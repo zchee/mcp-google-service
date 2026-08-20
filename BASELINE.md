@@ -36,6 +36,27 @@ justify each setting with a measured delta. `scripts/bench-startup.sh` refuses t
 run with `RUSTFLAGS` set and prints the binary's size, sha256, mtime and the
 toolchain with every result.
 
+**`direnv exec .` is not a neutral wrapper for gates, and the rule above is
+narrower than it looks.** Two effects, both measured:
+
+* **Release builds are contaminated.** The `Reproduce` block below already
+  builds with `env -u RUSTFLAGS` into the project `target/`, which was
+  correct before this was understood; it is now correct *for a stated
+  reason*. A release artifact built under `direnv` is not the shipped
+  artifact.
+* **`-C debug-assertions=off` deletes a test.** It makes `cfg(debug_assertions)`
+  false, which removes both the `debug_assert!` in `Proxy::new` (routes must
+  never leave `googleapis.com`) **and** the `#[should_panic]` test at
+  `src/proxy.rs` that guards it. The pairing is deliberate and correct -- the
+  test exists exactly when the assert does, so this is not a vacuous pass --
+  but the consequence at team level is that a suite run under `direnv exec .`
+  checks **one invariant fewer** than the same command with `RUSTFLAGS` unset,
+  while both report a confident green. Gate runs use `env -u RUSTFLAGS`.
+
+Anything that asserts a *timing* is covered by the benchmark rule regardless
+of whether it is called a benchmark: the live tier's latency budgets are
+measurements, so they run with `RUSTFLAGS` unset and strictly serially.
+
 ### Reproduce
 
 ```sh
@@ -289,6 +310,7 @@ not where startup goes.
 | P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
 | P6 | none (reverted) | untouched | untouched | untouched | untouched | untouched; fan-out 6.64 -> 6.45 -> 6.32 s (A/B/A', null -- section 11) |
 | P7 | `924439d`, `f4767ae`, + this commit | **-0.82 ms** (profile, paired; 12a). mimalloc's -1.12 ms did not survive P5 -- re-measured 6/12, removed (section 14) | same probe (`--offline`) | untouched (`[profile.bench]` pinned, section 12) | untouched | **-6,688,864 from the profile**; mimalloc's +206,656 given back |
+| P8 | none (declined) | untouched | untouched | untouched | untouched | -646,112 measured, **not adopted** -- section 17 |
 | P5 | `8be5bd4` + `4bc3bb3` | offline paired min 20.3 -> **8.9 ms** (-56%), medians agree -- section 13 | same probe | within band under load (section 13c) | serve load 9.32 ms -> **89.5 us / 2,852 allocs**; JSON path kept | **16,472,160 (-34.6%)** |
 
 Notes on the P2 row:
@@ -475,6 +497,37 @@ latency, which is what varies between samples. The saving is the avoided
 handshake round trip, so every call after the first to a given service lands
 roughly 450-700 ms sooner. Startup is untouched: the same build reported
 process-start to ready 19.16 ms and initialize to first response 334 µs.
+
+**Profile, stamped late -- and the omission is what this correction is for.**
+Every figure above is from a **release** build. The original text said only
+"the same build", which is not reproducible: `tests/live.rs` resolves the
+binary through `CARGO_BIN_EXE_*`, so it inherits whichever profile the *test
+run* used, and README's documented live command carries no `--release`. A
+later validation run against ship state compared a **debug** live run with the
+release numbers above and read a 12x regression that does not exist. Measured
+on `77acb16`, same tests, both profiles:
+
+| Metric | section 9 (P3, release) | `77acb16` release | `77acb16` debug |
+|---|---:|---:|---:|
+| process start -> ready | 19.16 ms | **7.23 ms** | 54-56 ms |
+| initialize -> first response | 334 µs | **502.75 µs** | ~4 ms |
+| dispatch cold / warm / saved | 1076 / 380 / 697 ms | 1143 / 360 / 783 ms | 973 / 402 / 572 ms |
+
+The release column **validates this section at ship state**; ready improved
+19.16 -> 7.23 ms, which is P5's archive arriving where it should. The debug
+column runs ~12x on first response and ~7x on ready, and is comparable only to
+itself. **A latency figure without its profile is not a measurement** -- the
+ratio is recorded here so the next reader converts instead of re-deriving it,
+or worse, re-raising the same false alarm.
+
+A contention explanation was tested *first* and falsified, which is the only
+reason it was not written up as the cause: with every outbound connection
+refused (`HTTPS_PROXY=127.0.0.1:1`, so the 47-host fan-out cannot start),
+debug first response measured 3.88 / 4.10 / 3.75 ms -- indistinguishable from
+online. The first response does not wait on background work. The handler is
+also synchronous by inspection (`readiness()` is a snapshot, `service_label()`
+a pure match, the payload a 47-entry map), so the time is round-trip and
+codegen, not payload cost.
 
 Correctness of the cache, all asserted by test rather than by argument:
 
@@ -711,6 +764,20 @@ target-dir (`.../target-alloc/release/deps/...`). That is what moves with path
 length, and the arithmetic then lands: 24 entries x 30 characters = 720 B
 predicted against 688 B observed. The "one path copy per compilation unit"
 reading was right; the thing being counted is OSO entries, not DWARF DIEs.
+
+**Confirmed out of sample, and by direct count.** The rate above was derived
+on a 25 MB binary. The shipped 16 MB binary at `77acb16` was built twice from
+identical source into target dirs of 24 and 61 characters: **16,096,384 B and
+16,097,184 B, a 800 B difference across 37 characters**, against 849 B
+predicted by this section's rate and 888 B by the naive 24 x 37. A 35% smaller
+artifact pays the *same absolute* cost, which is what "entry count x path
+length" predicts and what any proportional or DWARF-sized story does not.
+`nm -ap` on that binary counts **exactly 24 `OSO` entries**, so the constant
+is now measured rather than inferred. Two consequences: the mechanism is
+load-bearing, and **no size row in this ledger is meaningful without its
+target-dir path** -- two different correct byte counts for one commit is the
+normal case here, not a contradiction.
+
 `strip = "none"` is still why they survive. Release link time goes from ~40 s to ~112 s; the
 test profile inherits dev, so `nextest` pays none of it.
 
@@ -1016,3 +1083,159 @@ Startup after removal, for the record: minima cluster **7.7-8.8 ms**, medians
 **9.1-15.3 ms** under a load average of ~4 (the controls above bound the
 environment). Against P1's 1809.31 ms real-mode median that is the cumulative
 result of P2, P3, P5 and P7's profile settings; no allocator is involved.
+
+## 15. Credential shapes: the impersonation check
+
+v1 exercised exactly one credential shape -- `authorized_user` ADC -- and
+recorded service-account and workload-identity flows as unverified. The
+service-account half is now closed, by the reviewer's Ruling 2 protocol, with
+**no key file synthesized**: org policy forbids them, so the check ran against
+an `impersonated_service_account` ADC wrapper built from the operator's own
+ADC as `source_credentials`.
+
+**Source reading first, prediction registered before measuring.** `gcp_auth`
+0.12.7 has no impersonation support by construction: no
+`impersonated_service_account` variant, no `service_account_impersonation_url`
+handling anywhere in its `provider()` chain. Predicted: both placements fail,
+neither yields a token, the `GOOGLE_APPLICATION_CREDENTIALS` placement fails
+*immediately at parse* while the ADC-path placement falls through the chain
+and fails later. **Confirmed on all three points.**
+
+| Run | Placement | Exit | Wall | Terminal error |
+|---|---|---:|---:|---|
+| 1 | `GOOGLE_APPLICATION_CREDENTIALS` | 1 | **15 ms** | failed to deserialize ApplicationCredentials: missing field `private_key` |
+| 2 | ADC path, `gcloud` **off** PATH | 1 | **931 ms** | `no available authentication method found` |
+| 3 | ADC path, `gcloud` **on** PATH | 1 | **1359 ms** | same |
+
+**Discharge: D1 (pass).** Both mandatory runs fail fast with actionable text,
+non-zero exit, no panic, no hang (worst case 1.36 s against a 30 s ceiling),
+and no token material -- `Bearer `/`ya29.`/`refresh_token`/`client_secret`/
+`access_token`/`private_key` scanned across every captured stderr: **0 hits**.
+`serving from snapshot ...` printed **zero times** in all three, which is the
+end-to-end witness that no token was ever held: since the strict path acquires
+credentials before serving, that line is unreachable on a credential failure.
+
+**Run 3 is inconclusive, and the protocol is why that does not matter.**
+It failed at `gcloud` -- but because this machine's `gcloud` CLI credentials
+are expired, not because `gcp_auth` rejected impersonation. On a workstation
+with a live `gcloud`, run 3 would likely have *succeeded* via
+`GCloudAuthorizedUser`, minting a token that has nothing to do with
+impersonation. That false pass is exactly the hazard the reviewer anticipated
+by making run 2 -- `gcloud` genuinely off PATH -- the mandatory one. The
+finding rests on run 2.
+
+**Method notes, because two of them are traps.** `command -v gcloud` resolves
+a *shell alias* here, so a first attempt at run 2 computed an empty PATH entry
+and left `gcloud` reachable; the mandatory condition was unmet and the run was
+redone after verifying a *subprocess* could not resolve it. And `gcp_auth`
+locates ADC through `env::home_dir()`, **not** `CLOUDSDK_CONFIG`, so runs 2
+and 3 redirected `HOME`; the operator's real ADC was never moved or written.
+The wrapper embedded a live refresh token and was deleted immediately after,
+deletion verified.
+
+**Still open, and not to be read as cleared:** WIF (`external_account`) was
+never exercised. Recording it as unsupported would repeat the run-3 error in
+the opposite direction. What is established is narrower and exact:
+**`impersonated_service_account` is unsupported by `gcp_auth` 0.12.7 and fails
+clean.**
+
+The failure text is nonetheless misleading in a way worth knowing: a user who
+ran `gcloud auth application-default login --impersonate-service-account=...`
+-- the org-policy-friendly path -- is told a `private_key` field is *missing*
+from a credential they deliberately created *without* a key, which points them
+at the one artifact policy forbids.
+
+## 16. Live tier at ship state (`77acb16`)
+
+Six tests, real Google endpoints, real ADC, project gaudiy-licentia-dev.
+**6/6 passed.** Serial (`--test-threads=1`) and `RUSTFLAGS` unset: three of the
+six assert latency budgets, and six concurrent servers each fanning out to 47
+hosts would measure those under self-inflicted contention.
+
+| Test | Result | Evidence emitted |
+|---|---|---|
+| `live_background_catalog_refresh_completes_within_its_budget` | **PASS** 5.353 s | `catalog refresh fan-out: 5.312124208s for 47 services (47 live, 548 tools)` |
+| `live_developerknowledge_search_documents_dispatches_without_error` | **PASS** 2.348 s | `returned 1 content block(s)` |
+| `live_run_list_services_dispatches_without_error` | **PASS** 1.068 s | `returned 1 content block(s)` |
+| `live_second_dispatch_reuses_the_session` | **PASS** 1.410 s | cold 973.382041 ms / warm 401.527042 ms / **saved 571.854999 ms** |
+| `live_snapshot_parse_stays_within_its_budget` | **PASS** 0.027 s | `snapshot parse: 15.351792ms for 47 services / 548 tools` |
+| `live_startup_and_first_tool_response_meet_their_latency_budgets` | **PASS** 0.193 s | ready 25.13675 ms / first response 16.970875 ms |
+
+**A green run here is not evidence, and was not accepted as such.** Every test
+opens `let Some(project) = live_project() else { return; }` -- a bare `return`,
+which the runner scores as a pass. An unset gate therefore produces six green
+lights and zero live calls, which is the same picture as success. The run was
+repeated under `--no-capture` and only *past-the-gate* output is recorded
+above: `47 live`, real content blocks, a real cold/warm split. ADC liveness was
+established **before** the run (token minted, exit status only, never captured)
+so that a failure would have been unambiguously a code finding rather than a
+stale credential.
+
+Budget headroom, and the one number that is not comfortable:
+
+| Budget | Limit | Observed | Used |
+|---|---:|---:|---:|
+| background refresh fan-out | 10 s | 5.312 s | **53%** |
+| process start -> ready | 3 s | 25.1 ms (debug) / 7.2 ms (release) | <1% |
+| initialize -> first response | 100 ms | 17.0 ms (debug) / 0.50 ms (release) | 17% / 0.5% |
+| snapshot parse | 500 ms | 15.4 ms | 3% |
+
+**The refresh is the only budget without an order of magnitude in hand**, and
+it was measured on a warm desktop with good network; it is the one that breaks
+first on a worse link. It is listed here as the least-headroom budget rather
+than filed among the comfortable ones.
+
+Leak scan across both runs' logs: **0**. One benign log line worth knowing:
+test 6 emits `WARN gcp_auth::types: failed to refresh token, trying again...
+ConnectError("dns error", ... JoinError::Cancelled)`. That signature is runtime
+teardown -- the test measures first response and shuts down while the
+background credential fetch is mid-DNS -- not a failure. An operator who starts
+and immediately stops the binary will see it.
+
+Profiles: the table above is the **debug** profile, because
+`CARGO_BIN_EXE_*` follows the test profile and README's documented command
+carries no `--release`. The release cross-check is in section 9.
+
+## 17. P8 -- scoped strip: measured, declined
+
+**Candidate.** `[profile.release] strip = "debuginfo"` plus
+`[profile.release.build-override] strip = "none"`. The scoped form had never
+been tried; `ae92467` tested only a *global* strip, which broke proc-macro
+dylibs. Registered estimate: `__LINKEDIT` 3,080,192 B and 56,854 local symbols
+implied **~2.5-2.8 MB reclaimable**, roughly 3x the LTO win.
+
+**Probe result: the form works, the estimate does not.** The build succeeds in
+1m48s, `ae92467`'s corruption does **not** reproduce in `build-override` form,
+the binary runs 47/548, `nextest` is 188/188, and the `[profile.bench]`
+value-match freeze correctly shielded the benches from the new key -- its
+designed failure mode, observed working. But the win is **-646,112 B (-4.0%)**,
+about **4x smaller** than the estimate.
+
+**Mechanism.** Only the nlist array is reclaimed: 38,669 stabs x 16 B =
+618,704 B predicted against ~655,360 B observed (page-granular). The string
+table barely moves, because the debug map's `FUN` strings are **shared** with
+the regular symbol table -- stripping the stabs does not free the names. The
+estimate had implicitly counted those strings twice.
+
+**Corroborated independently on the shipped binary**, rather than recorded on
+report: `nm -ap` counts **exactly 24 `OSO`** entries (the constant section 12
+derived from arithmetic), 39,910 stab lines, and **19,576 `FUN`** entries --
+the population whose strings are shared, which is the mechanism above.
+
+**Decision: DECLINED (user).** -4.0% does not pay for losing symbolicated
+backtraces on an operator-facing binary that handles credentials. Recorded as
+a user decision on measured numbers, with the ~4x overestimate named so the
+estimate is not re-proposed from the same reasoning.
+
+## 18. Ship state (`77acb16`)
+
+| Fact | Value |
+|---|---|
+| Binary | **16,097,184 B**, sha256 `fe5e314f...` |
+| Build | `env -u RUSTFLAGS cargo build --release`, into `<repo>/target` (61-char path) |
+| Delta from `871251c` (16,096,912 B) | **+272 B** -- fix batch #2 |
+| Same commit, `/Volumes/tmpfs/target-sa` (24-char path) | 16,096,384 B -- see section 12; the 800 B is path length, not a different build |
+
+The canonical build command carries no `direnv` and no `RUSTFLAGS`; the
+`Reproduce` block above is the authority, and section 12 is why a size row
+without its target-dir path cannot be compared.

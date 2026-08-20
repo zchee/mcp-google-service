@@ -414,6 +414,23 @@ process start to ready under 3s, initialize to first tool response under
 100ms, snapshot parse under 500ms, and one background refresh fan-out under
 10s.
 
+Run them serially -- three of them are timing assertions, and concurrent
+servers measure each other's contention:
+
+```sh
+MCP_GOOGLE_LIVE=1 GOOGLE_MCP_QUOTA_PROJECT=PROJECT_ID \
+  cargo nextest run -E 'test(live_)' --test-threads=1
+```
+
+**The command above measures the debug binary.** The tests resolve the server
+through `CARGO_BIN_EXE_*`, so they exercise whichever profile the test run
+built. The budgets are loose enough that both profiles pass, so the difference
+is easy to miss and easy to compare across by mistake: on the same commit,
+initialize to first response measures ~4ms in debug and ~0.5ms in release, and
+start to ready ~55ms against ~7ms. Add `--release` to measure the shipped
+artifact, and never compare a number from one profile against a number from
+the other.
+
 ## Manual end-to-end checklist
 
 Automated tests do not cover the experience of driving the two-tier surface
