@@ -1,0 +1,97 @@
+# Expected head of the ranking `Catalog::search` produces over the committed
+# snapshot (`data/catalog-snapshot.json`). Checked by `tests/search_ranking.rs`.
+#
+# Format: a `query:` line, then the namespaced tool names expected at the head
+# of the result list, in rank order. `(no hits)` pins an empty result. A block
+# pins exactly as many positions as it lists; what follows them is unpinned.
+# Blank lines and `#` lines are ignored.
+#
+# These are the first tools a model is shown for each query, so a change here
+# is a behaviour change, not a refresh. Edit it on purpose with the reason in
+# the commit message; never regenerate it from the code under test. The
+# `cloud run` block is the real-model E2E finding of 2026-08-20: the ranking
+# put BigQuery-related tools above Cloud Run's own.
+
+# -- the real-model E2E query: Cloud Run's tools, then the gcloud escape hatch
+query: cloud run
+run__deploy_service_from_archive
+run__deploy_service_from_file_contents
+run__deploy_service_from_image
+run__get_service
+run__list_services
+cloudcli__run_gcloud_command
+
+query: list cloud run
+run__list_services
+cloudcli__run_gcloud_command
+cloudcli__run_bq_command
+
+# -- a bare noun: every `list_instances` outranks tools that only mention it
+query: instances
+alloydb__list_instances
+bigtableadmin__list_instances
+compute__list_instances
+compute__list_managed_instances
+file__list_instances
+
+# -- misses: conjunctive matching, an unknown term empties the result
+query: zzzznomatch
+(no hits)
+
+query: list cloud zzzznomatch
+(no hits)
+
+# -- a service id on its own names that service before tools with `run` in
+#    their names
+query: run
+run__deploy_service_from_archive
+run__deploy_service_from_file_contents
+run__deploy_service_from_image
+run__get_service
+run__list_services
+
+# -- an exact service id beats services whose ids merely start with it
+query: bigquery
+bigquery__execute_sql
+bigquery__execute_sql_readonly
+bigquery__get_dataset_info
+bigquery__get_table_info
+bigquery__list_dataset_ids
+bigquery__list_table_ids
+
+# -- a product name whose service id is only a prefix (`sqladmin`): the
+#    branding word `cloud` must not pull `cloud*` services above it
+query: cloud sql
+sqladmin__execute_sql
+sqladmin__execute_sql_readonly
+
+# -- the whole query spells a service id once the `cloud` brand prefix and the
+#    spaces are dropped
+query: cloud asset
+cloudasset__list_assets
+
+query: resource manager
+cloudresourcemanager__search_projects
+
+query: bigquery data transfer
+bigquerydatatransfer__create_transfer_config
+
+# -- both words are name words of one tool; the `run` service must not win
+#    just because its id appears in the query
+query: run gcloud
+cloudcli__run_gcloud_command
+
+# -- description-only product names still resolve
+query: gke cluster
+container__create_cluster
+container__get_cluster
+container__update_cluster
+container__list_clusters
+
+query: pubsub topics
+pubsub__list_topics
+
+# -- an exact bare tool name; two services expose it, ties break on name
+query: list_services
+agentregistry__list_services
+run__list_services

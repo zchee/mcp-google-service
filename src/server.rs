@@ -643,13 +643,17 @@ static META_TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         Tool::new(
             TOOL_SEARCH_TOOLS,
             "Find tools by keyword across every exposed service. Returns namespaced \
-             tool names ranked by relevance; pass the name to describe_tools or call.",
+             tool names ranked by relevance, each with its `score`, plus \
+             `total_matches` when more matched than were returned; pass the name to \
+             describe_tools or call.",
             schema(json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keywords; every term must match a tool's name or description.",
+                        "description": "Keywords; every term must match the tool's name, \
+                                        description, or service (`cloud run` names the `run` \
+                                        service).",
                     },
                     "service": {
                         "type": "string",
@@ -765,20 +769,26 @@ fn list_services_payload(catalog: &Catalog, readiness: &Readiness) -> Value {
 }
 
 /// `search_tools` payload.
+///
+/// `score` is relative relevance within this one response; `total_matches`
+/// tells the caller how many tools matched before `limit` cut the list, so
+/// "narrow the query" is distinguishable from "that was everything".
 fn search_payload(catalog: &Catalog, query: &str, service: Option<&str>, limit: usize) -> Value {
-    let hits: Vec<Value> = catalog
-        .search(query, service)
-        .into_iter()
-        .take(limit)
-        .map(|entry| {
-            json!({
-                "name": entry.namespaced_name,
-                "service_id": entry.service_id,
-                "description": entry.tool.description.as_deref().map(first_line),
-            })
-        })
-        .collect();
-    json!({ "query": query, "match_count": hits.len(), "matches": hits })
+    let mut hits = Vec::with_capacity(limit.min(catalog.tool_count()));
+    let total = catalog.search_with(query, service, limit, |hit| {
+        hits.push(json!({
+            "name": hit.tool.namespaced_name,
+            "service_id": hit.tool.service_id,
+            "score": hit.score,
+            "description": hit.tool.tool.description.as_deref().map(first_line),
+        }));
+    });
+    json!({
+        "query": query,
+        "match_count": hits.len(),
+        "total_matches": total,
+        "matches": hits,
+    })
 }
 
 /// `describe_tools` payload; unknown names are reported rather than skipped.
@@ -1163,6 +1173,7 @@ mod tests {
         let catalog = catalog();
         let payload = search_payload(&catalog, "list", None, 20);
         assert_eq!(payload["match_count"], json!(2));
+        assert_eq!(payload["total_matches"], json!(2));
         assert_eq!(
             payload["matches"][0]["description"],
             json!("List BigQuery datasets.")
@@ -1170,6 +1181,11 @@ mod tests {
 
         let limited = search_payload(&catalog, "list", None, 1);
         assert_eq!(limited["match_count"], json!(1));
+        assert_eq!(
+            limited["total_matches"],
+            json!(2),
+            "the caller must be able to tell a cut list from a complete one"
+        );
 
         let filtered = search_payload(&catalog, "list", Some("run"), 20);
         assert_eq!(filtered["match_count"], json!(1));
@@ -1178,6 +1194,26 @@ mod tests {
         assert_eq!(
             filtered["matches"][0]["description"],
             json!("List Cloud Run services.")
+        );
+    }
+
+    #[test]
+    fn search_matches_carry_scores_in_descending_order() {
+        let payload = search_payload(&catalog(), "list", None, 20);
+        let scores: Vec<u64> = payload["matches"]
+            .as_array()
+            .expect("matches is an array")
+            .iter()
+            .map(|hit| hit["score"].as_u64().expect("every match carries a score"))
+            .collect();
+        assert!(!scores.is_empty());
+        assert!(
+            scores.windows(2).all(|pair| pair[0] >= pair[1]),
+            "matches must be ordered best first, got {scores:?}"
+        );
+        assert!(
+            scores.iter().all(|&score| score > 0),
+            "a non-empty query only returns scored hits, got {scores:?}"
         );
     }
 

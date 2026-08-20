@@ -6,10 +6,12 @@
 //! snapshot, and embedded in the binary as an offline fallback.
 
 use std::{
+    cell::RefCell,
     cmp::Reverse,
     collections::{BTreeMap, HashMap},
+    ops::Range,
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -49,14 +51,54 @@ pub const SNAPSHOT_PATH: &str = "data/catalog-snapshot.json";
 /// Snapshot compiled into the binary so a network-less start still serves tools.
 const EMBEDDED_SNAPSHOT: &str = include_str!("../data/catalog-snapshot.json");
 
-/// Score added when a query token occurs in a tool's name.
-const SCORE_NAME_MATCH: u32 = 8;
+/// Score when a run of query tokens spells the tool's service id.
+///
+/// Set to the worth of two name words: a query that names a service has said
+/// which API it wants, but a tool whose name words all match the query (plus
+/// its phrase bonus) still outranks a tool that was only named by service.
+const SCORE_SERVICE: u32 = 32;
 
-/// Score added when a query token occurs in a tool's description.
-const SCORE_DESCRIPTION_MATCH: u32 = 2;
+/// Score when a run of query tokens spells the start of the service id.
+///
+/// `cloud sql` names `sqladmin` and `bigquery` touches `bigquerydatatransfer`.
+const SCORE_SERVICE_PREFIX: u32 = 8;
+
+/// Score per query token equal to a word of the tool's name.
+const SCORE_NAME_WORD: u32 = 16;
+
+/// Score per query token that starts a word of the tool's name.
+const SCORE_NAME_WORD_PREFIX: u32 = 12;
+
+/// Score per query token found in the tool's name at no word boundary.
+const SCORE_NAME_SUBSTRING: u32 = 4;
+
+/// Score per query token found anywhere in the tool's description.
+const SCORE_DESCRIPTION: u32 = 2;
+
+/// Bonus when the tokens occur in order as consecutive name words.
+const SCORE_NAME_PHRASE: u32 = 24;
+
+/// Bonus when the tokens occur in order, single-spaced, in the description.
+///
+/// This is how product names reach the ranking: `Cloud SQL` and `Cloud Run`
+/// appear verbatim in their services' descriptions.
+const SCORE_DESCRIPTION_PHRASE: u32 = 16;
 
 /// Bonus applied when the whole query equals the bare (un-prefixed) tool name.
 const SCORE_EXACT_NAME: u32 = 32;
+
+/// Brand word Google's service ids carry inconsistently (`cloudtrace`, but
+/// `run` for Cloud Run and `sqladmin` for Cloud SQL).
+///
+/// A leading `cloud` in a run of query tokens is therefore not a service
+/// reference by itself, and is dropped when the rest of the run spells one.
+const SERVICE_BRAND_PREFIX: &str = "cloud";
+
+/// Query bytes lowercased on the stack before the heap is involved.
+const QUERY_INLINE_BYTES: usize = 512;
+
+/// Query tokens held on the stack before the heap is involved.
+const QUERY_INLINE_TOKENS: usize = 32;
 
 /// Failures that make a catalog unusable.
 #[derive(Debug, thiserror::Error)]
@@ -173,10 +215,144 @@ pub struct ServiceCatalog {
 }
 
 /// The merged, namespace-validated tool catalog.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `services` is read-only once the catalog is built: the search index is
+/// derived from it on the first query, so replace a catalog (`restricted_to`,
+/// `marked_as`, [`Catalog::new`]) rather than editing one in place.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Catalog {
     /// Per-service catalogs, sorted by service id.
     pub services: Vec<ServiceCatalog>,
+    /// Lowercased search text and per-tool spans, built by the first search.
+    ///
+    /// Derived data: a clone starts without it and equality ignores it.
+    #[serde(skip)]
+    index: OnceLock<SearchIndex>,
+}
+
+impl Clone for Catalog {
+    fn clone(&self) -> Self {
+        Self {
+            services: self.services.clone(),
+            index: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for Catalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.services == other.services
+    }
+}
+
+/// One ranked `search` result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchHit<'a> {
+    /// Relevance per the rules in [`Catalog::search_with`]; higher ranks first.
+    pub score: u32,
+    /// The matched tool.
+    pub tool: &'a NamespacedTool,
+}
+
+/// Query-time view of a catalog: every searchable string lowercased once,
+/// laid out contiguously, so a query compares bytes and allocates nothing.
+///
+/// Built lazily by [`Catalog::index`], which is why a catalog's first search
+/// after construction costs more than the ones after it.
+struct SearchIndex {
+    /// Service ids, tool names and descriptions, lowercased and concatenated.
+    text: Box<str>,
+    /// One entry per service, in catalog order.
+    services: Vec<IndexedService>,
+    /// One entry per tool, in catalog order (service-major).
+    tools: Vec<IndexedTool>,
+}
+
+impl std::fmt::Debug for SearchIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchIndex")
+            .field("services", &self.services.len())
+            .field("tools", &self.tools.len())
+            .field("bytes", &self.text.len())
+            .finish()
+    }
+}
+
+/// Where one service's searchable text lives in [`SearchIndex`].
+struct IndexedService {
+    /// Lowercased service id.
+    id: Span,
+    /// Indices into [`SearchIndex::tools`] of this service's tools.
+    tools: Range<usize>,
+}
+
+/// Where one tool's searchable text lives in [`SearchIndex`].
+struct IndexedTool {
+    /// Index into [`Catalog::services`].
+    service: usize,
+    /// Index into that service's `tools`.
+    tool: usize,
+    /// Upstream name, lowercased as-is; for exact and substring matches.
+    raw_name: Span,
+    /// Upstream name, lowercased with CamelCase broken into `_`-separated
+    /// words; for word, word-prefix and phrase matches.
+    name: Span,
+    /// Description, lowercased; empty when the tool has none.
+    description: Span,
+}
+
+/// A byte range of [`SearchIndex::text`].
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+/// How a run of query tokens relates to a service id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServiceReference {
+    /// [`SCORE_SERVICE`], [`SCORE_SERVICE_PREFIX`], or 0 for no reference.
+    score: u32,
+    /// Token positions (half-open) that spelled the reference; those tokens
+    /// count as matched for every tool of the service.
+    start: usize,
+    end: usize,
+}
+
+impl ServiceReference {
+    /// The query does not name this service.
+    const NONE: Self = Self {
+        score: 0,
+        start: 0,
+        end: 0,
+    };
+
+    /// Whether the token at `position` is part of the reference.
+    fn covers(&self, position: usize) -> bool {
+        self.start <= position && position < self.end
+    }
+}
+
+/// Result of spelling a run of tokens against a service id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// The tokens, concatenated, are the whole id.
+    Whole,
+    /// The tokens, concatenated, are a proper prefix of the id.
+    Prefix,
+    /// Neither.
+    No,
+}
+
+thread_local! {
+    /// Candidate buffer reused across queries on this thread.
+    ///
+    /// Ranking needs every matching tool before the first hit can be
+    /// delivered; keeping that scratch per thread, rather than per call, is
+    /// what makes a warm query allocate nothing. It is taken out of the cell
+    /// for the duration of a query, so a search issued from inside a `visit`
+    /// callback simply starts with an empty buffer instead of panicking.
+    static CANDIDATES: RefCell<Vec<(Reverse<u32>, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// What changed between two catalogs, excluding description text.
@@ -252,9 +428,18 @@ impl Catalog {
                 .sort_by(|a, b| a.namespaced_name.cmp(&b.namespaced_name));
         }
 
-        let catalog = Self { services };
+        let catalog = Self {
+            services,
+            index: OnceLock::new(),
+        };
         catalog.validate()?;
         Ok(catalog)
+    }
+
+    /// The search index, built on first use.
+    fn index(&self) -> &SearchIndex {
+        self.index
+            .get_or_init(|| SearchIndex::build(&self.services))
     }
 
     /// Enforce the two namespacing invariants over the whole catalog.
@@ -406,33 +591,116 @@ impl Catalog {
             .filter(|s| s.tools.iter().any(|t| t.namespaced_name == namespaced_name))
     }
 
-    /// Rank tools by keyword overlap with `query` over names and descriptions.
+    /// Every tool matching `query`, best first.
+    ///
+    /// The convenience form of [`Catalog::search_with`]: it ranks the whole
+    /// catalog and allocates the result list. Callers that only show the top
+    /// few hits should pass a `limit` to `search_with` instead.
+    pub fn search(&self, query: &str, service_filter: Option<&str>) -> Vec<&NamespacedTool> {
+        let mut hits = Vec::new();
+        self.search_with(query, service_filter, usize::MAX, |hit| hits.push(hit.tool));
+        hits
+    }
+
+    /// Rank tools against `query` and hand the best `limit` to `visit`, best
+    /// first; returns how many tools matched in total.
     ///
     /// Matching is case-insensitive and conjunctive: every whitespace-separated
-    /// token in `query` must occur in the tool's name or description, so extra
-    /// terms narrow rather than widen the result. Name hits outweigh
-    /// description hits, and an exact bare-name match sorts to the top. Ties
-    /// break on namespaced name, making the order fully deterministic.
+    /// token must match the tool somewhere, so an extra term narrows rather
+    /// than widens the result. A token matches a tool when it
     ///
-    /// An empty query returns every tool permitted by `service_filter`.
-    pub fn search(&self, query: &str, service_filter: Option<&str>) -> Vec<&NamespacedTool> {
-        let query = query.trim().to_lowercase();
-        let tokens: Vec<&str> = query.split_whitespace().collect();
+    /// * is part of a run of tokens that spells the tool's service id
+    ///   (`cloud run`, `run`, `big query`, `resource manager`, `cloud asset`),
+    ///   a leading `cloud` being brand rather than id; a run that spells only
+    ///   the start of an id (`cloud sql` for `sqladmin`) also counts, for less;
+    /// * equals, starts, or occurs inside a word of the tool's upstream name
+    ///   (`_`-separated; CamelCase names are split the same way); or
+    /// * occurs anywhere in the description.
+    ///
+    /// The score is the sum over tokens of the matches found, weighted
+    /// service > name word > name-word prefix > name substring > description,
+    /// plus a bonus when the tokens appear in order as consecutive name words
+    /// or as a single-spaced phrase in the description, plus a bonus when the
+    /// whole query is the bare tool name. Ties keep catalog order, which is
+    /// service id then namespaced name, so the ranking is deterministic.
+    ///
+    /// An empty query matches every tool permitted by `service_filter`, in
+    /// catalog order. `limit` may exceed the number of matches.
+    ///
+    /// The query path allocates nothing once this catalog's index exists and
+    /// the calling thread has searched before; the first search of a catalog
+    /// builds the index from its tools, and the first search on a thread
+    /// sizes that thread's candidate buffer. Queries over
+    /// `QUERY_INLINE_BYTES` bytes or `QUERY_INLINE_TOKENS` tokens use the
+    /// heap for the query itself.
+    pub fn search_with<'a>(
+        &'a self,
+        query: &str,
+        service_filter: Option<&str>,
+        limit: usize,
+        mut visit: impl FnMut(SearchHit<'a>),
+    ) -> usize {
+        let index = self.index();
 
-        let mut scored: Vec<(u32, &NamespacedTool)> = self
-            .services
-            .iter()
-            .filter(|s| service_filter.is_none_or(|f| s.service_id == f))
-            .flat_map(|s| s.tools.iter())
-            .filter_map(|tool| score_tool(tool, &query, &tokens).map(|score| (score, tool)))
-            .collect();
+        let mut query_buf = [0u8; QUERY_INLINE_BYTES];
+        let query_heap: String;
+        let lowered: &str = match lowercase_into(query, &mut query_buf) {
+            Some(inline) => inline,
+            None => {
+                query_heap = lowercase(query);
+                &query_heap
+            }
+        };
+        let mut token_buf: [&str; QUERY_INLINE_TOKENS] = [""; QUERY_INLINE_TOKENS];
+        let token_heap: Vec<&str>;
+        let tokens: &[&str] = match collect_tokens(lowered, &mut token_buf) {
+            Some(count) => &token_buf[..count],
+            None => {
+                token_heap = lowered.split_whitespace().collect();
+                &token_heap
+            }
+        };
 
-        scored.sort_by(|a, b| {
-            Reverse(a.0)
-                .cmp(&Reverse(b.0))
-                .then_with(|| a.1.namespaced_name.cmp(&b.1.namespaced_name))
-        });
-        scored.into_iter().map(|(_, tool)| tool).collect()
+        let mut candidates = CANDIDATES.take();
+        candidates.clear();
+        candidates.reserve(index.tools.len());
+        for (position, service) in index.services.iter().enumerate() {
+            if service_filter.is_some_and(|wanted| self.services[position].service_id != wanted) {
+                continue;
+            }
+            let reference = if tokens.is_empty() {
+                ServiceReference::NONE
+            } else {
+                service_reference(index.text(service.id), tokens)
+            };
+            for tool_index in service.tools.clone() {
+                if let Some(score) = score_tool(index, &index.tools[tool_index], tokens, reference)
+                {
+                    candidates.push((Reverse(score), tool_index));
+                }
+            }
+        }
+
+        let total = candidates.len();
+        if limit == 0 {
+            candidates.clear();
+        } else if limit < total {
+            // Partition the best `limit` to the front, then order only those.
+            candidates.select_nth_unstable(limit - 1);
+            candidates.truncate(limit);
+        }
+        candidates.sort_unstable();
+        for &(Reverse(score), tool_index) in &candidates {
+            let entry = &index.tools[tool_index];
+            visit(SearchHit {
+                score,
+                tool: &self.services[entry.service].tools[entry.tool],
+            });
+        }
+
+        candidates.clear();
+        CANDIDATES.set(candidates);
+        total
     }
 
     /// A copy holding only the services in `endpoints`.
@@ -446,6 +714,7 @@ impl Catalog {
                 .filter(|service| endpoints.iter().any(|e| e.service_id == service.service_id))
                 .cloned()
                 .collect(),
+            index: OnceLock::new(),
         }
     }
 
@@ -466,6 +735,7 @@ impl Catalog {
                     ..service.clone()
                 })
                 .collect(),
+            index: OnceLock::new(),
         }
     }
 
@@ -542,39 +812,289 @@ pub fn split_namespaced(namespaced_name: &str) -> Option<(&str, &str)> {
     Some((service_id, tool_name))
 }
 
-/// Score one tool against the lowercased query, or `None` if a token misses.
-fn score_tool(tool: &NamespacedTool, query: &str, tokens: &[&str]) -> Option<u32> {
-    if tokens.is_empty() {
-        return Some(0);
+impl SearchIndex {
+    /// Lowercase every searchable string of `services` into one buffer.
+    fn build(services: &[ServiceCatalog]) -> Self {
+        let tool_count = services.iter().map(|s| s.tools.len()).sum();
+        let text_len = services
+            .iter()
+            .map(|s| {
+                s.service_id.len()
+                    + s.tools
+                        .iter()
+                        .map(|t| {
+                            // Raw copy + word copy; the latter may gain a `_`
+                            // per CamelCase boundary, so allow for half again.
+                            (t.tool.name.len() * 5).div_ceil(2)
+                                + t.tool.description.as_deref().map_or(0, str::len)
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+
+        let mut text = String::with_capacity(text_len);
+        let mut indexed_services = Vec::with_capacity(services.len());
+        let mut tools = Vec::with_capacity(tool_count);
+        for (service_index, service) in services.iter().enumerate() {
+            let id = push_lowercase(&mut text, &service.service_id);
+            let first = tools.len();
+            for (tool_index, entry) in service.tools.iter().enumerate() {
+                let raw_name = push_lowercase(&mut text, &entry.tool.name);
+                let name = push_name_words(&mut text, &entry.tool.name);
+                let description =
+                    push_lowercase(&mut text, entry.tool.description.as_deref().unwrap_or(""));
+                tools.push(IndexedTool {
+                    service: service_index,
+                    tool: tool_index,
+                    raw_name,
+                    name,
+                    description,
+                });
+            }
+            indexed_services.push(IndexedService {
+                id,
+                tools: first..tools.len(),
+            });
+        }
+
+        Self {
+            text: text.into_boxed_str(),
+            services: indexed_services,
+            tools,
+        }
     }
 
-    let name = tool.tool.name.to_lowercase();
-    let description = tool
-        .tool
-        .description
-        .as_deref()
-        .map(str::to_lowercase)
-        .unwrap_or_default();
+    /// The text a span covers.
+    fn text(&self, span: Span) -> &str {
+        &self.text[span.start..span.end]
+    }
+}
 
-    let mut total = 0;
+/// Append `text` lowercased and return where it landed.
+///
+/// ASCII is lowered bytewise; anything else goes through
+/// [`char::to_lowercase`], which is also what [`lowercase_into`] applies to a
+/// query, so the index and the query agree on every character.
+fn push_lowercase(out: &mut String, text: &str) -> Span {
+    let start = out.len();
+    if text.is_ascii() {
+        out.push_str(text);
+        out[start..].make_ascii_lowercase();
+    } else {
+        out.extend(text.chars().flat_map(char::to_lowercase));
+    }
+    Span {
+        start,
+        end: out.len(),
+    }
+}
+
+/// Append `name` lowercased with CamelCase words broken apart by `_`.
+///
+/// Upstream names are mostly `snake_case`, but some services publish
+/// `CreateBackupPlan`; indexing it as `create_backup_plan` lets word and
+/// phrase matching treat both spellings alike. `GetIAMPolicy` becomes
+/// `get_iam_policy`; an existing `_` is never doubled.
+fn push_name_words(out: &mut String, name: &str) -> Span {
+    let start = out.len();
+    let mut previous: Option<char> = None;
+    let mut chars = name.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current.is_uppercase() {
+            let after_word = previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit());
+            let acronym_end = previous.is_some_and(char::is_uppercase)
+                && chars.peek().is_some_and(|next| next.is_lowercase());
+            if after_word || acronym_end {
+                out.push('_');
+            }
+        }
+        out.extend(current.to_lowercase());
+        previous = Some(current);
+    }
+    Span {
+        start,
+        end: out.len(),
+    }
+}
+
+/// Lowercase `text` into `buf`, or `None` if it does not fit.
+///
+/// Same character rules as [`push_lowercase`].
+fn lowercase_into<'b>(text: &str, buf: &'b mut [u8]) -> Option<&'b str> {
+    let mut len = 0;
+    if text.is_ascii() {
+        let dst = buf.get_mut(..text.len())?;
+        dst.copy_from_slice(text.as_bytes());
+        dst.make_ascii_lowercase();
+        len = text.len();
+    } else {
+        for lower in text.chars().flat_map(char::to_lowercase) {
+            let width = lower.len_utf8();
+            lower.encode_utf8(buf.get_mut(len..len + width)?);
+            len += width;
+        }
+    }
+    std::str::from_utf8(&buf[..len]).ok()
+}
+
+/// Lowercase `text` onto the heap; the fallback for oversized queries.
+fn lowercase(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    push_lowercase(&mut out, text);
+    out
+}
+
+/// Split `query` on whitespace into `buf`, or `None` if it does not fit.
+fn collect_tokens<'q>(query: &'q str, buf: &mut [&'q str]) -> Option<usize> {
+    let mut count = 0;
+    for token in query.split_whitespace() {
+        *buf.get_mut(count)? = token;
+        count += 1;
+    }
+    Some(count)
+}
+
+/// How the query names `service_id`, if it does.
+///
+/// Every run of consecutive tokens is tried; a leading
+/// [`SERVICE_BRAND_PREFIX`] token is dropped from the run first, and a run
+/// that is only that word names nothing. The run is compared with the id and,
+/// when the id itself starts with the brand word, with the id minus that
+/// prefix, so `cloud asset`, `asset` and `cloudasset` all name `cloudasset`
+/// while `cloud run` names `run`. A whole-id spelling beats a prefix
+/// spelling, and among equals the longer run wins, so that more of the query
+/// is explained by the service reference.
+fn service_reference(service_id: &str, tokens: &[&str]) -> ServiceReference {
+    let core = service_id
+        .strip_prefix(SERVICE_BRAND_PREFIX)
+        .filter(|rest| !rest.is_empty());
+
+    let mut best = ServiceReference::NONE;
+    for start in 0..tokens.len() {
+        for end in start + 1..=tokens.len() {
+            let run = &tokens[start..end];
+            let spelled = match run {
+                [brand, rest @ ..] if *brand == SERVICE_BRAND_PREFIX => rest,
+                _ => run,
+            };
+            if spelled.is_empty() {
+                continue;
+            }
+            let score = [Some(service_id), core]
+                .into_iter()
+                .flatten()
+                .map(|target| match spells(target, spelled) {
+                    Spelling::Whole => SCORE_SERVICE,
+                    Spelling::Prefix => SCORE_SERVICE_PREFIX,
+                    Spelling::No => 0,
+                })
+                .max()
+                .unwrap_or(0);
+            let better = score > best.score
+                || (score > 0 && score == best.score && end - start > best.end - best.start);
+            if better {
+                best = ServiceReference { score, start, end };
+            }
+        }
+    }
+    best
+}
+
+/// Whether `tokens`, concatenated, spell all or the start of `target`.
+fn spells(target: &str, tokens: &[&str]) -> Spelling {
+    let mut rest = target;
     for token in tokens {
-        let mut hit = 0;
-        if name.contains(token) {
-            hit += SCORE_NAME_MATCH;
+        match rest.strip_prefix(token) {
+            Some(after) => rest = after,
+            None => return Spelling::No,
         }
+    }
+    if rest.is_empty() {
+        Spelling::Whole
+    } else {
+        Spelling::Prefix
+    }
+}
+
+/// Score one indexed tool against the query tokens, or `None` if a token
+/// matches neither the tool nor its service.
+fn score_tool(
+    index: &SearchIndex,
+    entry: &IndexedTool,
+    tokens: &[&str],
+    reference: ServiceReference,
+) -> Option<u32> {
+    let raw_name = index.text(entry.raw_name);
+    let name = index.text(entry.name);
+    let description = index.text(entry.description);
+
+    let mut total = reference.score;
+    for (position, token) in tokens.iter().enumerate() {
+        let mut hit = name_score(name, raw_name, token);
         if description.contains(token) {
-            hit += SCORE_DESCRIPTION_MATCH;
+            hit += SCORE_DESCRIPTION;
         }
-        if hit == 0 {
+        if hit == 0 && !reference.covers(position) {
             return None;
         }
         total += hit;
     }
 
-    if name == query {
+    if tokens.len() > 1 {
+        if contains_sequence(name, tokens, '_') {
+            total += SCORE_NAME_PHRASE;
+        }
+        if contains_sequence(description, tokens, ' ') {
+            total += SCORE_DESCRIPTION_PHRASE;
+        }
+    }
+    if let [only] = tokens
+        && *only == raw_name
+    {
         total += SCORE_EXACT_NAME;
     }
     Some(total)
+}
+
+/// How strongly `token` matches a tool name; 0 when it does not occur.
+fn name_score(name: &str, raw_name: &str, token: &str) -> u32 {
+    let mut starts_a_word = false;
+    for word in name.split('_') {
+        if word == token {
+            return SCORE_NAME_WORD;
+        }
+        starts_a_word |= word.starts_with(token);
+    }
+    if starts_a_word {
+        SCORE_NAME_WORD_PREFIX
+    } else if raw_name.contains(token) || name.contains(token) {
+        SCORE_NAME_SUBSTRING
+    } else {
+        0
+    }
+}
+
+/// Whether `tokens` occur in `haystack` in order, each pair joined by exactly
+/// one `separator`.
+fn contains_sequence(haystack: &str, tokens: &[&str], separator: char) -> bool {
+    let Some((first, rest)) = tokens.split_first() else {
+        return false;
+    };
+    haystack.match_indices(first).any(|(at, _)| {
+        let mut tail = &haystack[at + first.len()..];
+        rest.iter().all(|token| {
+            match tail
+                .strip_prefix(separator)
+                .and_then(|after| after.strip_prefix(token))
+            {
+                Some(after) => {
+                    tail = after;
+                    true
+                }
+                None => false,
+            }
+        })
+    })
 }
 
 /// Run `initialize` + `tools/list` against one endpoint with no credentials.
@@ -1219,5 +1739,267 @@ mod tests {
             !loaded.services.is_empty(),
             "either the working tree's copy or the embedded one must be returned"
         );
+    }
+
+    #[test]
+    fn a_service_reference_is_spelled_by_token_runs() {
+        let tests = [
+            ("exact: bare id", ("run", "run", SCORE_SERVICE, (0, 1))),
+            (
+                "exact: brand dropped from the query",
+                ("run", "cloud run", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "exact: id inside a longer query",
+                ("run", "list cloud run services", SCORE_SERVICE, (1, 3)),
+            ),
+            (
+                "exact: brand dropped from the id",
+                ("cloudasset", "asset", SCORE_SERVICE, (0, 1)),
+            ),
+            (
+                "exact: brand on both sides",
+                ("cloudasset", "cloud asset", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "exact: multi-token spelling",
+                (
+                    "bigquerydatatransfer",
+                    "bigquery data transfer",
+                    SCORE_SERVICE,
+                    (0, 3),
+                ),
+            ),
+            (
+                "exact: split product name",
+                ("bigquery", "big query", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "exact: brand inside the id",
+                (
+                    "geminicloudassist",
+                    "gemini cloud assist",
+                    SCORE_SERVICE,
+                    (0, 3),
+                ),
+            ),
+            (
+                "prefix: product name shorter than the id",
+                ("sqladmin", "cloud sql", SCORE_SERVICE_PREFIX, (0, 2)),
+            ),
+            (
+                "prefix: single token",
+                (
+                    "bigquerydatatransfer",
+                    "bigquery",
+                    SCORE_SERVICE_PREFIX,
+                    (0, 1),
+                ),
+            ),
+            (
+                "prefix: a lone token can still start the id",
+                ("bigquery", "query big", SCORE_SERVICE_PREFIX, (1, 2)),
+            ),
+            (
+                "none: brand alone names nothing",
+                ("cloudcli", "cloud", 0, (0, 0)),
+            ),
+            ("none: unrelated token", ("run", "bigquery", 0, (0, 0))),
+            (
+                "none: no run starts the id",
+                ("bigquery", "data warehouse", 0, (0, 0)),
+            ),
+        ];
+        for (name, (service_id, query, score, (start, end))) in tests {
+            let tokens: Vec<&str> = query.split_whitespace().collect();
+            let reference = service_reference(service_id, &tokens);
+            assert_eq!(
+                (reference.score, reference.start, reference.end),
+                (score, start, end),
+                "{name}: `{query}` against `{service_id}`"
+            );
+        }
+    }
+
+    #[test]
+    fn camelcase_names_index_as_snake_words() {
+        let tests: HashMap<&str, (&str, &str)> = HashMap::from([
+            (
+                "snake case is untouched",
+                ("list_services", "list_services"),
+            ),
+            (
+                "camel words split",
+                ("CreateBackupPlan", "create_backup_plan"),
+            ),
+            (
+                "acronym ends before a word",
+                ("GetIAMPolicy", "get_iam_policy"),
+            ),
+            ("digit ends a word", ("Http2Server", "http2_server")),
+            (
+                "existing separator is not doubled",
+                ("Create_Backup", "create_backup"),
+            ),
+        ]);
+        for (name, (input, expected)) in tests {
+            let mut text = String::new();
+            let span = push_name_words(&mut text, input);
+            assert_eq!(&text[span.start..span.end], expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn query_lowercasing_agrees_between_stack_and_heap() {
+        let samples = [
+            "Cloud RUN",
+            "  List   Cloud\tRun  ",
+            "İstanbul",
+            "ΣΊΣΥΦΟΣ",
+            "mixed 🚀 Emoji X",
+        ];
+        for sample in samples {
+            let mut buf = [0u8; QUERY_INLINE_BYTES];
+            let inline = lowercase_into(sample, &mut buf)
+                .unwrap_or_else(|| panic!("`{sample}` fits the inline buffer"));
+            assert_eq!(
+                inline,
+                lowercase(sample),
+                "stack and heap lowering diverge on `{sample}`"
+            );
+        }
+
+        let oversized = "x".repeat(QUERY_INLINE_BYTES + 1);
+        let mut buf = [0u8; QUERY_INLINE_BYTES];
+        assert!(
+            lowercase_into(&oversized, &mut buf).is_none(),
+            "an oversized query must report that it does not fit"
+        );
+    }
+
+    #[test]
+    fn search_with_delivers_the_best_hits_and_counts_all_matches() {
+        let catalog = sample_catalog();
+
+        let mut hits = Vec::new();
+        let total = catalog.search_with("list", None, 1, |hit| hits.push(hit));
+        assert_eq!(total, 2, "both list tools match");
+        assert_eq!(hits.len(), 1, "only the best hit is delivered");
+        assert_eq!(hits[0].tool.namespaced_name, "bigquery__list_datasets");
+        assert!(hits[0].score >= SCORE_NAME_WORD);
+
+        let mut nothing = Vec::new();
+        let counted = catalog.search_with("list", None, 0, |hit| nothing.push(hit));
+        assert_eq!((counted, nothing.len()), (2, 0), "limit 0 still counts");
+    }
+
+    #[test]
+    fn a_query_that_names_the_service_outranks_name_substrings() {
+        // `bigquery__run_query` carries `run` as a name word; the `run`
+        // service's own tool mentions it nowhere in its name. Before the
+        // service reference existed, the name word won — this is the
+        // real-model E2E defect in miniature.
+        let catalog = Catalog::new(vec![
+            service(
+                "run",
+                &[("get_service", "Get info about a Cloud Run service")],
+            ),
+            service(
+                "bigquery",
+                &[("run_query", "Run a SQL query in Google Cloud")],
+            ),
+        ])
+        .expect("valid");
+
+        for query in ["run", "cloud run"] {
+            let names: Vec<&str> = catalog
+                .search(query, None)
+                .iter()
+                .map(|t| t.namespaced_name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                ["run__get_service", "bigquery__run_query"],
+                "`{query}` must put the named service first"
+            );
+        }
+    }
+
+    #[test]
+    fn camelcase_tools_match_word_queries() {
+        let catalog = Catalog::new(vec![service(
+            "backupdr",
+            &[("CreateBackupPlan", "Creates a backup plan.")],
+        )])
+        .expect("valid");
+
+        assert_eq!(
+            catalog.search("backup plan", None).len(),
+            1,
+            "camel words must match a spaced query"
+        );
+        assert_eq!(
+            catalog.search("CreateBackupPlan", None).len(),
+            1,
+            "the published spelling must still be found"
+        );
+    }
+
+    #[test]
+    fn the_exact_name_bonus_applies_to_camelcase_names() {
+        // `aaa_first` sorts first and matches in its description, so only the
+        // exact-name bonus on the camel tool's raw spelling reorders them.
+        let catalog = Catalog::new(vec![service(
+            "backupdr",
+            &[
+                ("BackupPlan", "d"),
+                ("aaa_first", "mentions backupplan verbatim"),
+            ],
+        )])
+        .expect("valid");
+
+        let names: Vec<&str> = catalog
+            .search("backupplan", None)
+            .iter()
+            .map(|t| t.upstream_name())
+            .collect();
+        assert_eq!(names, ["BackupPlan", "aaa_first"]);
+    }
+
+    #[test]
+    fn a_clone_drops_the_index_and_still_searches_identically() {
+        let original = sample_catalog();
+        let before: Vec<&str> = original
+            .search("cloud", None)
+            .iter()
+            .map(|t| t.namespaced_name.as_str())
+            .collect();
+
+        let cloned = original.clone();
+        assert_eq!(original, cloned, "equality ignores the derived index");
+        let after: Vec<&str> = cloned
+            .search("cloud", None)
+            .iter()
+            .map(|t| t.namespaced_name.as_str())
+            .collect();
+        assert_eq!(before, after, "a rebuilt index must rank identically");
+    }
+
+    #[test]
+    fn search_with_survives_reentrant_searches_from_its_callback() {
+        // The candidate scratch is moved out of its thread-local cell for the
+        // duration of a query, so a search issued from inside `visit` must
+        // work rather than panic on a second borrow.
+        let catalog = sample_catalog();
+        let mut outer = Vec::new();
+        catalog.search_with("list", None, usize::MAX, |hit| {
+            let mut inner = Vec::new();
+            catalog.search_with("cloud", None, usize::MAX, |nested| {
+                inner.push(nested.tool.namespaced_name.clone())
+            });
+            outer.push((hit.tool.namespaced_name.clone(), inner.len()));
+        });
+        assert_eq!(outer.len(), 2);
+        assert!(outer.iter().all(|(_, nested_hits)| *nested_hits == 2));
     }
 }
