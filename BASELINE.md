@@ -284,7 +284,27 @@ not where startup goes.
 | Phase | Commit | Startup real median (ms) | Offline median (ms) | Search warm `cloud run` (µs / allocs) | Parse (ms) | Binary (B) |
 |---|---|---:|---:|---:|---:|---:|
 | baseline (P1) | `d341bbb` | 1809.31 | 137.80 | 58.89 / 1,099 | 9.86 | 30,442,048 |
-| P2 | see section 8 | **22.84** | **22.78** | 58.64 / 1,099 (untouched) | 9.21 (untouched) | 31,557,600 |
+| P2 | `b4b184d` + `7e7af67` | **22.84** | **22.78** | 58.64 / 1,099 (untouched) | 9.21 (untouched) | 31,586,464 |
+
+Notes on the P2 row:
+
+- Two-tier only. Flat mode (`--expose flat`) stays network-bound by design --
+  median 1905 ms on the same harness (section 8a) -- because its tool list is
+  fixed at `initialize` and there is no `listChanged`, so the exposed set must
+  be final before serving. The alternative of serving the configured set
+  unpruned and letting disabled APIs fail at call time with the
+  `SERVICE_DISABLED` remediation was considered and rejected: it would list
+  tools that cannot be used, and the remediation only helps after a failed
+  call. Do not "fix" flat's startup without re-making that trade.
+- Independent measurement by the team lead on `b4b184d`: time to the
+  `tools/list` *response* min 18.77 / median 19.47 / p95 20.66 ms; time to
+  process *exit* min 131.63 / median 133.36 / p95 136.90 ms. The exit figure
+  is the background task finishing gcp_auth's ~113 ms trust-store load, which
+  is why a `hyperfine -N` over a piped session reads ~130 ms: hyperfine
+  measures to exit, not to first response.
+- A failed or timed-out credential fetch is held for 30 s
+  (`FETCH_FAILURE_COOLDOWN`); `list_services` keeps reporting `failed` with
+  the original reason throughout, and the first call after the window retries.
 
 ## 8. P2 -- network off the startup critical path
 
