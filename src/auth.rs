@@ -276,7 +276,17 @@ impl AuthContext {
     /// Fails fast: an unusable credential source is reported here, before
     /// anything is served. This is what `--strict-startup` asks for.
     pub async fn new(cfg: &Config) -> Result<Self, Error> {
-        let provider = gcp_auth::provider().await?;
+        // Bounded for the same reason the lazy path is: a wedged metadata
+        // server or a hung `gcloud` must not hold the process open forever.
+        // A plain `timeout` suffices *here* precisely because this path does
+        // not block its thread -- there is no `block_in_place` between the
+        // timer and the runtime, which is the whole difference from
+        // [`drive_blocking`]. Leaving this one unbounded would also make the
+        // two paths disagree: `--strict-startup` (and `--expose flat`, which
+        // forces it) would be the only way to reach an unbounded discovery.
+        let provider = tokio::time::timeout(DISCOVERY_TIMEOUT, gcp_auth::provider())
+            .await
+            .map_err(|_elapsed| Error::TokenFetchTimeout(DISCOVERY_TIMEOUT))??;
         Self::with_source(Arc::new(GcpTokenSource { provider }), &cfg.quota_project)
     }
 
@@ -361,7 +371,29 @@ impl AuthContext {
             // producing the same unusable token.
             let cached = match CachedToken::from_fetched(fetched) {
                 Ok(cached) => cached,
-                Err(error) => return Err(Self::hold_failure(&mut state, error)),
+                Err(error) => {
+                    // Deliberately NOT `hold_failure`: that stores
+                    // `error.to_string()`, and this particular error is
+                    // computed *from the token bytes*. The stored text reaches
+                    // the model twice over -- through
+                    // `Error::CredentialsCoolingDown` and through
+                    // `list_services`' `startup.credentials_error` -- so it is
+                    // only safe today because `http`'s `InvalidHeaderValue` is
+                    // a unit struct that renders "failed to parse header
+                    // value" and drops the offending bytes. That is a
+                    // third-party `Display` impl standing between a raw bearer
+                    // token and an MCP client, held by nothing in this
+                    // repository and free to change in a patch release. A
+                    // fixed string removes the dependency on it; the caller
+                    // still receives the original error.
+                    state.failure = Some(RecentFailure {
+                        at: tokio::time::Instant::now(),
+                        cause: "the credential source returned a token that \
+                                cannot be rendered as an HTTP header"
+                            .to_owned(),
+                    });
+                    return Err(error);
+                }
             };
             state.token = Some(cached);
             state.failure = None;

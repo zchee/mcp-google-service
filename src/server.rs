@@ -752,7 +752,13 @@ fn flat_tools(catalog: &Catalog) -> Result<Vec<Tool>, McpError> {
     }
     if tools.is_empty() && omitted > 0 {
         return Err(McpError::internal_error(
-            format!("none of the {omitted} tool definitions could be materialized"),
+            // Both branches keep the count: the caller's actionable fact is
+            // how many definitions were lost, and the singular phrasing must
+            // not quietly drop it to buy grammatical agreement.
+            match omitted {
+                1 => "1 tool definition could not be materialized".to_owned(),
+                n => format!("none of the {n} tool definitions could be materialized"),
+            },
             None,
         ));
     }

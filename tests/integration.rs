@@ -1715,7 +1715,24 @@ async fn strict_startup_refuses_to_serve_without_a_real_token() {
     match generated {
         Ok(output) if output.status.success() => {}
         _ => {
-            eprintln!("strict-startup test inert: `openssl` unavailable to mint a throwaway key");
+            // Skipping is a convenience for a developer without `openssl`, and
+            // a hazard everywhere else: this is the *only* regression test for
+            // a HIGH finding, and a silent skip would report green on an image
+            // that never ran it -- the failure looking exactly like a pass.
+            // So on CI the missing tool is the failure. A committed PEM would
+            // remove the dependency and trip every secret scanner instead.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`openssl` is required to mint the throwaway service-account key \
+                 this test needs, and it is missing. On CI that is a failure, not \
+                 a skip: this is the only regression test for the strict-startup \
+                 credential finding, and skipping it silently would report a pass \
+                 for a check that never ran."
+            );
+            eprintln!(
+                "strict-startup test inert: `openssl` unavailable to mint a \
+                 throwaway key (set CI=1 to make this a failure instead)"
+            );
             return;
         }
     }

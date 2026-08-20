@@ -101,6 +101,10 @@ impl Proxy {
     /// which pays TLS setup once per host per call. One pooled client amortizes
     /// connection setup across the whole process.
     pub fn new(auth: Arc<AuthContext>, http: reqwest::Client, routes: Vec<Route>) -> Self {
+        debug_assert!(
+            routes.iter().all(|r| r.host.ends_with(".googleapis.com")),
+            "dispatch attaches a bearer token; routes must never leave googleapis.com"
+        );
         Self {
             auth,
             http,
@@ -385,7 +389,17 @@ impl Proxy {
             .auth
             .apply_tracked(&mut headers)
             .await
-            .map_err(|error| format!("could not attach Google credentials: {error}"))?;
+            // Sanitized like the sibling upstream path: this renders into the
+            // same model-visible sink, and while gcp_auth 0.12.7's variants
+            // all lead with crate-controlled static text, that is a property
+            // of a pinned version rather than an invariant a minor bump must
+            // preserve.
+            .map_err(|error| {
+                format!(
+                    "could not attach Google credentials: {}",
+                    sanitize_body(&error.to_string())
+                )
+            })?;
         let headers = headers
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
@@ -514,6 +528,91 @@ mod tests {
         let message = unnamespaced_message("list_services");
         assert!(message.contains("list_services"));
         assert!(message.contains("{service}__{tool}"));
+    }
+
+    /// Every route the production constructor can produce stays on Google.
+    ///
+    /// This is the strongest invariant in the binary and until now it held by
+    /// construction alone: dispatch attaches a bearer token to whatever host
+    /// the route names, and nothing failed if a refactor pointed one
+    /// elsewhere. `Route`'s fields are public and `Proxy::new` is public, so
+    /// "we only ever call `from_endpoints`" was a convention rather than a
+    /// check. Asserting it over the whole registry costs nothing and turns a
+    /// silent refactor into a red test.
+    #[test]
+    fn every_route_from_the_registry_stays_on_googleapis_com() {
+        let endpoints: Vec<&Endpoint> = registry::ENDPOINTS.iter().collect();
+        assert!(
+            !endpoints.is_empty(),
+            "an empty registry would make this assertion vacuous"
+        );
+
+        let proxy = Proxy::from_endpoints(
+            Arc::new(
+                crate::auth::AuthContext::with_source(Arc::new(UnusedTokenSource), "test-project")
+                    .expect("a literal project id is a valid header value"),
+            ),
+            reqwest::Client::new(),
+            &endpoints,
+        );
+
+        for route in &proxy.routes {
+            assert!(
+                route.host.ends_with(".googleapis.com"),
+                "route `{}` leaves Google at host `{}`; dispatch would attach a \
+                 bearer token to it",
+                route.service_id,
+                route.host
+            );
+            assert!(
+                route.mcp_url.starts_with("https://")
+                    && route.mcp_url.ends_with(".googleapis.com/mcp"),
+                "route `{}` has a URL dispatch should never post a token to: {}",
+                route.service_id,
+                route.mcp_url
+            );
+        }
+    }
+
+    /// The guard itself bites, not just the registry that satisfies it.
+    ///
+    /// Without this, the `debug_assert` in [`Proxy::new`] is a line nothing
+    /// executes: every route the tests build is already on Google, so the
+    /// assertion passes vacuously and a future edit could weaken it unnoticed.
+    /// `cfg(debug_assertions)` so the test exists exactly when the assert
+    /// does -- `debug_assert` compiles out under `--release`, and a
+    /// `should_panic` test that outlived it would fail a release test run.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "routes must never leave googleapis.com")]
+    fn a_route_off_google_trips_the_guard() {
+        let auth = Arc::new(
+            crate::auth::AuthContext::with_source(Arc::new(UnusedTokenSource), "test-project")
+                .expect("a literal project id is a valid header value"),
+        );
+        let _ = Proxy::new(
+            auth,
+            reqwest::Client::new(),
+            vec![route_to_base_url("evil", "https://attacker.example")],
+        );
+    }
+
+    /// A token source that must never be consulted; this test never dispatches.
+    struct UnusedTokenSource;
+
+    impl crate::auth::TokenSource for UnusedTokenSource {
+        fn fetch(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::auth::FetchedToken, crate::error::Error>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { panic!("the route invariant test never dispatches") })
+        }
     }
 
     #[test]

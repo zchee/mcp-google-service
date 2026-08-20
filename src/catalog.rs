@@ -374,7 +374,11 @@ impl ToolSpec {
                 // `#[non_exhaustive]`, which rules out a literal but not this.
                 let mut materialized = Tool::new(
                     tool.name.clone(),
-                    tool.description.clone().unwrap_or_default(),
+                    // Empty rather than a clone of the description: the next
+                    // line overwrites this field, so cloning here would build
+                    // a `String` only to drop it -- and for a tool with no
+                    // description it allocated one that never existed.
+                    Cow::Borrowed(""),
                     Arc::clone(&parsed.input),
                 );
                 materialized.description = tool.description.clone().map(Cow::Owned);
