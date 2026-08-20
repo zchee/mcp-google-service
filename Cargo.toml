@@ -7,6 +7,13 @@ rust-version = "1.88"
 # snapshot and targets one operator workflow.
 publish = false
 
+# Stripping corrupts the Mach-O LINKEDIT segment of proc-macro dylibs on macOS,
+# and dyld then refuses to load them ("mis-aligned LINKEDIT string pool"). The
+# build fails claiming it cannot find `serde_derive`, `tokio_macros` and every
+# other derive crate, which points nowhere near the real cause.
+[profile.release]
+strip = "none"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
