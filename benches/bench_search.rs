@@ -31,12 +31,8 @@ use mcp_google_service::catalog::{self, Catalog};
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
 /// The catalog the binary ships, parsed once per process.
-static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
-    catalog::embedded_snapshot()
-        .expect("embedded snapshot parses")
-        .into_catalog()
-        .expect("embedded snapshot satisfies the namespacing invariants")
-});
+static CATALOG: LazyLock<Catalog> =
+    LazyLock::new(|| catalog::embedded_catalog().expect("the embedded archive materializes"));
 
 /// What `search_tools` passes when the caller does not name a limit; mirrors
 /// `DEFAULT_SEARCH_LIMIT` in `src/server.rs`, which is private on purpose.

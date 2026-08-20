@@ -17,7 +17,7 @@ use std::{
 
 use rmcp::{
     ServiceExt,
-    model::Tool,
+    model::{JsonObject, Tool},
     service::{ClientInitializeError, ServiceError},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -26,7 +26,10 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 
-use crate::registry::{self, Endpoint};
+use crate::{
+    archive,
+    registry::{self, Endpoint},
+};
 
 /// Separator between the service prefix and the upstream tool name.
 ///
@@ -48,8 +51,16 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Repository-relative location of the committed snapshot.
 pub const SNAPSHOT_PATH: &str = "data/catalog-snapshot.json";
 
-/// Snapshot compiled into the binary so a network-less start still serves tools.
-const EMBEDDED_SNAPSHOT: &str = include_str!("../data/catalog-snapshot.json");
+/// Keeps the embedded archive's rkyv payload aligned: the bytes start with a
+/// 16-byte header, so a 16-aligned start leaves the payload 16-aligned too.
+#[repr(C, align(16))]
+struct AlignedArchive<T: ?Sized>(T);
+
+/// Catalog archive compiled into the binary so a network-less start still
+/// serves tools; `data/catalog-snapshot.bin`, derived from the committed JSON
+/// snapshot and pinned to it by `archive::tests`.
+static EMBEDDED_ARCHIVE: &AlignedArchive<[u8]> =
+    &AlignedArchive(*include_bytes!("../data/catalog-snapshot.bin"));
 
 /// Score when a run of query tokens spells the tool's service id.
 ///
@@ -128,9 +139,9 @@ pub enum CatalogError {
         len: usize,
     },
 
-    /// The snapshot baked into the binary is not valid JSON for this model.
-    #[error("embedded snapshot at `{SNAPSHOT_PATH}` is not a valid catalog snapshot")]
-    EmbeddedSnapshot(#[source] serde_json::Error),
+    /// The archive baked into the binary failed its header or validation.
+    #[error("embedded catalog archive is unusable; the build is defective")]
+    EmbeddedArchive(#[source] archive::ArchiveError),
 
     /// An explicitly named snapshot file could not be read.
     #[error("catalog snapshot `{path}` could not be read")]
@@ -183,8 +194,8 @@ pub struct NamespacedTool {
     pub namespaced_name: String,
     /// Service that serves this tool.
     pub service_id: String,
-    /// The upstream tool definition, including its input/output schemas.
-    pub tool: Tool,
+    /// The upstream tool definition; schemas may still be compressed.
+    pub tool: ToolSpec,
 }
 
 impl NamespacedTool {
@@ -193,13 +204,314 @@ impl NamespacedTool {
         Self {
             namespaced_name: format!("{service_id}{NAMESPACE_SEPARATOR}{}", tool.name),
             service_id: service_id.to_owned(),
-            tool,
+            tool: ToolSpec::Live(Box::new(tool)),
         }
     }
 
     /// The upstream tool name, without the service prefix.
     pub fn upstream_name(&self) -> &str {
-        &self.tool.name
+        self.tool.name()
+    }
+}
+
+/// Why a tool's schemas could not be produced.
+///
+/// Reachable only from the archived representation, whose frames were
+/// verified at generation and are pinned to the committed JSON by test; a
+/// failure here means the running binary and its embedded artifact disagree,
+/// so callers surface it rather than panicking.
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaError {
+    /// A zstd frame would not inflate (or failed its content checksum).
+    #[error("schema of `{tool}` failed to decompress")]
+    Inflate {
+        /// Upstream tool name.
+        tool: String,
+        /// Underlying cause.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Inflated bytes were not the JSON object they were generated from.
+    #[error("schema of `{tool}` is not a JSON object after decompression")]
+    Parse {
+        /// Upstream tool name.
+        tool: String,
+        /// Underlying cause.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A full `rmcp` tool could not be assembled from the archived fields.
+    #[error("archived tool `{tool}` did not assemble into an rmcp tool")]
+    Assemble {
+        /// Upstream tool name.
+        tool: String,
+        /// Underlying cause.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// A tool definition: live from an upstream, or archived in the binary.
+///
+/// The live variant is a complete [`rmcp::model::Tool`] and round-trips every
+/// field rmcp knows, present and future. The archived variant carries the
+/// fields the serve path reads constantly (name, description) as strings and
+/// keeps the schemas as the embedded archive's zstd frames, parsed once on
+/// first use; its serialized form is pinned byte-identical to the source JSON
+/// by the archive identity tests.
+#[derive(Debug, Clone)]
+pub enum ToolSpec {
+    /// Straight from an upstream `tools/list` or an operator's JSON snapshot.
+    Live(Box<Tool>),
+    /// From the embedded archive; schemas stay compressed until asked for.
+    Archived(ArchivedTool),
+}
+
+/// The archived tool representation; see [`ToolSpec::Archived`].
+#[derive(Debug, Clone)]
+pub struct ArchivedTool {
+    name: String,
+    description: Option<String>,
+    annotations_json: Option<&'static str>,
+    input_frame: &'static [u8],
+    input_len: u32,
+    output_frame: Option<&'static [u8]>,
+    output_len: u32,
+    /// Parsed schemas, shared by every clone so a catalog copy keeps them.
+    parsed: Arc<OnceLock<ParsedSchemas>>,
+}
+
+/// Cached result of inflating one tool's schema frames.
+#[derive(Debug)]
+struct ParsedSchemas {
+    input: Arc<JsonObject>,
+    output: Option<Arc<JsonObject>>,
+}
+
+impl ToolSpec {
+    /// The upstream tool name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Live(tool) => &tool.name,
+            Self::Archived(tool) => &tool.name,
+        }
+    }
+
+    /// The description text, when the upstream sent one.
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            Self::Live(tool) => tool.description.as_deref(),
+            Self::Archived(tool) => tool.description.as_deref(),
+        }
+    }
+
+    /// The input schema, inflating and caching it on first use.
+    ///
+    /// # Errors
+    ///
+    /// Per [`SchemaError`]; live tools cannot fail.
+    pub fn input_schema(&self) -> Result<Arc<JsonObject>, SchemaError> {
+        match self {
+            Self::Live(tool) => Ok(Arc::clone(&tool.input_schema)),
+            Self::Archived(tool) => Ok(Arc::clone(&tool.parsed()?.input)),
+        }
+    }
+
+    /// The output schema, when the tool has one; inflated and cached alike.
+    ///
+    /// # Errors
+    ///
+    /// Per [`SchemaError`]; live tools cannot fail.
+    pub fn output_schema(&self) -> Result<Option<Arc<JsonObject>>, SchemaError> {
+        match self {
+            Self::Live(tool) => Ok(tool.output_schema.as_ref().map(Arc::clone)),
+            Self::Archived(tool) => Ok(tool.parsed()?.output.as_ref().map(Arc::clone)),
+        }
+    }
+
+    /// The `annotations` object as compact JSON text, when present.
+    ///
+    /// # Errors
+    ///
+    /// Serialization failure of a live tool's annotations, which would be a
+    /// bug in `rmcp`'s own types.
+    pub fn annotations_json(&self) -> Result<Option<String>, SchemaError> {
+        match self {
+            Self::Live(tool) => tool
+                .annotations
+                .as_ref()
+                .map(|annotations| {
+                    serde_json::to_string(annotations).map_err(|source| SchemaError::Assemble {
+                        tool: tool.name.to_string(),
+                        source,
+                    })
+                })
+                .transpose(),
+            Self::Archived(tool) => Ok(tool.annotations_json.map(str::to_owned)),
+        }
+    }
+
+    /// A complete `rmcp` tool, materializing archived schemas.
+    ///
+    /// This is the flat-mode and refresh boundary; the two-tier serve path
+    /// never needs it.
+    ///
+    /// # Errors
+    ///
+    /// Per [`SchemaError`].
+    pub fn to_rmcp(&self) -> Result<Tool, SchemaError> {
+        match self {
+            Self::Live(tool) => Ok((**tool).clone()),
+            Self::Archived(tool) => {
+                let parsed = tool.parsed()?;
+                let mut object = serde_json::Map::new();
+                object.insert(
+                    "name".to_owned(),
+                    serde_json::Value::String(tool.name.clone()),
+                );
+                if let Some(description) = &tool.description {
+                    object.insert(
+                        "description".to_owned(),
+                        serde_json::Value::String(description.clone()),
+                    );
+                }
+                object.insert(
+                    "inputSchema".to_owned(),
+                    serde_json::Value::Object((*parsed.input).clone()),
+                );
+                if let Some(output) = &parsed.output {
+                    object.insert(
+                        "outputSchema".to_owned(),
+                        serde_json::Value::Object((**output).clone()),
+                    );
+                }
+                if let Some(annotations) = tool.annotations_json {
+                    let value =
+                        serde_json::from_str(annotations).map_err(|source| SchemaError::Parse {
+                            tool: tool.name.clone(),
+                            source,
+                        })?;
+                    object.insert("annotations".to_owned(), value);
+                }
+                serde_json::from_value(serde_json::Value::Object(object)).map_err(|source| {
+                    SchemaError::Assemble {
+                        tool: tool.name.clone(),
+                        source,
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl ArchivedTool {
+    /// Inflate and parse both schema frames, once.
+    fn parsed(&self) -> Result<&ParsedSchemas, SchemaError> {
+        if let Some(parsed) = self.parsed.get() {
+            return Ok(parsed);
+        }
+        let inflate = |frame: &[u8], len: u32| -> Result<Arc<JsonObject>, SchemaError> {
+            let raw = crate::archive::decompress_schema(frame, len).map_err(|source| {
+                SchemaError::Inflate {
+                    tool: self.name.clone(),
+                    source,
+                }
+            })?;
+            let object: JsonObject =
+                serde_json::from_slice(&raw).map_err(|source| SchemaError::Parse {
+                    tool: self.name.clone(),
+                    source,
+                })?;
+            Ok(Arc::new(object))
+        };
+        let parsed = ParsedSchemas {
+            input: inflate(self.input_frame, self.input_len)?,
+            output: self
+                .output_frame
+                .map(|frame| inflate(frame, self.output_len))
+                .transpose()?,
+        };
+        // A concurrent caller may have won; either value came from the same
+        // frames, so whichever landed is served.
+        Ok(self.parsed.get_or_init(|| parsed))
+    }
+}
+
+#[cfg(test)]
+impl ToolSpec {
+    /// A spec whose frames cannot inflate; exercises the schema error paths.
+    pub(crate) fn broken_for_tests(name: &str) -> Self {
+        Self::Archived(ArchivedTool {
+            name: name.to_owned(),
+            description: Some("broken on purpose".to_owned()),
+            annotations_json: None,
+            input_frame: &[0xde, 0xad, 0xbe, 0xef],
+            input_len: 64,
+            output_frame: None,
+            output_len: 0,
+            parsed: Arc::new(OnceLock::new()),
+        })
+    }
+}
+
+impl PartialEq for ToolSpec {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Live(a), Self::Live(b)) => a == b,
+            (Self::Archived(a), Self::Archived(b)) => {
+                a.name == b.name
+                    && a.description == b.description
+                    && a.annotations_json == b.annotations_json
+                    && a.input_frame == b.input_frame
+                    && a.output_frame == b.output_frame
+            }
+            // Mixed provenance: equal when they serialize to the same JSON,
+            // which is the only meaning of equality the snapshot format has.
+            (a, b) => match (serde_json::to_value(a), serde_json::to_value(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            },
+        }
+    }
+}
+
+impl Serialize for ToolSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeMap};
+        match self {
+            Self::Live(tool) => tool.serialize(serializer),
+            // Field order mirrors `rmcp::model::Tool`'s declaration order;
+            // the archive identity tests hold this byte-identical to the
+            // JSON the archive was generated from.
+            Self::Archived(archived) => {
+                let parsed = archived.parsed().map_err(S::Error::custom)?;
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_entry("name", &archived.name)?;
+                if let Some(description) = &archived.description {
+                    map.serialize_entry("description", description)?;
+                }
+                map.serialize_entry("inputSchema", &*parsed.input)?;
+                if let Some(output) = &parsed.output {
+                    map.serialize_entry("outputSchema", &**output)?;
+                }
+                if let Some(annotations) = archived.annotations_json {
+                    // Typed, not `serde_json::Value`: the Value's map sorts
+                    // keys, while the snapshot carries rmcp's struct order.
+                    let annotations: rmcp::model::ToolAnnotations =
+                        serde_json::from_str(annotations).map_err(S::Error::custom)?;
+                    map.serialize_entry("annotations", &annotations)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Tool::deserialize(deserializer).map(|tool| Self::Live(Box::new(tool)))
     }
 }
 
@@ -451,6 +763,51 @@ impl Catalog {
     fn index(&self) -> &SearchIndex {
         self.index
             .get_or_init(|| SearchIndex::build(&self.services))
+    }
+
+    /// Materialize a catalog from an archived snapshot.
+    ///
+    /// Copies out the hot fields (ids, names, descriptions) and keeps every
+    /// schema as its `'static` compressed frame, so the cost is proportional
+    /// to the text a search reads, not to the schemas nobody asked for.
+    ///
+    /// # Errors
+    ///
+    /// Namespacing violations, per [`Catalog::new`].
+    pub fn from_archive(
+        archived: &'static archive::ArchivedSnapshotArchive,
+    ) -> Result<Self, CatalogError> {
+        let mut services = Vec::with_capacity(archived.services.len());
+        for service in archived.services.iter() {
+            let service_id = service.service_id.as_str().to_owned();
+            let mut tools = Vec::with_capacity(service.tools.len());
+            for tool in service.tools.iter() {
+                tools.push(NamespacedTool {
+                    namespaced_name: tool.namespaced_name.as_str().to_owned(),
+                    service_id: service_id.clone(),
+                    tool: ToolSpec::Archived(ArchivedTool {
+                        name: tool.name.as_str().to_owned(),
+                        description: tool.description.as_ref().map(|d| d.as_str().to_owned()),
+                        annotations_json: tool.annotations_json.as_ref().map(|a| a.as_str()),
+                        input_frame: tool.input_schema_zstd.as_slice(),
+                        input_len: tool.input_schema_len.to_native(),
+                        output_frame: tool.output_schema_zstd.as_ref().map(|f| f.as_slice()),
+                        output_len: tool.output_schema_len.to_native(),
+                        parsed: Arc::new(OnceLock::new()),
+                    }),
+                });
+            }
+            services.push(ServiceCatalog {
+                service_id,
+                source: if service.live {
+                    CatalogSource::Live
+                } else {
+                    CatalogSource::Snapshot
+                },
+                tools,
+            });
+        }
+        Self::new(services)
     }
 
     /// Enforce the two namespacing invariants over the whole catalog.
@@ -775,8 +1132,7 @@ impl Catalog {
                 .iter()
                 .filter_map(|(name, before)| {
                     let after = new.get(name)?;
-                    let changed = before.tool.input_schema != after.tool.input_schema
-                        || before.tool.output_schema != after.tool.output_schema;
+                    let changed = !schemas_equal(&before.tool, &after.tool);
                     changed.then(|| (*name).to_owned())
                 })
                 .collect(),
@@ -808,6 +1164,21 @@ impl Catalog {
     }
 }
 
+/// Whether two tools' schemas are the same JSON.
+///
+/// Inflates archived sides on demand (cached); a side that cannot produce its
+/// schemas counts as changed, which sends drift the loud direction.
+fn schemas_equal(before: &ToolSpec, after: &ToolSpec) -> bool {
+    let pair =
+        |spec: &ToolSpec| Ok::<_, SchemaError>((spec.input_schema()?, spec.output_schema()?));
+    match (pair(before), pair(after)) {
+        (Ok((input_a, output_a)), Ok((input_b, output_b))) => {
+            input_a == input_b && output_a == output_b
+        }
+        _ => false,
+    }
+}
+
 /// Split `{service}__{tool}` into its halves.
 ///
 /// Service ids never contain `__`, so the first separator is the boundary even
@@ -833,8 +1204,8 @@ impl SearchIndex {
                         .map(|t| {
                             // Raw copy + word copy; the latter may gain a `_`
                             // per CamelCase boundary, so allow for half again.
-                            (t.tool.name.len() * 5).div_ceil(2)
-                                + t.tool.description.as_deref().map_or(0, str::len)
+                            (t.tool.name().len() * 5).div_ceil(2)
+                                + t.tool.description().map_or(0, str::len)
                         })
                         .sum::<usize>()
             })
@@ -847,10 +1218,9 @@ impl SearchIndex {
             let id = push_lowercase(&mut text, &service.service_id);
             let first = tools.len();
             for (tool_index, entry) in service.tools.iter().enumerate() {
-                let raw_name = push_lowercase(&mut text, &entry.tool.name);
-                let name = push_name_words(&mut text, &entry.tool.name);
-                let description =
-                    push_lowercase(&mut text, entry.tool.description.as_deref().unwrap_or(""));
+                let raw_name = push_lowercase(&mut text, entry.tool.name());
+                let name = push_name_words(&mut text, entry.tool.name());
+                let description = push_lowercase(&mut text, entry.tool.description().unwrap_or(""));
                 tools.push(IndexedTool {
                     service: service_index,
                     tool: tool_index,
@@ -1126,14 +1496,28 @@ async fn fetch_tools(
     listed.map_err(|e| FetchError::ListTools(Box::new(e)))
 }
 
-/// Parse the snapshot compiled into the binary.
+/// Materialize the catalog archive compiled into the binary.
+///
+/// Checked access first, then per-service and per-tool hot fields copied out;
+/// schemas stay as `'static` compressed frames inside the returned catalog.
 ///
 /// # Errors
 ///
-/// Returns [`CatalogError::EmbeddedSnapshot`] when the embedded copy fails to
-/// parse, which is a build-time defect rather than a runtime condition.
-pub fn embedded_snapshot() -> Result<Snapshot, CatalogError> {
-    serde_json::from_str(EMBEDDED_SNAPSHOT).map_err(CatalogError::EmbeddedSnapshot)
+/// Returns [`CatalogError::EmbeddedArchive`] when the embedded artifact fails
+/// its header or validation, which is a build defect rather than a runtime
+/// condition, or namespacing violations per [`Catalog::new`].
+pub fn embedded_catalog() -> Result<Catalog, CatalogError> {
+    let archived = archive::access(&EMBEDDED_ARCHIVE.0).map_err(CatalogError::EmbeddedArchive)?;
+    Catalog::from_archive(archived)
+}
+
+/// The embedded catalog as a [`Snapshot`], timestamped as the archive was.
+///
+/// Cheap: archived tools clone by reference, no schema is inflated.
+fn embedded_fallback_snapshot() -> Result<Snapshot, CatalogError> {
+    let archived = archive::access(&EMBEDDED_ARCHIVE.0).map_err(CatalogError::EmbeddedArchive)?;
+    let catalog = Catalog::from_archive(archived)?;
+    Ok(catalog.to_snapshot(archived.generated_at.as_str().to_owned()))
 }
 
 /// Load a snapshot from an explicitly named file, with no fallback.
@@ -1175,10 +1559,10 @@ pub fn load_snapshot_file(path: &Path) -> Result<Snapshot, CatalogError> {
 ///
 /// Per [`embedded_snapshot`] or [`load_snapshot_file`]; an unusable explicit
 /// path is fatal rather than a silent fall back to the embedded copy.
-pub fn serve_snapshot(override_path: Option<&Path>) -> Result<Snapshot, CatalogError> {
+pub fn serve_catalog(override_path: Option<&Path>) -> Result<Catalog, CatalogError> {
     match override_path {
-        Some(path) => load_snapshot_file(path),
-        None => embedded_snapshot(),
+        Some(path) => load_snapshot_file(path)?.into_catalog(),
+        None => embedded_catalog(),
     }
 }
 
@@ -1211,15 +1595,15 @@ pub fn load_working_tree_snapshot() -> Result<Snapshot, CatalogError> {
             "no catalog snapshot on disk; using the embedded copy"
         ),
     }
-    embedded_snapshot()
+    embedded_fallback_snapshot()
 }
 
 /// Log services present in the snapshot that the registry no longer pins.
 ///
 /// Snapshot fallback is deliberately loud: a silently stale catalog would show
 /// up to users as missing tools with no explanation.
-pub fn warn_on_registry_drift(snapshot: &Snapshot) {
-    for service in &snapshot.services {
+pub fn warn_on_registry_drift(services: &[ServiceCatalog]) {
+    for service in services {
         if registry::find(&service.service_id).is_none() {
             tracing::warn!(
                 service = service.service_id,
@@ -1279,10 +1663,7 @@ mod tests {
 
     /// The catalog the binary actually ships, per acceptance criterion §5.2.
     fn committed_catalog() -> Catalog {
-        serde_json::from_str::<Snapshot>(EMBEDDED_SNAPSHOT)
-            .expect("embedded snapshot parses")
-            .into_catalog()
-            .expect("embedded snapshot satisfies namespacing invariants")
+        embedded_catalog().expect("the embedded archive materializes")
     }
 
     #[test]
@@ -1344,7 +1725,7 @@ mod tests {
                 tools: vec![NamespacedTool {
                     namespaced_name: "run__list".to_owned(),
                     service_id: "other".to_owned(),
-                    tool: tool("list", "b"),
+                    tool: ToolSpec::Live(Box::new(tool("list", "b"))),
                 }],
             },
         ])
@@ -1649,11 +2030,11 @@ mod tests {
         // Not "prefers": the default path has no disk branch at all, which is
         // what keeps a working directory chosen by the client from deciding
         // which tool descriptions a model reads.
-        let served = serve_snapshot(None).expect("the embedded snapshot always parses");
-        assert_eq!(served, embedded_snapshot().expect("embedded parses"));
+        let served = serve_catalog(None).expect("the embedded archive always materializes");
+        assert_eq!(served, embedded_catalog().expect("embedded materializes"));
         assert!(
             served.services.len() > 1,
-            "sanity: the embedded snapshot carries the real registry"
+            "sanity: the embedded archive carries the real registry"
         );
     }
 
@@ -1681,7 +2062,7 @@ mod tests {
 
         let original = std::env::current_dir().expect("the test process has a working directory");
         std::env::set_current_dir(&planted).expect("enter the planted directory");
-        let served = serve_snapshot(None);
+        let served = serve_catalog(None);
         let working_tree = load_working_tree_snapshot();
         std::env::set_current_dir(&original).expect("restore the working directory");
 
@@ -1693,10 +2074,10 @@ mod tests {
              comparison below is meaningful"
         );
 
-        let served = served.expect("the embedded snapshot always parses");
+        let served = served.expect("the embedded archive always materializes");
         assert_eq!(
             served,
-            embedded_snapshot().expect("embedded parses"),
+            embedded_catalog().expect("embedded materializes"),
             "the serve path must ignore a snapshot planted in the working \
              directory and use only the copy compiled into the binary"
         );
@@ -1706,8 +2087,7 @@ mod tests {
     fn an_explicit_path_overrides_the_embedded_snapshot() {
         let path = write_fixture("explicit-catalog-snapshot.json", &fixture_snapshot_json());
 
-        let served = serve_snapshot(Some(&path)).expect("an explicit, valid snapshot loads");
-        assert_eq!(served.generated_at, "2026-08-19T00:00:00Z");
+        let served = serve_catalog(Some(&path)).expect("an explicit, valid snapshot loads");
         assert_eq!(
             served.services.len(),
             1,
@@ -1720,7 +2100,7 @@ mod tests {
     #[test]
     fn a_corrupt_explicit_path_is_fatal_rather_than_silently_replaced() {
         let path = write_fixture("corrupt-catalog-snapshot.json", "{ not json");
-        let error = serve_snapshot(Some(&path))
+        let error = serve_catalog(Some(&path))
             .expect_err("a named snapshot that cannot be parsed must not fall back");
         assert!(
             matches!(error, CatalogError::SnapshotInvalid { .. }),
@@ -1728,7 +2108,7 @@ mod tests {
         );
 
         let missing = Path::new("/nonexistent/mcp-google-service/catalog-snapshot.json");
-        let error = serve_snapshot(Some(missing))
+        let error = serve_catalog(Some(missing))
             .expect_err("a named snapshot that does not exist must not fall back");
         assert!(
             matches!(error, CatalogError::SnapshotUnreadable { .. }),
@@ -2009,5 +2389,118 @@ mod tests {
         });
         assert_eq!(outer.len(), 2);
         assert!(outer.iter().all(|(_, nested_hits)| *nested_hits == 2));
+    }
+
+    /// The acceptance criterion in one assertion: a catalog materialized from
+    /// the embedded archive serializes back to the committed JSON snapshot,
+    /// byte for byte. Schemas inflate, annotations re-parse, field order and
+    /// skips match `rmcp`'s -- or this fails.
+    #[test]
+    fn archived_catalog_serializes_back_to_the_committed_json() {
+        let json = embedded_fallback_snapshot()
+            .expect("the embedded archive materializes")
+            .to_json()
+            .expect("a materialized snapshot serializes");
+        let committed = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT_PATH),
+        )
+        .expect("the committed snapshot file reads");
+        assert!(
+            json == committed,
+            "the archive-materialized catalog serializes differently from \
+             data/catalog-snapshot.json ({} vs {} bytes); the archive, the \
+             serializer, or the committed pair has drifted",
+            json.len(),
+            committed.len()
+        );
+    }
+
+    /// Cross-provenance equality: the archived catalog and a serde-parsed one
+    /// hold the same tools, schemas included, so a refresh comparison between
+    /// them reports no drift.
+    #[test]
+    fn archived_and_parsed_catalogs_agree_tool_for_tool() {
+        let archived = committed_catalog();
+        let parsed: Snapshot = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT_PATH),
+            )
+            .expect("the committed snapshot file reads"),
+        )
+        .expect("the committed snapshot parses");
+        let parsed = parsed
+            .into_catalog()
+            .expect("the committed snapshot satisfies the namespacing invariants");
+
+        assert_eq!(archived.tool_count(), parsed.tool_count());
+        let drift = archived.drift_from(&parsed);
+        assert!(
+            drift.is_empty(),
+            "archived vs parsed catalogs report drift: {drift:?}"
+        );
+
+        // Spot-check one full rmcp materialization against the parsed truth.
+        let name = "run__list_services";
+        let from_archive = archived
+            .get(name)
+            .expect("present")
+            .tool
+            .to_rmcp()
+            .expect("archived schemas inflate");
+        let from_json = parsed
+            .get(name)
+            .expect("present")
+            .tool
+            .to_rmcp()
+            .expect("live");
+        assert_eq!(from_archive, from_json);
+    }
+
+    /// A frame that will not inflate must surface as a clean error from every
+    /// accessor, not a panic and never a silently different schema.
+    #[test]
+    fn a_broken_frame_is_a_clean_schema_error() {
+        let broken = ToolSpec::broken_for_tests("list_services");
+        assert_eq!(broken.name(), "list_services");
+        assert!(matches!(
+            broken.input_schema(),
+            Err(SchemaError::Inflate { .. })
+        ));
+        assert!(matches!(
+            broken.output_schema(),
+            Err(SchemaError::Inflate { .. })
+        ));
+        assert!(matches!(broken.to_rmcp(), Err(SchemaError::Inflate { .. })));
+        let error = broken.input_schema().expect_err("still broken");
+        assert!(error.to_string().contains("list_services"));
+    }
+
+    /// Search over the archived catalog equals search over the parsed one;
+    /// the golden suite runs on the archive, this pins the equivalence.
+    #[test]
+    fn search_ranks_identically_over_archived_and_parsed_catalogs() {
+        let archived = committed_catalog();
+        let parsed: Snapshot = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT_PATH),
+            )
+            .expect("the committed snapshot file reads"),
+        )
+        .expect("the committed snapshot parses");
+        let parsed = parsed.into_catalog().expect("valid");
+
+        for query in ["cloud run", "instances", "execute sql", ""] {
+            let a: Vec<&str> = archived
+                .search(query, None)
+                .iter()
+                .map(|t| t.namespaced_name.as_str())
+                .collect();
+            let b: Vec<&str> = parsed
+                .search(query, None)
+                .iter()
+                .map(|t| t.namespaced_name.as_str())
+                .collect();
+            assert_eq!(a, b, "ranking diverged for `{query}`");
+        }
     }
 }

@@ -95,14 +95,14 @@ pub enum ArchiveError {
         source: std::io::Error,
     },
 
-    /// Tool annotations could not be serialized while building the archive.
-    #[error("annotations of `{tool}` could not be serialized")]
-    AnnotationsSerialize {
+    /// A tool's schemas or annotations could not be produced for archiving.
+    #[error("schemas of `{tool}` could not be produced")]
+    ToolSchema {
         /// Namespaced tool name.
         tool: String,
         /// Underlying cause.
         #[source]
-        source: serde_json::Error,
+        source: crate::catalog::SchemaError,
     },
 
     /// A tool disagreed with its service about the service id.
@@ -185,30 +185,26 @@ pub fn build(snapshot: &Snapshot) -> Result<Vec<u8>, ArchiveError> {
                     actual: service.service_id.clone(),
                 });
             }
+            let schemas = |source| ArchiveError::ToolSchema {
+                tool: tool.namespaced_name.clone(),
+                source,
+            };
+            let input = tool.tool.input_schema().map_err(schemas)?;
             let (input_schema_zstd, input_schema_len) =
-                compress_schema(&tool.namespaced_name, &tool.tool.input_schema)?;
-            let (output_schema_zstd, output_schema_len) = match tool.tool.output_schema.as_deref() {
-                Some(schema) => {
-                    let (frame, len) = compress_schema(&tool.namespaced_name, schema)?;
-                    (Some(frame), len)
-                }
-                None => (None, 0),
-            };
-            let annotations_json = match &tool.tool.annotations {
-                Some(annotations) => {
-                    Some(serde_json::to_string(annotations).map_err(|source| {
-                        ArchiveError::AnnotationsSerialize {
-                            tool: tool.namespaced_name.clone(),
-                            source,
-                        }
-                    })?)
-                }
-                None => None,
-            };
+                compress_schema(&tool.namespaced_name, &input)?;
+            let (output_schema_zstd, output_schema_len) =
+                match tool.tool.output_schema().map_err(schemas)? {
+                    Some(schema) => {
+                        let (frame, len) = compress_schema(&tool.namespaced_name, &schema)?;
+                        (Some(frame), len)
+                    }
+                    None => (None, 0),
+                };
+            let annotations_json = tool.tool.annotations_json().map_err(schemas)?;
             tools.push(ToolEntry {
                 namespaced_name: tool.namespaced_name.clone(),
-                name: tool.tool.name.to_string(),
-                description: tool.tool.description.as_deref().map(str::to_owned),
+                name: tool.tool.name().to_owned(),
+                description: tool.tool.description().map(str::to_owned),
                 annotations_json,
                 input_schema_zstd,
                 input_schema_len,
@@ -371,10 +367,10 @@ mod tests {
             assert_eq!(archived_service.tools.len(), service.tools.len());
             for (archived_tool, tool) in archived_service.tools.iter().zip(&service.tools) {
                 assert_eq!(archived_tool.namespaced_name.as_str(), tool.namespaced_name);
-                assert_eq!(archived_tool.name.as_str(), &*tool.tool.name);
+                assert_eq!(archived_tool.name.as_str(), tool.tool.name());
                 assert_eq!(
                     archived_tool.description.as_deref(),
-                    tool.tool.description.as_deref()
+                    tool.tool.description()
                 );
 
                 let input = decompress_schema(
@@ -384,12 +380,13 @@ mod tests {
                 .expect("input frame inflates");
                 let input: serde_json::Value =
                     serde_json::from_slice(&input).expect("input frame is JSON");
-                assert_eq!(input, json!(&*tool.tool.input_schema));
+                assert_eq!(
+                    input,
+                    json!(tool.tool.input_schema().expect("live schemas never fail"))
+                );
 
-                match (
-                    &archived_tool.output_schema_zstd,
-                    tool.tool.output_schema.as_deref(),
-                ) {
+                let output_schema = tool.tool.output_schema().expect("live schemas never fail");
+                match (&archived_tool.output_schema_zstd, output_schema) {
                     (rkyv::option::ArchivedOption::Some(frame), Some(schema)) => {
                         let output = decompress_schema(
                             frame.as_slice(),
@@ -398,7 +395,7 @@ mod tests {
                         .expect("output frame inflates");
                         let output: serde_json::Value =
                             serde_json::from_slice(&output).expect("output frame is JSON");
-                        assert_eq!(output, json!(schema));
+                        assert_eq!(output, json!(&schema));
                     }
                     (rkyv::option::ArchivedOption::None, None) => {}
                     (frame, schema) => panic!(

@@ -255,11 +255,8 @@ async fn catalog_builds_with_no_credentials_in_the_environment() {
 async fn embedded_snapshot_loads_with_no_environment() {
     let scrubbed = scrub_google_credential_env();
 
-    let snapshot = mcp_google_service::catalog::embedded_snapshot()
-        .expect("the snapshot embedded at compile time must always parse");
-    let catalog = snapshot
-        .into_catalog()
-        .expect("the embedded snapshot must satisfy the namespacing invariants");
+    let catalog = mcp_google_service::catalog::embedded_catalog()
+        .expect("the archive embedded at compile time must always materialize");
 
     assert!(
         !catalog.services.is_empty(),
@@ -656,11 +653,8 @@ async fn a_downed_upstream_is_served_from_the_snapshot_until_refresh_succeeds() 
 /// claim to be live, whatever provenance the file recorded when written.
 #[tokio::test]
 async fn a_disk_loaded_snapshot_never_reports_itself_as_live() {
-    let snapshot =
-        mcp_google_service::catalog::embedded_snapshot().expect("the embedded snapshot must parse");
-    let loaded = snapshot
-        .into_catalog()
-        .expect("the committed snapshot must satisfy the namespacing invariants");
+    let loaded = mcp_google_service::catalog::embedded_catalog()
+        .expect("the embedded archive must materialize");
 
     // The file records `live`, because that is what it was when captured.
     // This is precisely why the relabel below is load-bearing rather than
@@ -703,10 +697,10 @@ async fn a_disk_loaded_snapshot_never_reports_itself_as_live() {
 /// relabel is the only thing that can produce the expected result.
 #[tokio::test]
 async fn a_freshly_assembled_serve_catalog_reports_snapshot_provenance() {
-    let snapshot =
-        mcp_google_service::catalog::embedded_snapshot().expect("the embedded snapshot must parse");
+    let catalog = mcp_google_service::catalog::embedded_catalog()
+        .expect("the embedded archive must materialize");
     assert!(
-        snapshot
+        catalog
             .services
             .iter()
             .any(|service| service.source == CatalogSource::Live),
@@ -719,7 +713,7 @@ async fn a_freshly_assembled_serve_catalog_reports_snapshot_provenance() {
         registry::find("run").expect("`run` is a registered endpoint"),
         registry::find("bigquery").expect("`bigquery` is a registered endpoint"),
     ];
-    let state = assemble_serve_catalog(snapshot, &exposed)
+    let state = assemble_serve_catalog(catalog, &exposed)
         .expect("the committed snapshot satisfies the namespacing invariants");
 
     let startup = state.startup();
@@ -1233,14 +1227,13 @@ async fn serve_answers_before_credentials_and_enablement_resolve_then_narrows() 
         .iter()
         .map(|id| registry::find(id).expect("a registered endpoint"))
         .collect();
-    let snapshot = Catalog::new(vec![
+    let fixture = Catalog::new(vec![
         synthetic_service("run", CatalogSource::Snapshot),
         synthetic_service("bigquery", CatalogSource::Snapshot),
         synthetic_service("compute", CatalogSource::Snapshot),
     ])
-    .expect("synthetic services satisfy the namespacing invariants")
-    .to_snapshot("2026-08-19T00:00:00Z".to_owned());
-    let state = assemble_serve_catalog(snapshot, &configured)
+    .expect("synthetic services satisfy the namespacing invariants");
+    let state = assemble_serve_catalog(fixture, &configured)
         .expect("the fixture satisfies the namespacing invariants");
     let proxy = Proxy::new(
         Arc::clone(&auth),

@@ -22,7 +22,7 @@ use tokio::sync::{RwLock, watch};
 
 use crate::{
     auth::AuthContext,
-    catalog::{Catalog, CatalogError, CatalogSource, Snapshot},
+    catalog::{Catalog, CatalogError, CatalogSource},
     config::{Config, ExposeMode},
     proxy::Proxy,
     prune,
@@ -240,12 +240,11 @@ impl Readiness {
 /// Per [`Snapshot::into_catalog`]: the snapshot must satisfy the namespacing
 /// invariants.
 pub fn assemble_serve_catalog(
-    snapshot: Snapshot,
+    catalog: Catalog,
     exposed: &[&Endpoint],
 ) -> Result<CatalogState, CatalogError> {
     Ok(CatalogState::new(
-        snapshot
-            .into_catalog()?
+        catalog
             .restricted_to(exposed)
             .marked_as(CatalogSource::Snapshot),
     ))
@@ -589,7 +588,7 @@ impl ServerHandler for GoogleMcpServer {
         let catalog = self.catalog().await;
         let tools = match self.expose {
             ExposeMode::TwoTier => meta_tools(),
-            ExposeMode::Flat => flat_tools(&catalog),
+            ExposeMode::Flat => flat_tools(&catalog)?,
         };
         Ok(ListToolsResult {
             tools,
@@ -715,13 +714,24 @@ fn meta_tools() -> Vec<Tool> {
 }
 
 /// Every exposed tool, renamed to its namespaced form but otherwise verbatim.
-fn flat_tools(catalog: &Catalog) -> Vec<Tool> {
+///
+/// Materializes archived schemas: flat mode hands the client every schema at
+/// `initialize`, so this is where the lazy frames are paid for -- by the one
+/// mode whose startup is network-bound anyway.
+fn flat_tools(catalog: &Catalog) -> Result<Vec<Tool>, McpError> {
     catalog
         .tools()
         .map(|entry| {
-            let mut tool = entry.tool.clone();
+            let mut tool = entry.tool.to_rmcp().map_err(|error| {
+                tracing::error!(
+                    %error,
+                    tool = entry.namespaced_name,
+                    "flat listing could not materialize a tool definition"
+                );
+                McpError::internal_error("a tool definition could not be materialized", None)
+            })?;
             tool.name = entry.namespaced_name.clone().into();
-            tool
+            Ok(tool)
         })
         .collect()
 }
@@ -780,7 +790,7 @@ fn search_payload(catalog: &Catalog, query: &str, service: Option<&str>, limit: 
             "name": hit.tool.namespaced_name,
             "service_id": hit.tool.service_id,
             "score": hit.score,
-            "description": hit.tool.tool.description.as_deref().map(first_line),
+            "description": hit.tool.tool.description().map(first_line),
         }));
     });
     json!({
@@ -797,15 +807,32 @@ fn describe_payload(catalog: &Catalog, names: &[Value]) -> Value {
     let mut unknown = Vec::new();
     for name in names.iter().filter_map(Value::as_str) {
         match catalog.get(name) {
-            Some(entry) => described.push(json!({
-                "name": entry.namespaced_name,
-                "service_id": entry.service_id,
-                "upstream_name": entry.upstream_name(),
-                "source": catalog.service_of(name).map(|s| s.source.to_string()),
-                "description": entry.tool.description,
-                "input_schema": entry.tool.input_schema,
-                "output_schema": entry.tool.output_schema,
-            })),
+            Some(entry) => match (entry.tool.input_schema(), entry.tool.output_schema()) {
+                (Ok(input_schema), Ok(output_schema)) => described.push(json!({
+                    "name": entry.namespaced_name,
+                    "service_id": entry.service_id,
+                    "upstream_name": entry.upstream_name(),
+                    "source": catalog.service_of(name).map(|s| s.source.to_string()),
+                    "description": entry.tool.description(),
+                    "input_schema": input_schema,
+                    "output_schema": output_schema,
+                })),
+                // The archived frames were verified at generation and are
+                // pinned to the committed JSON by test, so this branch means
+                // the binary and its embedded artifact disagree. Say so
+                // instead of panicking or silently omitting the tool.
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::error!(%error, tool = name, "describe could not produce schemas");
+                    described.push(json!({
+                        "name": entry.namespaced_name,
+                        "service_id": entry.service_id,
+                        "upstream_name": entry.upstream_name(),
+                        "source": catalog.service_of(name).map(|s| s.source.to_string()),
+                        "description": entry.tool.description(),
+                        "schema_error": error.to_string(),
+                    }));
+                }
+            },
             None => unknown.push(name),
         }
     }
@@ -977,7 +1004,7 @@ mod tests {
     #[test]
     fn flat_mode_renames_tools_but_keeps_their_schemas() {
         let catalog = catalog();
-        let tools = flat_tools(&catalog);
+        let tools = flat_tools(&catalog).expect("live schemas always materialize");
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(
@@ -996,8 +1023,11 @@ mod tests {
             .iter()
             .find(|t| t.name == "run__list_services")
             .expect("present in flat mode");
-        assert_eq!(flat.input_schema, original.tool.input_schema);
-        assert_eq!(flat.description, original.tool.description);
+        assert_eq!(
+            flat.input_schema,
+            original.tool.input_schema().expect("live schemas")
+        );
+        assert_eq!(flat.description.as_deref(), original.tool.description());
     }
 
     #[test]
@@ -1087,9 +1117,8 @@ mod tests {
 
     #[test]
     fn a_freshly_assembled_catalog_is_pending_until_something_publishes() {
-        let snapshot = catalog().to_snapshot("2026-08-19T00:00:00Z".to_owned());
         let run = crate::registry::find("run").expect("run is registered");
-        let state = assemble_serve_catalog(snapshot, &[run]).expect("valid fixture");
+        let state = assemble_serve_catalog(catalog(), &[run]).expect("valid fixture");
         assert_eq!(state.readiness(), Readiness::pending());
 
         let watch = state.readiness_watch();
@@ -1215,6 +1244,34 @@ mod tests {
             scores.iter().all(|&score| score > 0),
             "a non-empty query only returns scored hits, got {scores:?}"
         );
+    }
+
+    /// An archived tool whose frames will not inflate is described with a
+    /// `schema_error` instead of being silently dropped or panicking; the
+    /// condition means the binary and its embedded artifact disagree.
+    #[test]
+    fn describe_reports_a_schema_error_instead_of_dropping_the_tool() {
+        let catalog = Catalog::new(vec![crate::catalog::ServiceCatalog {
+            service_id: "run".to_owned(),
+            source: CatalogSource::Snapshot,
+            tools: vec![crate::catalog::NamespacedTool {
+                namespaced_name: "run__broken".to_owned(),
+                service_id: "run".to_owned(),
+                tool: crate::catalog::ToolSpec::broken_for_tests("broken"),
+            }],
+        }])
+        .expect("valid");
+
+        let payload = describe_payload(&catalog, &[json!("run__broken")]);
+        assert_eq!(payload["unknown"], json!([]));
+        assert_eq!(payload["tools"][0]["name"], json!("run__broken"));
+        assert!(
+            payload["tools"][0]["schema_error"]
+                .as_str()
+                .is_some_and(|text| text.contains("broken")),
+            "got {payload}"
+        );
+        assert!(payload["tools"][0].get("input_schema").is_none());
     }
 
     #[test]
@@ -1390,6 +1447,7 @@ mod tests {
 
         let startup = flat.catalog().await;
         let before: Vec<String> = flat_tools(&startup)
+            .expect("live schemas always materialize")
             .iter()
             .map(|t| t.name.to_string())
             .collect();
@@ -1408,6 +1466,7 @@ mod tests {
 
         let served_now = flat.catalog().await;
         let after: Vec<String> = flat_tools(&served_now)
+            .expect("live schemas always materialize")
             .iter()
             .map(|t| t.name.to_string())
             .collect();
@@ -1469,8 +1528,11 @@ mod tests {
 
         let run = crate::registry::find("run").expect("run is registered");
         let bigquery = crate::registry::find("bigquery").expect("bigquery is registered");
-        let state = assemble_serve_catalog(snapshot, &[run, bigquery])
-            .expect("the fixture satisfies the namespacing invariants");
+        let state = assemble_serve_catalog(
+            snapshot.into_catalog().expect("fixture is valid"),
+            &[run, bigquery],
+        )
+        .expect("the fixture satisfies the namespacing invariants");
 
         for service in &state.startup().services {
             assert_eq!(

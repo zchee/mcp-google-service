@@ -186,8 +186,8 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         args.strict_startup,
     )?;
     let http = proxy::shared_http_client().context("building the shared HTTP client")?;
-    let snapshot = catalog::serve_snapshot(args.snapshot.as_deref())?;
-    catalog::warn_on_registry_drift(&snapshot);
+    let catalog = catalog::serve_catalog(args.snapshot.as_deref())?;
+    catalog::warn_on_registry_drift(&catalog.services);
 
     // Two ways to a served catalog. Strict resolves credentials and enablement
     // first and fails fast, so nothing is served with broken credentials. The
@@ -207,7 +207,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         );
         let auth = Arc::new(auth::AuthContext::new(&cfg).await?);
         let exposure = server::resolve_enablement(&cfg, &auth, &http).await;
-        let state = server::assemble_serve_catalog(snapshot, &exposure.endpoints)?;
+        let state = server::assemble_serve_catalog(catalog, &exposure.endpoints)?;
         state.publish_readiness(Readiness {
             credentials: CredentialState::Ready,
             enablement: exposure.enablement,
@@ -216,7 +216,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     } else {
         let auth = Arc::new(auth::AuthContext::new_lazy(&cfg)?);
         let configured = server::configured_endpoints(&cfg);
-        let state = server::assemble_serve_catalog(snapshot, &configured)?;
+        let state = server::assemble_serve_catalog(catalog, &configured)?;
         let background = BackgroundStartup {
             state: state.clone(),
             auth: Arc::clone(&auth),
@@ -378,7 +378,7 @@ fn run_print_catalog() -> anyhow::Result<()> {
     // there is one, which is the file an operator is about to review or
     // regenerate. The serve path deliberately does not share that behaviour.
     let snapshot = catalog::load_working_tree_snapshot()?;
-    catalog::warn_on_registry_drift(&snapshot);
+    catalog::warn_on_registry_drift(&snapshot.services);
 
     let generated_at = snapshot.generated_at.clone();
     let catalog = snapshot.into_catalog()?;

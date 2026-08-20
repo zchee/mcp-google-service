@@ -323,10 +323,8 @@ async fn live_snapshot_parse_stays_within_its_budget() {
     }
 
     let started = Instant::now();
-    let snapshot = catalog::embedded_snapshot().expect("the embedded snapshot must parse");
-    let parsed = snapshot
-        .into_catalog()
-        .expect("the committed snapshot must satisfy the namespacing invariants");
+    let parsed =
+        catalog::embedded_catalog().expect("the embedded archive must validate and materialize");
     let elapsed = started.elapsed();
 
     eprintln!(
@@ -351,10 +349,7 @@ async fn live_background_catalog_refresh_completes_within_its_budget() {
     }
 
     let http = shared_http_client().expect("the shared HTTP client builds");
-    let fallback = catalog::embedded_snapshot()
-        .expect("the embedded snapshot must parse")
-        .into_catalog()
-        .expect("the committed snapshot must satisfy the namespacing invariants");
+    let fallback = catalog::embedded_catalog().expect("the embedded archive must materialize");
 
     let started = Instant::now();
     let fresh = catalog::Catalog::build_live(registry::ENDPOINTS, &http, Some(&fallback))

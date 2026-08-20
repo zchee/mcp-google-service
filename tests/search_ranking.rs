@@ -45,10 +45,7 @@ struct GoldenBlock {
 
 /// The catalog the binary ships.
 fn committed_catalog() -> Catalog {
-    catalog::embedded_snapshot()
-        .expect("embedded snapshot parses")
-        .into_catalog()
-        .expect("embedded snapshot satisfies the namespacing invariants")
+    catalog::embedded_catalog().expect("the embedded archive materializes")
 }
 
 /// Namespaced names in rank order for `query` over the whole catalog.

@@ -23,12 +23,8 @@ use rmcp::model::Tool;
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
 /// The catalog the binary ships, parsed once per process.
-static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
-    catalog::embedded_snapshot()
-        .expect("embedded snapshot parses")
-        .into_catalog()
-        .expect("embedded snapshot satisfies the namespacing invariants")
-});
+static CATALOG: LazyLock<Catalog> =
+    LazyLock::new(|| catalog::embedded_catalog().expect("the embedded archive materializes"));
 
 fn main() {
     divan::main();
@@ -40,10 +36,10 @@ fn upstream_tools() -> Vec<(&'static str, Tool)> {
         .services
         .iter()
         .flat_map(|service| {
-            service
-                .tools
-                .iter()
-                .map(move |entry| (service.service_id.as_str(), entry.tool.clone()))
+            service.tools.iter().map(move |entry| {
+                let tool = entry.tool.to_rmcp().expect("archived schemas inflate");
+                (service.service_id.as_str(), tool)
+            })
         })
         .collect()
 }
