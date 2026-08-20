@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned to the exact stable release the acceptance run used, so "pinned" in
+# the README is a fact rather than a floating channel.
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

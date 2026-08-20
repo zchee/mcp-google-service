@@ -1,0 +1,57 @@
+[package]
+name = "mcp-google-service"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+# Nothing here is meant for crates.io: the binary embeds an 11MB catalog
+# snapshot and targets one operator workflow.
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+gcp_auth = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "stream"] }
+rmcp = { version = "3.1", features = ["server", "client", "transport-io", "transport-streamable-http-client-reqwest", "reqwest"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Scrubs the cached access token's heap buffer on drop, so a token does not
+# outlive its `AuthContext` in freed memory.
+zeroize = "1"
+
+# Test-only. The integration tier runs REAL in-process servers (a genuine rmcp
+# MCP server and a Service Usage REST stub) behind TLS, because both
+# `Catalog::build_live` and `prune::enabled_services` construct `https://` URLs
+# against fixed Google hostnames. Tests reach them by pointing the reqwest
+# client's DNS at a loopback socket, so production URL construction is exercised
+# rather than bypassed.
+[dev-dependencies]
+# Body types for the Service Usage stub's responses.
+bytes = "1"
+http-body-util = "0.1"
+# Serves the upstreams. `StreamableHttpService` is a plain `tower` service, so
+# hyper alone is enough; no web framework is pulled in.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+# Ephemeral self-signed certs, generated in memory per run. Avoids committing a
+# private key to the repository.
+rcgen = "0.14"
+# The in-process upstream is a real MCP server speaking the real protocol
+# (plan section 4-P5), not a canned-response fake.
+rmcp = { version = "3.1", features = [
+    "server",
+    "transport-streamable-http-server",
+    # The live tier drives the real compiled binary over its real stdio
+    # transport, rather than re-assembling the server in-process.
+    "transport-child-process",
+] }
+rustls = "0.23"
+# `test-util` supplies the paused clock the token-fetch timeout test runs on,
+# so that test costs microseconds instead of the real 30s budget.
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "test-util"] }
+tokio-rustls = "0.26"

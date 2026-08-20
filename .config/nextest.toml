@@ -1,0 +1,6 @@
+[profile.default]
+# The test binaries each map the 11.6MB embedded catalog snapshot; under
+# full-parallel load, process teardown can exceed nextest's 100ms default leak
+# grace period, producing spurious LEAK flags that wander between unrelated
+# pure in-memory tests. Raised per the T6 investigation (2026-08-19).
+leak-timeout = "500ms"
