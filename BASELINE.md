@@ -285,6 +285,7 @@ not where startup goes.
 |---|---|---:|---:|---:|---:|---:|
 | baseline (P1) | `d341bbb` | 1809.31 | 137.80 | 58.89 / 1,099 | 9.86 | 30,442,048 |
 | P2 | `b4b184d` + `7e7af67` | **22.84** | **22.78** | 58.64 / 1,099 (untouched) | 9.21 (untouched) | 31,586,464 |
+| P3 | `26b0cd3` (+ addendum) | unchanged | unchanged | untouched | untouched | see section 9 |
 
 Notes on the P2 row:
 
@@ -439,8 +440,63 @@ precedes the first `call`; replacing it with bundled roots is a security
 decision for team-verify, not a P2 change. Binary grew by 1,115,552 bytes
 (+3.7%) with the readiness machinery and the lazy credential source; size is
 P5/P7's concern and is recorded, not optimized, here.
-| P3 | | | | | | |
+| P3 | `26b0cd3` | see section 9 | | | | |
 | P4 | | | | | | |
 | P5 | | | | | | |
 | P6 | | | | | | |
 | P7 | | | | | | |
+
+## 9. P3 -- one round trip per dispatch, not two
+
+Before P3 every dispatch built a transport, ran a full MCP `initialize`, made
+one `tools/call` and cancelled the session, so each call cost two round trips
+to Google. Sessions are now cached per service, keyed by the token generation
+their headers were built from.
+
+**Acceptance (plan section 5.4) is a handshake count, not a timing.** The
+streamable-HTTP client has no session id until `initialize` completes, so the
+`initialize` POST is the one request that arrives without an `Mcp-Session-Id`
+header. Counting header-less requests at the in-process upstream therefore
+counts handshakes exactly, needs no request bodies, and counts a *failed*
+handshake too (a 401 yields no session id).
+`a_second_dispatch_reuses_the_session_and_does_not_reinitialize`: three
+dispatches to one service, **1 handshake**.
+
+**End-to-end, against real Google.** `tests/live.rs::live_second_dispatch_reuses_the_session`,
+`run__list_services` on `https://run.googleapis.com/mcp`, project
+gaudiy-licentia-dev, real ADC, two dispatches in one server process:
+
+| Sample | cold (handshake + call) | warm (call only) | saved |
+|---|---:|---:|---:|
+| 1 | 1076.4 ms | 379.8 ms | **696.6 ms** (2.83x) |
+| 2 | 1031.2 ms | 581.4 ms | **449.7 ms** (1.77x) |
+
+Cold is stable at ~1.03-1.08 s; the warm figure carries Google's own per-call
+latency, which is what varies between samples. The saving is the avoided
+handshake round trip, so every call after the first to a given service lands
+roughly 450-700 ms sooner. Startup is untouched: the same build reported
+process-start to ready 19.16 ms and initialize to first response 334 µs.
+
+Correctness of the cache, all asserted by test rather than by argument:
+
+| Property | Test |
+|---|---|
+| A rotated token opens a new session rather than reusing the old one | `a_rotated_token_forces_a_fresh_session` |
+| A handshake refused with 401 is retried once against a fresh token, and only once | `an_unauthorized_handshake_is_retried_once_against_a_fresh_token` |
+| A session cached before a credential failure is dropped, and a cooling-down credential does not resurrect it | `a_credential_failure_drops_every_cached_session` |
+| An idle session is closed and reopened after its TTL | `an_idle_session_is_reopened_after_its_ttl` |
+| The cache is bounded, evicting least-recently-used | `the_session_cache_is_bounded_and_evicts_least_recently_used` |
+| The generation changes exactly when a fresh token is cached, and a superseded invalidation is a no-op | `the_generation_changes_exactly_when_a_fresh_token_is_cached`, `invalidating_a_superseded_generation_is_a_no_op` |
+
+**Deliberately not retried:** a failure on a *reused* session's call. That
+error can arrive after the upstream has already run the tool, and the tools
+reached here include `run__deploy_service_from_image`,
+`compute__create_instance` and `compute__delete_instance`; retrying could
+deploy or create twice. The session is dropped instead, and the next dispatch
+rebuilds -- where a stale-token rejection arrives at the handshake, before any
+tool runs, and is retried there. Bound is 16 sessions, idle TTL 5 minutes.
+
+Measurement note: worker-2's P4 work was in the same working tree during this
+phase, so the hermetic gate for P3 was run as
+`nextest run -E 'not binary(search_ranking)'` -> **148/148 passed**; the
+excluded binary is P4's golden-ranking tests, written red before that rewrite.

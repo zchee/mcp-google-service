@@ -210,10 +210,25 @@ impl Proxy {
         match session.call_tool(params).await {
             Ok(result) => Ok(result),
             Err(error) => {
-                // A reused session may have gone stale under us; drop it so the
-                // next dispatch rebuilds. The call is not retried here: a
-                // transport error can arrive after the tool has run, and this
-                // tool set is not all idempotent.
+                // A reused session may have gone stale under us, so drop it and
+                // let the next dispatch rebuild.
+                //
+                // This call is deliberately NOT retried, and that is a safety
+                // property rather than caution. A failure here can arrive
+                // *after* the upstream has already run the tool -- a response
+                // lost on the way back looks exactly like a request that never
+                // arrived -- and the tools reached through this proxy are not
+                // all idempotent: `run__deploy_service_from_image`,
+                // `compute__create_instance` and `compute__delete_instance` are
+                // among them. Retrying would risk deploying or creating twice.
+                //
+                // The stale-token case that a retry would have covered is
+                // recovered anyway, one dispatch later: the session is gone, so
+                // the next call opens a new one, and there the rejection
+                // arrives at the handshake, where it is positively identifiable
+                // and no tool has run yet (see `session_for`). Anyone extending
+                // this into a general retry must keep that split -- retry only
+                // where the upstream refused *before* executing.
                 self.evict(&route.service_id, &session).await;
                 Err(upstream_message(&route.host, &error))
             }

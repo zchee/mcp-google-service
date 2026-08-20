@@ -29,6 +29,7 @@
 //! | P3 session reuse (5.4) | `a_second_dispatch_reuses_the_session_and_does_not_reinitialize` |
 //! | P3 token rotation | `a_rotated_token_forces_a_fresh_session` |
 //! | P3 401 retry | `an_unauthorized_handshake_is_retried_once_against_a_fresh_token` |
+//! | P3 stale-session safety | `a_credential_failure_drops_every_cached_session` |
 
 mod common;
 
@@ -1559,6 +1560,131 @@ async fn an_unauthorized_handshake_is_retried_once_against_a_fresh_token() {
     // recovered session and adds no handshake.
     echo_ok(&proxy, "reuses-the-recovered-session").await;
     assert_eq!(upstream.initialize_count(), 2);
+
+    upstream.server.shutdown().await;
+}
+
+/// A token source that answers `ok_calls` times and then fails forever.
+///
+/// Stands in for a credential that works, then stops: revoked, or an ADC file
+/// removed while the server runs.
+struct ExpiringToken {
+    ok_calls: std::sync::atomic::AtomicUsize,
+    token: &'static str,
+}
+
+impl TokenSource for ExpiringToken {
+    fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+        let still_ok = self
+            .ok_calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        let value = zeroize::Zeroizing::new(self.token.to_owned());
+        Box::pin(async move {
+            if still_ok {
+                Ok(FetchedToken {
+                    value,
+                    // No expiry: the token stays cached until something
+                    // explicitly invalidates it, so the failure below can only
+                    // come from the re-fetch this test forces.
+                    expires_at: None,
+                })
+            } else {
+                Err(Error::QuotaProjectUnresolved)
+            }
+        })
+    }
+}
+
+/// A session opened while credentials worked must not be reused once they stop.
+///
+/// The session carries the bearer token it was opened with for its whole life,
+/// so a cached session surviving a credential failure would keep talking to
+/// Google with a credential this process can no longer vouch for. Every
+/// `apply` failure -- including one the cooldown is holding rather than
+/// re-attempting -- must therefore drop every cached session.
+#[tokio::test]
+async fn a_credential_failure_drops_every_cached_session() {
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+
+    // One good token, then failure.
+    let auth = Arc::new(
+        AuthContext::with_source(
+            Arc::new(ExpiringToken {
+                ok_calls: std::sync::atomic::AtomicUsize::new(1),
+                token: "token-before-revocation",
+            }),
+            TEST_PROJECT,
+        )
+        .expect("a literal project id is a valid header value"),
+    );
+    let generation = auth
+        .apply_tracked(&mut reqwest::header::HeaderMap::new())
+        .await
+        .expect("the first fetch succeeds");
+
+    let proxy = Proxy::new(Arc::clone(&auth), http, vec![Route::from_endpoint(run)]);
+    echo_ok(&proxy, "while-credentials-work").await;
+    assert_eq!(proxy.cached_sessions().await, 1);
+    assert_eq!(upstream.initialize_count(), 1);
+
+    // The credential is revoked: the cached token is dropped, and the source
+    // now refuses, so the next dispatch cannot obtain headers at all.
+    auth.invalidate(generation).await;
+
+    let refused = proxy
+        .dispatch(
+            &format!("run__{TOOL_ECHO}"),
+            Some(
+                json!({ "payload": "after-revocation" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        )
+        .await;
+    assert_eq!(refused.is_error, Some(true));
+    assert!(
+        result_text(&refused).contains("could not attach Google credentials"),
+        "the credential failure must reach the caller; got: {}",
+        result_text(&refused)
+    );
+    assert_eq!(
+        proxy.cached_sessions().await,
+        0,
+        "a credential failure must drop every cached session, or a session \
+         would keep using a token this process can no longer vouch for"
+    );
+
+    // And the second attempt, which the cooldown answers without touching the
+    // source at all, must not resurrect it either.
+    let again = proxy
+        .dispatch(
+            &format!("run__{TOOL_ECHO}"),
+            Some(
+                json!({ "payload": "still-refused" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        )
+        .await;
+    assert_eq!(again.is_error, Some(true));
+    assert_eq!(
+        proxy.cached_sessions().await,
+        0,
+        "a cooling-down credential must leave the cache empty too"
+    );
+    assert_eq!(
+        upstream.initialize_count(),
+        1,
+        "no new session may be opened without credentials; the upstream saw: {:?}",
+        upstream.all_requests()
+    );
 
     upstream.server.shutdown().await;
 }
