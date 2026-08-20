@@ -30,6 +30,11 @@ gcp_auth = "0.12"
 # override of the system allocator for other libraries.
 mimalloc = { version = "0.1", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "stream"] }
+# Zero-copy archived form of the committed catalog snapshot. The serve path
+# validates and reads the embedded archive in place instead of parsing 11.6 MB
+# of JSON; `bytecheck` (a default feature) is what makes the checked `access`
+# the default path rather than an option.
+rkyv = "0.8.18"
 rmcp = { version = "3.1", features = ["server", "client", "transport-io", "transport-streamable-http-client-reqwest", "reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,6 +49,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Scrubs the cached access token's heap buffer on drop, so a token does not
 # outlive its `AuthContext` in freed memory.
 zeroize = "1"
+# Compresses each tool's input/output schema JSON inside the archive; schemas
+# are 60% of the snapshot and are read only by `describe_tools`, so they stay
+# compressed until something asks. C library (zstd-sys): flagged for the
+# security reviewer like mimalloc's C, same trust-base question.
+zstd = "0.13.3"
 
 # Test-only. The integration tier runs REAL in-process servers (a genuine rmcp
 # MCP server and a Service Usage REST stub) behind TLS, because both

@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use rmcp::{ServiceExt, transport::stdio};
 
 use mcp_google_service::{
-    auth, catalog,
+    archive, auth, catalog,
     config::{Config, ExposeMode},
     proxy, registry,
     server::{self, BackgroundStartup, CredentialState, Readiness},
@@ -99,6 +99,15 @@ enum Command {
         /// tools.
         #[arg(long)]
         allow_partial: bool,
+
+        /// Re-encode this snapshot JSON instead of fanning out.
+        ///
+        /// Reads the file, keeps its `generated_at`, and emits the same
+        /// outputs a live fan-out would. This is how the committed archive is
+        /// regenerated from the committed JSON without touching the network,
+        /// so the two artifacts can never legitimately disagree.
+        #[arg(long, value_name = "PATH", conflicts_with = "allow_partial")]
+        from: Option<PathBuf>,
     },
     /// Print the snapshot's per-service tool counts to stdout.
     PrintCatalog,
@@ -139,7 +148,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None => run_serve(cli.serve).await,
         Some(Command::Serve(args)) => run_serve(args).await,
-        Some(Command::Snapshot { out, allow_partial }) => run_snapshot(out, allow_partial).await,
+        Some(Command::Snapshot {
+            out,
+            allow_partial,
+            from,
+        }) => run_snapshot(out, allow_partial, from).await,
         Some(Command::PrintCatalog) => run_print_catalog(),
     }
 }
@@ -269,7 +282,23 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 /// upstreams answered, so a host that fails is reported rather than papered
 /// over with its previous contents, and a short fan-out fails the command
 /// unless `--allow-partial` says a partial capture is wanted.
-async fn run_snapshot(out: Option<PathBuf>, allow_partial: bool) -> anyhow::Result<()> {
+async fn run_snapshot(
+    out: Option<PathBuf>,
+    allow_partial: bool,
+    from: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // Re-encode mode: the catalog and its timestamp come from the named file,
+    // no byte leaves the machine, and the outputs are what a fan-out that had
+    // observed the same catalog at the same instant would have written.
+    if let Some(path) = from {
+        let snapshot = catalog::load_snapshot_file(&path)?;
+        let generated_at = snapshot.generated_at.clone();
+        let catalog = snapshot
+            .into_catalog()
+            .context("validating the snapshot named by --from")?;
+        return write_snapshot_outputs(&catalog, generated_at, out);
+    }
+
     let http = proxy::shared_http_client().context("building the shared HTTP client")?;
     let catalog = catalog::Catalog::build_live(registry::ENDPOINTS, &http, None).await?;
 
@@ -302,13 +331,39 @@ async fn run_snapshot(out: Option<PathBuf>, allow_partial: bool) -> anyhow::Resu
     );
 
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let json = catalog.to_snapshot_json(generated_at)?;
+    write_snapshot_outputs(&catalog, generated_at, out)
+}
+
+/// Write a catalog's snapshot JSON and, when a path is named, its archive.
+///
+/// The archive lands beside the JSON with a `.bin` extension. It is derived
+/// from exactly the snapshot being written -- same catalog, same timestamp --
+/// so committing the pair keeps `archive::tests` able to hold them identical.
+/// Stdout mode emits JSON only: a terminal is no place for a binary artifact,
+/// and an archive nobody can commit has no consumer.
+fn write_snapshot_outputs(
+    catalog: &catalog::Catalog,
+    generated_at: String,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let snapshot = catalog.to_snapshot(generated_at);
+    let json = snapshot.to_json()?;
 
     match out {
         Some(path) => {
             std::fs::write(&path, &json)
                 .with_context(|| format!("writing snapshot to {}", path.display()))?;
             tracing::info!(path = %path.display(), bytes = json.len(), "snapshot written");
+
+            let archive_path = path.with_extension("bin");
+            let archive = archive::build(&snapshot).context("building the catalog archive")?;
+            std::fs::write(&archive_path, &archive)
+                .with_context(|| format!("writing archive to {}", archive_path.display()))?;
+            tracing::info!(
+                path = %archive_path.display(),
+                bytes = archive.len(),
+                "catalog archive written"
+            );
         }
         None => std::io::stdout()
             .write_all(json.as_bytes())

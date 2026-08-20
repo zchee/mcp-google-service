@@ -6,6 +6,7 @@
 //! over these modules; they are exposed as a library so the integration tier
 //! can assemble a server against in-process upstreams.
 
+pub mod archive;
 pub mod auth;
 pub mod catalog;
 pub mod config;

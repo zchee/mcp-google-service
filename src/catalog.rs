@@ -387,6 +387,17 @@ impl Snapshot {
     pub fn into_catalog(self) -> Result<Catalog, CatalogError> {
         Catalog::new(self.services)
     }
+
+    /// Render this snapshot as newline-terminated pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Serialize`] if the snapshot cannot be encoded.
+    pub fn to_json(&self) -> Result<String, CatalogError> {
+        let mut json = serde_json::to_string_pretty(self).map_err(CatalogError::Serialize)?;
+        json.push('\n');
+        Ok(json)
+    }
 }
 
 /// Reasons a single upstream failed to answer discovery.
@@ -793,10 +804,7 @@ impl Catalog {
     ///
     /// Returns [`CatalogError::Serialize`] if the catalog cannot be encoded.
     pub fn to_snapshot_json(&self, generated_at: String) -> Result<String, CatalogError> {
-        let mut json = serde_json::to_string_pretty(&self.to_snapshot(generated_at))
-            .map_err(CatalogError::Serialize)?;
-        json.push('\n');
-        Ok(json)
+        self.to_snapshot(generated_at).to_json()
     }
 }
 
