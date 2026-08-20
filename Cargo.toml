@@ -40,6 +40,12 @@ zeroize = "1"
 [dev-dependencies]
 # Body types for the Service Usage stub's responses.
 bytes = "1"
+# Benchmark harness (see `benches/`). Chosen over criterion because its
+# `AllocProfiler` counts allocations per benchmark out of the box, which is the
+# instrument the optimization plan's zero-allocation search criterion is
+# measured with; criterion would need dhat bolted on, and pulls in rayon,
+# plotters and regex for statistics this micro-scale work does not need.
+divan = "0.1.21"
 http-body-util = "0.1"
 # Serves the upstreams. `StreamableHttpService` is a plain `tower` service, so
 # hyper alone is enough; no web framework is pulled in.
@@ -62,3 +68,24 @@ rustls = "0.23"
 # so that test costs microseconds instead of the real 30s budget.
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "test-util"] }
 tokio-rustls = "0.26"
+
+# Micro-benchmarks over the committed 47-service / 548-tool snapshot. Each is a
+# divan binary (`harness = false`), so `cargo bench` runs them one after
+# another; they must never be run concurrently with each other or with
+# `scripts/bench-startup.sh`, and never with `RUSTFLAGS` set, or the numbers
+# are not comparable with `BASELINE.md`.
+[[bench]]
+name = "bench_search"
+harness = false
+
+[[bench]]
+name = "bench_snapshot_load"
+harness = false
+
+[[bench]]
+name = "bench_namespace_build"
+harness = false
+
+[[bench]]
+name = "bench_classify_upstream"
+harness = false

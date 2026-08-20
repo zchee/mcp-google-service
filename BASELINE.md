@@ -1,0 +1,292 @@
+# BASELINE
+
+Fixed reference for the optimization plan
+(`.omc/plans/2026-08-20-optimization-to-the-limit.md`). Every later phase reports
+its delta against the numbers here, taken with the same harness, the same flag
+regime, and the same machine. Nothing in this file is copied from the plan's
+section 0; every number was re-measured on 2026-08-20 and the deviations from
+section 0 are called out explicitly at the end.
+
+## Provenance
+
+| | |
+|---|---|
+| Source | `ae92467` plus the P1 harness (this commit); no hot path touched |
+| Machine | Apple M3 Max, 16 cores, 128 GiB; Darwin 27.0.0 arm64 |
+| Toolchain | `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1` (pinned by `rust-toolchain.toml`) |
+| Release binary | `target/release/mcp-google-service`, 30,442,048 bytes, sha256 `068f52bd0c8446a5ef895c7a8917c2922b5276ac159d28cd8b146c32155ad231`, built 2026-08-20T14:59:46+0900 |
+| Flag regime | **`RUSTFLAGS` unset** for every build that produces a measured artifact; `[profile.release]` = `strip = "none"` only, so opt-level 3, codegen-units 16, no LTO, `panic = "unwind"` |
+| Snapshot | `data/catalog-snapshot.json`, 11,637,929 bytes, 47 services / 548 tools, `generated_at` 2026-08-19T09:02:07Z |
+| Quota project (real mode) | `gaudiy-licentia-dev` (the live tier's project), 56 APIs enabled, 14 of 47 services exposed after pruning |
+
+### Why `RUSTFLAGS` is unset, and why that is the rule
+
+The shell this repository is developed in exports nightly-only `RUSTFLAGS`
+(`-Z ...`, `-C panic=abort`) that do not build on the pinned stable toolchain,
+and the project `.envrc` (`layout rust_stable`) replaces them with
+`-C target-cpu=native -C opt-level=3 -C codegen-units=1 -C force-frame-pointers=on
+-C debug-assertions=off -C overflow-checks=off -C llvm-args=-unroll-threshold=500
+-C llvm-args=-enable-dfa-jump-thread -C link-arg=-Wl,-dead_strip`. Builds,
+clippy, tests and `cargo install` run under that set (`direnv exec . cargo ...`).
+Benchmarks do not: a number that silently depends on an ambient environment
+variable is not reproducible, and `target-cpu=native` makes it not even portable
+between machines. Anything wanted in the shipped binary belongs in
+`[profile.release]`, where it is recorded in the repository and where P7 must
+justify each setting with a measured delta. `scripts/bench-startup.sh` refuses to
+run with `RUSTFLAGS` set and prints the binary's size, sha256, mtime and the
+toolchain with every result.
+
+### Reproduce
+
+```sh
+# 1. the artifact under test (no RUSTFLAGS; project target/, not the dev tmpfs)
+env -u RUSTFLAGS cargo build --release
+
+# 2. startup probes, strictly serial, nothing else benchmarking meanwhile
+env -u RUSTFLAGS GOOGLE_MCP_QUOTA_PROJECT=<project> scripts/bench-startup.sh --runs 20
+env -u RUSTFLAGS scripts/bench-startup.sh --offline --runs 20
+env -u RUSTFLAGS scripts/bench-startup.sh --print-catalog --runs 20
+
+# 3. micro-benchmarks (divan), serial
+env -u RUSTFLAGS cargo bench
+```
+
+`cargo bench` re-links `target/release/mcp-google-service` from the bench
+profile (a 30,538,960-byte artifact with a different sha256). Run step 1 again
+before any further startup probe; the sha256 the script prints is how a mixed-up
+binary is caught.
+
+## 1. Startup: process start to `tools/list` answered
+
+`scripts/bench-startup.sh`, 20 serial runs each, 1 s pause between runs
+(excluded), one client doing `initialize` -> `notifications/initialized` ->
+`tools/list` over stdio. Time is from just before the spawn to the `tools/list`
+response line being read. Two-tier surface, so the response is the four
+meta-tools.
+
+| Mode | What is stubbed | min | **median** | p95 | max | mean |
+|---|---|---:|---:|---:|---:|---:|
+| real | nothing: real ADC (`authorized_user` refresh token), real Service Usage listing, real 47-host background fan-out | 1625.25 | **1809.31** | 2406.72 | 2521.87 | 1915.92 |
+| `--offline` | `GOOGLE_APPLICATION_CREDENTIALS` -> throwaway service-account key whose `token_uri` is a loopback stub; `HTTPS_PROXY`/`ALL_PROXY` -> `http://127.0.0.1:1`, so the Service Usage call and every fan-out connection fail with ECONNREFUSED in microseconds; no byte leaves the machine | 132.81 | **137.80** | 219.51 | 338.18 | 153.14 |
+| `--print-catalog` | no MCP session at all: `print-catalog` process start -> exit, reading the snapshot from disk (cwd = repo root) and rendering the table | 24.62 | **26.12** | 28.45 | 29.24 | 26.40 |
+
+All times in ms. Per-run values, sorted:
+
+- real: 1625.25 1726.02 1740.09 1742.38 1750.40 1758.00 1795.08 1796.89 1805.30
+  1805.50 1813.12 1872.04 1914.88 1960.36 1989.59 1994.99 2079.32 2220.53
+  2406.72 2521.87
+- offline: 132.81 133.08 133.64 133.72 134.11 134.21 134.41 134.75 135.56 136.72
+  138.87 140.03 142.21 144.10 144.67 145.62 148.91 157.66 219.51 338.18
+- print-catalog: 24.62 24.64 25.07 25.12 25.16 25.59 25.89 26.08 26.09 26.09
+  26.16 26.25 26.80 26.98 27.24 27.26 27.54 27.79 28.45 29.24
+
+Cross-check of `print-catalog` with hyperfine (`hyperfine -N --warmup 3 --runs 20`):
+25.6 ms +- 1.1 ms for this binary; 24.7 ms +- 0.8 ms for the direnv-built
+binary (`codegen-units=1`, `-dead_strip`), i.e. the aggressive flags buy 4% here.
+
+Why `--offline` is built the way it is: gcp_auth retries a *refused* token
+endpoint five times with 50/100/200/400 ms back-off, so pointing `token_uri` at a
+dead port would add ~750 ms of sleep and call it "offline". The loopback stub
+answers in well under a millisecond. reqwest reads `HTTPS_PROXY` from the
+environment even with `default-features = false` (hyper-util's proxy matcher
+always consults the env), so the dead proxy port stops every `https://` request
+the shared client makes before a DNS lookup happens; gcp_auth's own hyper client
+has no proxy support, which is why the stub is still reached.
+
+### 1a. Where the time goes (one debug-logged run each, `RUST_LOG=debug`)
+
+Single diagnostic runs, so these are attributions, not statistics. Spans are
+between consecutive log lines of the binary and its dependencies.
+
+Real mode, 1900.4 ms total:
+
+| Span | ms | What it is |
+|---|---:|---|
+| exec -> first log line | ~8.5 | exec, dyld of a 30 MB binary, tokio runtime, tracing init |
+| `gcp_auth::provider()`: `HttpClient::new()` | **121.5** | gcp_auth builds its own hyper client with the native root store (`rustls-native-certs` reads the macOS keychain). CPU/IO on the critical path, paid by every credential type, no network |
+| ADC refresh-token exchange (`accounts.google.com`) | **199.0** | network: 1 RTT + TLS; `ConfigDefaultCredentials::with_client` fetches eagerly during discovery |
+| Service Usage `services?filter=state:ENABLED` | **1516.0** | network: the single largest item, ~80% of startup |
+| snapshot parse + `assemble_serve_catalog` + logging | 50.8 | 13.3 ms in the offline run below; the extra here is unexplained single-sample variance |
+| `initialize` -> `tools/list` answered | ~1.4 | the handshake itself |
+
+Offline mode, 139.2 ms total:
+
+| Span | ms | What it is |
+|---|---:|---|
+| exec -> first log line | ~10 | as above |
+| `gcp_auth::provider()` construction + JWT sign + loopback token exchange | **113.5** | `HttpClient::new()` (native roots) dominates; the token exchange against the stub is ~0.6 ms of it |
+| Service Usage call refused via proxy | 0.2 | |
+| snapshot parse + `assemble_serve_catalog` + logging | **13.3** | consistent with the in-process 9.9 ms parse + 0.3 ms assemble below |
+| spawn refresh, bind stdio, `initialize` -> `tools/list` | ~2 | the 47 fan-out connections fail instantly on worker threads |
+
+Consequence for P2: taking auth and pruning off the critical path removes the
+two network spans **and** the 113-121 ms of gcp_auth construction. What is left
+is ~25 ms (exec + parse + handshake), which is exactly what `print-catalog`
+measures end to end. The plan's "<60 ms" target is therefore reachable by P2
+alone; P5 (zero-copy snapshot) is what takes it from ~25 ms toward ~15 ms.
+
+## 2. Micro-benchmarks (divan, `env -u RUSTFLAGS cargo bench`)
+
+Medians; allocations are per iteration as counted by divan's `AllocProfiler`
+(which adds a thread-local increment per allocation to the timed region).
+Timer precision 41 ns.
+
+### 2a. `bench_search` -- `Catalog::search` over 548 tools
+
+| Query | tokens | hit/miss | cold median | warm median | allocs / iter | bytes / iter |
+|---|---:|---|---:|---:|---:|---:|
+| `instances` | 1 | hit | 61.99 µs | **47.47 µs** | 1,099 | 275.7 KB |
+| `cloud run` | 2 | hit (the real-model E2E query) | 70.47 µs | **58.89 µs** | 1,099 | 275.7 KB |
+| `list cloud run` | 3 | hit | 70.14 µs | **57.56 µs** | 1,099 | 275.7 KB |
+| `zzzznomatch` | 1 | miss | 53.19 µs | **48.52 µs** | 1,098 | 275.6 KB |
+| `list cloud zzzznomatch` | 3 | miss on 3rd | 65.92 µs | **59.11 µs** | 1,098 | 275.7 KB |
+| `list` filtered to `run` | 1 | hit, 6 tools scanned | -- | 407.9 ns | 13 | 2.4 KB |
+| `""` (empty) | 0 | returns all 548 | -- | 3.94 µs | 2 | 8.8 KB |
+
+cold = first search on a freshly materialized `Catalog` (20 samples of 1);
+warm = repeated searches on a long-lived catalog (100 samples). The 1,098-1,099
+allocations per query are the 548 `name.to_lowercase()` + 548
+`description.to_lowercase()` in `score_tool` (`src/catalog.rs:546-578`, the
+`to_lowercase` calls at 551 and 556) plus the query, the token vector, the
+scored vector and the result vector; 275.7 KB per query is those lowercased
+copies (266,352 bytes of descriptions + 9,265 bytes of names, re-lowercased
+on every query).
+
+Note for P4: the plan expected search at "hundreds of µs". It is already
+47-59 µs. P4's measurable wins are the allocation count (1,099 -> 0), the
+ranking defect (`"cloud run"` must put `run__*` above BigQuery), and whatever
+sub-50 µs is left; it is not a 10-100x latency win.
+
+### 2b. `bench_snapshot_load`
+
+| Benchmark | median | allocs / iter | bytes allocated / iter |
+|---|---:|---:|---:|
+| `parse_embedded` (embedded JSON -> `Snapshot`) | **9.86 ms** | 260,841 | 33.06 MB |
+| `parse_embedded_into_catalog` (+ `Catalog::new`) | 9.73 ms | 260,858 | 33.21 MB |
+| `parse_file` (read 11.6 MB from disk + parse) | 11.45 ms | 260,842 | 44.69 MB |
+| `assemble_serve_catalog_all_endpoints` (validate + `restricted_to` + `marked_as`, snapshot pre-parsed, 47 endpoints) | **270.6 µs** | 4,809 | 1.00 MB |
+
+30 samples of 1 each. Snapshot parse is ~10 ms in-process, ~33 MB of
+allocations in 261k calls, and the dominant cost of the non-network path after
+gcp_auth construction.
+
+### 2c. `bench_namespace_build`
+
+| Benchmark | median | allocs / iter |
+|---|---:|---:|
+| `namespace_tools` (548 x `NamespacedTool::new`) | 53.5 µs | 1,097 |
+| `catalog_new` (sort 47 services + 548 tools, uniqueness + 64-char check) | 38.0 µs | 17 |
+
+### 2d. `bench_classify_upstream`
+
+| Case | median | allocs |
+|---|---:|---:|
+| `QuotaProjectMissing` (403) | 13.9 ns | 0 |
+| `PermissionDenied` (403, generic) | 25.1 ns | 0 |
+| `Internal500` (500, sanitize path) | 89.6 ns | 1 |
+| `MissingCredential` (401) | 288.7 ns | 0 |
+| `ServiceDisabled` (403, parses api + project) | 340.4 ns | 2 |
+| `ServiceDisabledEnvelope` (403, JSON envelope) | 344.3 ns | 2 |
+| `ApiKeyUnsupported` (401, second substring scan) | 489.3 ns | 0 |
+
+Sub-microsecond throughout; recorded for completeness, not as a target.
+
+## 3. Binary
+
+`size -m target/release/mcp-google-service` (the measured artifact):
+
+| Section | bytes | share |
+|---|---:|---:|
+| total file | 30,442,048 | 100% |
+| `__TEXT,__const` (embedded snapshot + other constants) | 12,588,600 | 41.4% |
+| `__TEXT,__text` (code) | 9,214,588 | 30.3% |
+| `__LINKEDIT` | 5,816,320 | 19.1% |
+| `__TEXT,__eh_frame` | 1,271,632 | 4.2% |
+| `__TEXT,__gcc_except_tab` | 595,544 | 2.0% |
+| `__DATA_CONST,__const` | 604,840 | 2.0% |
+| `__TEXT,__unwind_info` | 236,880 | 0.8% |
+| `__TEXT,__cstring` | 145,859 | 0.5% |
+
+For comparison, the direnv-built binary (`codegen-units=1`, `-dead_strip`,
+installed at `/opt/local/rust/cargo/bin`, sha256 `4d5e6e6d...`) is 25,260,448
+bytes: `__text` 7,280,712, `__LINKEDIT` 3,358,720, `__const` 12,538,184. Those
+flags remove ~5.2 MB (17%) of code and link-edit data and change the embedded
+payload by 50 KB; they do not change startup (see section 5).
+
+## 4. Snapshot facts (static, from `data/catalog-snapshot.json`)
+
+| Fact | value | how |
+|---|---:|---|
+| services / tools | 47 / 548 | `jq` |
+| description bytes, all tools (UTF-8) | 266,352 | `jq utf8bytelength` over `.tool.description` |
+| tool-name bytes | 9,265 | same, over `.tool.name` |
+| longest description | 39,874 bytes | |
+| `inputSchema` bytes, compact JSON | 1,801,451 | `tojson \| utf8bytelength` |
+| `outputSchema` bytes, compact JSON | 5,149,694 | same |
+| schemas total, compact | 6,951,145 (59.7% of the file) | |
+| file on disk (pretty-printed) | 11,637,929 | |
+
+## 5. Section 0 of the plan, checked
+
+Confirmed as stated:
+
+- `src/catalog.rs:546-578` `score_tool` lowercases the tool name and the whole
+  description for every tool on every query (`to_lowercase` at 551 and 556);
+  the bench shows it as 1,099 allocations / 275.7 KB per query.
+- `src/proxy.rs:126-141` builds a transport, runs a full MCP `initialize`
+  handshake (`().serve(transport)`, line 132-135), issues the one `call_tool`,
+  then cancels the session -- per dispatch.
+- Startup total: section 0 quoted 1757 / 1924 / 1961 ms from 3 runs; measured
+  median here is **1809 ms** over 20 runs (-6%), inside the 10% band. The p95 of
+  2407 ms is not comparable to a 3-run figure.
+- Description bytes: 266,352 measured vs 266,348 quoted (4 bytes, method).
+- Two network round trips on the startup critical path: confirmed and now
+  attributed (section 1a): ADC ~0.2 s, Service Usage ~1.5 s.
+
+**Differs from section 0 by more than 10% -- use the numbers here:**
+
+| Item | section 0 | measured here | delta | why |
+|---|---:|---:|---:|---|
+| release binary | 25,311,328 B | **30,442,048 B** | +20% | section 0 measured a binary built under the direnv flag set (`codegen-units=1`, `-Wl,-dead_strip`; its `__const` 12,538,184 matches that build exactly); the canonical artifact is built from `[profile.release]` alone |
+| `__text` | 7,283,144 B | **9,214,588 B** | +27% | same cause |
+| snapshot parse | 45 ms | **9.9 ms** in-process (`parse_embedded`), 13.3 ms for parse + assemble + log inside the serving process | -78% | section 0's 45 ms was an end-to-end process time, not the parse |
+| `print-catalog` wall time | 45 ms (5 runs) | **26.1 ms** median (20 runs; hyperfine agrees at 25.6 ms) | -42% | not reproducible today on either binary; the section-0 figure is superseded |
+| schema bytes | 7,168,658 B (62%) | 6,951,145 B compact (59.7%) | -3% | inside the band; differs by serialization method |
+
+Side note, not the baseline: re-measuring with the direnv-built binary gave
+startup 1925 / 1845 / 1843 ms (3 runs) and `print-catalog` 44 / 44 / 46 ms in
+the team lead's hands, and 24.7 ms here with hyperfine. The codegen flags move
+startup by nothing measurable, which is independent evidence that CPU work is
+not where startup goes.
+
+## 6. Predictions each later phase must confirm or falsify
+
+- **P2** (auth + pruning off the critical path): startup median from 1809 ms to
+  ~25 ms (the offline figure minus gcp_auth construction, i.e. the
+  `print-catalog` envelope). The plan's "<60 ms" should be met by P2 alone.
+- **P3** (session cache): dispatch loses one `initialize` round trip per call.
+  Measured per-call upstream latency is not in this baseline; P3 must add the
+  dispatch probe before claiming a delta.
+- **P4** (search): 1,099 -> 0 allocations per query, the `"cloud run"` ranking
+  fixed, and at most ~50 µs of latency removed; anything claiming 10x on search
+  latency is measuring something else.
+- **P5** (zero-copy snapshot): -10 ms of parse (not -45), -33 MB of startup
+  allocation, and the binary payload from 12.6 MB of `__const` toward a
+  compressed form; the "<13 MB" binary target is against 30.4 MB, not 25.3 MB.
+- **P6** (fan-out): background, invisible in every number above; needs its own
+  probe.
+- **P7** (profile settings): on startup, zero measurable effect (section 5, side
+  note); on binary size, `codegen-units=1` + dead-strip already shows -17%. P7
+  either shows a number from this harness or is dropped.
+
+## 7. Phase ledger
+
+| Phase | Commit | Startup real median (ms) | Offline median (ms) | Search warm `cloud run` (µs / allocs) | Parse (ms) | Binary (B) |
+|---|---|---:|---:|---:|---:|---:|
+| baseline (P1) | this commit | 1809.31 | 137.80 | 58.89 / 1,099 | 9.86 | 30,442,048 |
+| P2 | | | | | | |
+| P3 | | | | | | |
+| P4 | | | | | | |
+| P5 | | | | | | |
+| P6 | | | | | | |
+| P7 | | | | | | |
