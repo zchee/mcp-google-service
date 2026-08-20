@@ -12,23 +12,6 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 gcp_auth = "0.12"
-# Startup allocator. Adopted on a measured win, not on reputation: paired
-# against the system allocator over 12 alternating rounds it is ~1.1-1.5 ms
-# faster to first tool response (BASELINE.md section 12), which is ~5-6% of a
-# ~21 ms startup and the largest single item left after P2. The mechanism is
-# named and checkable: loading the snapshot is a burst of 260,841 allocations,
-# which is exactly the shape a general-purpose allocator is beaten on.
-#
-# TRUST BASE: this compiles a C library into a binary that handles credentials.
-# That expansion is flagged for the security reviewer rather than assumed to be
-# free, and the reviewer also has the question of whether mimalloc's secure
-# mode (guard pages, encrypted free lists) is worth its cost here. `zeroize`'s
-# guarantee is unaffected -- the token buffer is scrubbed before it is freed,
-# so which allocator owns the freed page afterwards does not enter into it.
-#
-# `default-features = false` keeps the default build: no secure mode, no
-# override of the system allocator for other libraries.
-mimalloc = { version = "0.1", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "stream"] }
 # Zero-copy archived form of the committed catalog snapshot. The serve path
 # validates and reads the embedded archive in place instead of parsing 11.6 MB

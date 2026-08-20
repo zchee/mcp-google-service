@@ -288,7 +288,7 @@ not where startup goes.
 | P3 | `26b0cd3` (+ addendum) | unchanged | unchanged | untouched | untouched | see section 9 |
 | P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
 | P6 | none (reverted) | untouched | untouched | untouched | untouched | untouched; fan-out 6.64 -> 6.45 -> 6.32 s (A/B/A', null -- section 11) |
-| P7 | `924439d` + this commit | **-0.82 ms** (profile) **-1.12 ms** (mimalloc), paired; see 12a | same probe (`--offline`) | untouched (`[profile.bench]` pinned, section 12) | untouched | **25,200,624 (-20.5%)** |
+| P7 | `924439d`, `f4767ae`, + this commit | **-0.82 ms** (profile, paired; 12a). mimalloc's -1.12 ms did not survive P5 -- re-measured 6/12, removed (section 14) | same probe (`--offline`) | untouched (`[profile.bench]` pinned, section 12) | untouched | **-6,688,864 from the profile**; mimalloc's +206,656 given back |
 | P5 | `8be5bd4` + `4bc3bb3` | offline paired min 20.3 -> **8.9 ms** (-56%), medians agree -- section 13 | same probe | within band under load (section 13c) | serve load 9.32 ms -> **89.5 us / 2,852 allocs**; JSON path kept | **16,472,160 (-34.6%)** |
 
 Notes on the P2 row:
@@ -807,9 +807,10 @@ the reviewer can price the option against a measured baseline. **`zeroize` is
 unaffected**: the token buffer is scrubbed *before* being freed, so which
 allocator reclaims the page afterwards does not change what is left in it.
 
-**Still open at this commit**: nothing from P7. The security reviewer holds
-mimalloc's trust-base question and its secure-mode option; the phase's
-measured results are complete.
+**Superseded by section 14**: mimalloc was removed after P5 eliminated the
+allocation burst that justified it. Arm B's numbers below stand as measured --
+they were correct about the binary they were measured on -- but they no longer
+describe the shipped one.
 
 ## 13. P5 -- the catalog as a checked archive, schemas opened on demand
 
@@ -914,3 +915,92 @@ Notes for team-verify and later work:
   re-emit proven on the committed file), which is how the committed pair is
   regenerated together; the identity test makes landing them apart
   impossible.
+
+
+## 14. P7 revisited -- mimalloc removed after P5 moved the ground
+
+Section 12a adopted mimalloc on one stated mechanism: *"loading the snapshot
+is a burst of 260,841 allocations, which is exactly the shape a
+general-purpose allocator is beaten on."* Section 13b then recorded that P5
+replaced that load with `materialize_embedded`: **261,406 allocations ->
+2,852**, a 98.9% reduction. The justification had been invalidated by this
+project's own ledger, so the adoption was re-measured rather than left to
+stand on a mechanism the code no longer has.
+
+**Pre-registered before measuring** (as in 12a, and this time correct): the
+delta would fall inside the band on both statistics, and a survival claim
+would require both agreeing in sign at >= 10/12 rounds -- the same bar 12a
+used, so the adoption could not be rescued on a weaker standard than the one
+that established it.
+
+Same protocol as 12a Arm B: both arms built back to back at `4cee379` from one
+source path into one target-dir, differing only in the `#[global_allocator]`
+item and the dependency (16,472,224 B with, 16,265,568 B without -- a 206,656 B
+difference matching P7's +205,200, which is itself a check that the arm
+isolates mimalloc and nothing else). Both answer `print-catalog` 47/548.
+12 alternating rounds, `--offline`, bracketed by `print-catalog` controls that
+agreed (min 21.10 and 21.00 ms).
+
+| Statistic | mimalloc faster | mean | median |
+|---|---|---:|---:|
+| minima | **6/12** | **-0.39 ms** | +0.00 ms |
+| medians | **4/12** | **-1.15 ms** | -0.63 ms |
+
+Best single runs: without **7.69 ms**, with 7.83 ms.
+
+**Collapsed.** 6/12 on minima is a coin flip, and both point estimates lean
+*negative* -- the shipped binary was, if anything, marginally slower with
+mimalloc than without. Removed: dependency, `#[global_allocator]` item, and
+206,656 B of binary.
+
+What this costs and what it buys: the startup win from 12a is not lost, it
+was never real on this binary -- it belonged to a load that P5 deleted. What
+is bought is a **C library out of the trust base of a credential-handling
+binary**, which retires the security question rather than answering it, and
+which is the cheapest possible outcome for that review.
+
+The rule this follows is the plan's own -- *a phase whose end-to-end delta is
+inside the noise band is reverted, not kept* -- applied to a justification
+rather than to a change. The adoption was correct on the evidence available
+when it was made, and is reverted because the ground moved under it. Both
+statements are true at once, and the second does not retract the first.
+
+### 14a. Which endpoint this verdict rests on, and which burst it does not cover
+
+**The endpoint is time-to-first-response, offline.** That is deliberate and it
+is the same endpoint section 12a used to justify the adoption, so a collapse
+verdict on it is decision-grade for the decision actually being revisited. It
+is not a claim about every allocation this process makes.
+
+**The burst is 98.9% gone at that endpoint. It partially returns about a
+second later, in live two-tier mode.** `server.rs`'s background refresh calls
+`Catalog::drift_from`, whose `schemas_equal` calls `input_schema()` and
+`output_schema()` on *both* sides of every comparison -- inflating ~548 tools'
+zstd frames on each side, post-handshake. Section 13's own notes already
+record it ("a background refresh comparison (`drift_from`) inflates and caches
+as it compares; worst-case memory equals the pre-P5 resident catalog"). The
+offline protocol used here never fires it: no network, so no live refresh, so
+no `drift_from`.
+
+So an allocator could still matter for **background throughput and peak
+memory** on the live path. That was never what mimalloc was adopted for --
+section 12a measured startup latency and nothing else -- so it is out of
+scope here rather than unmeasured-and-ignored.
+
+**Consequence, and it is the section 9 endpoint rule appearing a second
+time**: on this tree, time-to-first-response and time-to-process-exit will
+*disagree*, and the disagreement is real rather than noise. The process cannot
+exit until the background refresh finishes, and that refresh now carries the
+inflation burst. A probe that times to exit is measuring a different question
+than a probe that times to first response, and neither answer transfers to the
+other.
+
+**If an allocator is ever re-proposed, it must name which burst it targets**:
+the startup burst (gone -- 261,406 -> 2,852, section 13b) or the background
+`drift_from` inflation (extant, off the critical path). A proposal that does
+not distinguish them is re-running this measurement against the wrong endpoint.
+
+Startup after removal, for the record: minima cluster **7.7-8.8 ms**, medians
+**9.1-15.3 ms** under a load average of ~4 (the controls above bound the
+environment). Against P1's 1809.31 ms real-mode median that is the cumulative
+result of P2, P3, P5 and P7's profile settings; no allocator is involved.
