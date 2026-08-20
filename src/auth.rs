@@ -197,13 +197,24 @@ struct RecentFailure {
     cause: String,
 }
 
-/// What the cache lock guards: the live token, and the failure that stands
-/// in for it while the source is cooling down.
+/// What the cache lock guards: the live token, the failure that stands in for
+/// it while the source is cooling down, and how many tokens have been cached
+/// so far.
 #[derive(Default)]
 struct CacheState {
     token: Option<CachedToken>,
     failure: Option<RecentFailure>,
+    generation: u64,
 }
+
+/// Identifies which cached token a header set was built from.
+///
+/// Bumped every time a fresh token is cached. Anything that captured the
+/// credential at construction time -- an upstream MCP session carries its
+/// headers for its whole life -- compares the generation it was built with
+/// against the current one to learn that the token has rotated underneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TokenGeneration(u64);
 
 /// Authenticated outbound context: cached ADC token plus quota project.
 ///
@@ -258,6 +269,16 @@ impl AuthContext {
     /// [`FETCH_FAILURE_COOLDOWN`]: until then every call fails at once with
     /// [`Error::CredentialsCoolingDown`] carrying the original failure.
     pub async fn apply(&self, headers: &mut HeaderMap) -> Result<(), Error> {
+        self.apply_tracked(headers).await.map(|_generation| ())
+    }
+
+    /// [`Self::apply`], also reporting which token the headers carry.
+    ///
+    /// The returned [`TokenGeneration`] changes exactly when a fresh token is
+    /// cached, so a caller that keeps something built from these headers
+    /// alive -- an upstream session -- can tell later whether it is still
+    /// current by comparing generations, without ever seeing the token.
+    pub async fn apply_tracked(&self, headers: &mut HeaderMap) -> Result<TokenGeneration, Error> {
         let mut state = self.cached.lock().await;
         if state
             .token
@@ -286,6 +307,7 @@ impl AuthContext {
             };
             state.token = Some(CachedToken::from_fetched(fetched)?);
             state.failure = None;
+            state.generation += 1;
         }
         let token = state
             .token
@@ -293,7 +315,23 @@ impl AuthContext {
             .expect("token cache populated just above");
         headers.insert(AUTHORIZATION, token.header.clone());
         headers.insert(USER_PROJECT_HEADER, self.quota_project.clone());
-        Ok(())
+        Ok(TokenGeneration(state.generation))
+    }
+
+    /// Forget the cached token if it is still the one `generation` names, so
+    /// the next [`Self::apply`] fetches a fresh one.
+    ///
+    /// For an upstream that rejected the token as unauthorized even though it
+    /// looked fresh locally: revoked, or expired on a skewed clock. Naming the
+    /// generation keeps concurrent callers that hit the same rejection from
+    /// discarding the replacement token the first of them already fetched.
+    /// The cooldown still applies to the fetch that follows, so a source that
+    /// recently failed is not hammered by this either.
+    pub async fn invalidate(&self, generation: TokenGeneration) {
+        let mut state = self.cached.lock().await;
+        if state.generation == generation.0 {
+            state.token = None;
+        }
     }
 
     /// Record `error` as the failure the source is cooling down from, and hand
@@ -602,6 +640,70 @@ mod tests {
             .await
             .expect("cached token");
         assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_generation_changes_exactly_when_a_fresh_token_is_cached() {
+        let source = FakeSource::new(None, "stable");
+        let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
+            .expect("valid inputs");
+
+        let first = ctx
+            .apply_tracked(&mut HeaderMap::new())
+            .await
+            .expect("first fetch");
+        let second = ctx
+            .apply_tracked(&mut HeaderMap::new())
+            .await
+            .expect("served from cache");
+        assert_eq!(
+            first, second,
+            "a cached token keeps its generation: {first:?} vs {second:?}"
+        );
+        assert_eq!(source.calls(), 1);
+
+        // Invalidating the generation that is current forces a fresh fetch and
+        // a new generation; anything built from `first` is now known stale.
+        ctx.invalidate(first).await;
+        let third = ctx
+            .apply_tracked(&mut HeaderMap::new())
+            .await
+            .expect("re-fetched after invalidation");
+        assert_ne!(third, first);
+        assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidating_a_superseded_generation_is_a_no_op() {
+        // Two callers hit a 401 on the same old token; the first one's
+        // invalidation already produced a replacement, and the second must not
+        // throw that replacement away too.
+        let source = FakeSource::new(None, "stable");
+        let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
+            .expect("valid inputs");
+
+        let old = ctx
+            .apply_tracked(&mut HeaderMap::new())
+            .await
+            .expect("first fetch");
+        ctx.invalidate(old).await;
+        let replacement = ctx
+            .apply_tracked(&mut HeaderMap::new())
+            .await
+            .expect("replacement fetched");
+        assert_eq!(source.calls(), 2);
+
+        ctx.invalidate(old).await;
+        let still = ctx
+            .apply_tracked(&mut HeaderMap::new())
+            .await
+            .expect("served from cache");
+        assert_eq!(still, replacement);
+        assert_eq!(
+            source.calls(),
+            2,
+            "a stale invalidation must not cost another fetch"
+        );
     }
 
     #[test]

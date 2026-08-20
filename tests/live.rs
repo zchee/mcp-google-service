@@ -264,6 +264,54 @@ async fn live_startup_and_first_tool_response_meet_their_latency_budgets() {
     session.shutdown().await;
 }
 
+/// A warm dispatch reuses its session and answers faster than the cold one.
+///
+/// P3 caches the upstream MCP session, so only the first dispatch to a service
+/// pays the `initialize` handshake; subsequent dispatches to the same service
+/// skip it. Against real Google latency the saving is one round trip, which
+/// varies run to run, so this reports both timings and the delta rather than
+/// asserting a threshold that would be flaky -- the in-process
+/// `a_second_dispatch_reuses_the_session_and_does_not_reinitialize` is what
+/// proves the handshake is gone by counting it. Here the only assertions are
+/// that both dispatches succeed and, loosely, that the warm one did not come
+/// out dramatically slower, which would signal the cache is not being hit.
+#[tokio::test]
+async fn live_second_dispatch_reuses_the_session() {
+    let Some(project) = live_project() else {
+        return;
+    };
+    let session = LiveSession::start(&project).await;
+
+    let args = json!({ "project": project, "region": "us-central1" });
+
+    let cold_start = Instant::now();
+    let cold = session.dispatch("run__list_services", args.clone()).await;
+    let cold_elapsed = cold_start.elapsed();
+    assert_live_dispatch_ok("run__list_services (cold)", &cold);
+
+    let warm_start = Instant::now();
+    let warm = session.dispatch("run__list_services", args).await;
+    let warm_elapsed = warm_start.elapsed();
+    assert_live_dispatch_ok("run__list_services (warm)", &warm);
+
+    eprintln!("dispatch cold (with handshake): {cold_elapsed:?}");
+    eprintln!("dispatch warm (session reused): {warm_elapsed:?}");
+    if let Some(saved) = cold_elapsed.checked_sub(warm_elapsed) {
+        eprintln!("warm saved: {saved:?} (one avoided initialize round trip)");
+    }
+
+    // Not a hard latency budget -- Google's own latency dominates and varies --
+    // but a warm dispatch several times slower than the cold one would mean the
+    // session is being rebuilt every call, which is the regression this guards.
+    assert!(
+        warm_elapsed < cold_elapsed * 3 + Duration::from_millis(500),
+        "warm dispatch ({warm_elapsed:?}) was far slower than cold ({cold_elapsed:?}); \
+         the session cache does not appear to be reused"
+    );
+
+    session.shutdown().await;
+}
+
 /// Parsing the committed snapshot must stay within its budget.
 ///
 /// No credentials are involved, but the measurement belongs with the other

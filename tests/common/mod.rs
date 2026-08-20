@@ -284,6 +284,61 @@ where
     }
 }
 
+/// Answers the first `reject_remaining` requests with a 401 challenge, then
+/// forwards to `inner`.
+///
+/// Concretely typed to the boxed body rmcp's server produces so the rejection
+/// branch and the forwarded branch share a response type.
+#[derive(Clone)]
+struct RejectInitializes<S> {
+    inner: S,
+    reject_remaining: Arc<AtomicUsize>,
+}
+
+impl<S> hyper::service::Service<Request<Incoming>> for RejectInitializes<S>
+where
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = Response<BoxBody<Bytes, Infallible>>,
+            Error = Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response<BoxBody<Bytes, Infallible>>;
+    type Error = Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, request: Request<Incoming>) -> Self::Future {
+        // Decrement only while there are rejections left, so exactly the first
+        // `reject` requests are refused and the rest pass through.
+        let reject = self
+            .reject_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if reject {
+            return Box::pin(async {
+                let body = r#"{"error":{"code":401,"message":"token revoked"}}"#;
+                let response = Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    // The challenge header is what makes rmcp classify this as
+                    // authorization-required rather than an opaque failure.
+                    .header("www-authenticate", "Bearer realm=\"google\"")
+                    .body(BoxBody::new(Full::new(Bytes::from(body))))
+                    .expect("a status and two headers always build a valid response");
+                Ok(response)
+            });
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
 /// A real MCP server with a small synthetic toolset.
 ///
 /// Deliberately not a Google mock: it implements `ServerHandler` and is served
@@ -426,10 +481,44 @@ impl McpUpstream {
             .expect("observed-header mutex is never held across a panic")
             .clone()
     }
+
+    /// How many MCP `initialize` handshakes this upstream has served.
+    ///
+    /// The streamable-HTTP client has no session id until `initialize`
+    /// completes, so the `initialize` POST is the one request that arrives
+    /// without an `Mcp-Session-Id` header; every later request on that session
+    /// carries it. Counting the header-less requests therefore counts
+    /// handshakes -- including a failed one, whose 401 never yields a session
+    /// id -- which is exactly what the dispatch-cache acceptance test asserts,
+    /// and it needs no access to request bodies.
+    pub fn initialize_count(&self) -> usize {
+        self.all_requests()
+            .iter()
+            .filter(|headers| !headers.contains_key("mcp-session-id"))
+            .count()
+    }
 }
 
 /// Start a real MCP upstream over TLS for `hostnames`.
 pub async fn spawn_mcp_upstream(hostnames: &[&str], label: &str) -> McpUpstream {
+    spawn_mcp_upstream_rejecting(hostnames, label, 0).await
+}
+
+/// [`spawn_mcp_upstream`] that answers its first `reject` requests with a 401
+/// carrying a `WWW-Authenticate: Bearer` challenge before serving normally.
+///
+/// This is how the dispatch cache's retry-once-on-401 is exercised: the first
+/// `initialize` is rejected exactly as Google rejects a revoked token (a 401
+/// with the challenge header, which is what rmcp turns into an
+/// authorization-required error), and the proxy must re-fetch and open a
+/// second session that succeeds. The rejection layer sits *inside* the header
+/// recorder, so the rejected handshake still counts toward
+/// [`McpUpstream::initialize_count`].
+pub async fn spawn_mcp_upstream_rejecting(
+    hostnames: &[&str],
+    label: &str,
+    reject: usize,
+) -> McpUpstream {
     let observed: ObservedHeaders = Arc::new(Mutex::new(Vec::new()));
 
     let handler_observed = Arc::clone(&observed);
@@ -458,7 +547,10 @@ pub async fn spawn_mcp_upstream(hostnames: &[&str], label: &str) -> McpUpstream 
     );
 
     let recording = RecordHeaders {
-        inner: TowerToHyperService::new(service),
+        inner: RejectInitializes {
+            inner: TowerToHyperService::new(service),
+            reject_remaining: Arc::new(AtomicUsize::new(reject)),
+        },
         observed: Arc::clone(&observed),
     };
     let server = spawn_tls(

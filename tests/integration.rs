@@ -26,6 +26,9 @@
 //! | P2 serve-first startup | `serve_answers_before_credentials_and_enablement_resolve_then_narrows` |
 //! | P2 `--only` skips Service Usage | `only_never_consults_service_usage` |
 //! | P2 failure surfacing | `a_credential_failure_is_reported_by_list_services_and_returned_by_call` |
+//! | P3 session reuse (5.4) | `a_second_dispatch_reuses_the_session_and_does_not_reinitialize` |
+//! | P3 token rotation | `a_rotated_token_forces_a_fresh_session` |
+//! | P3 401 retry | `an_unauthorized_handshake_is_retried_once_against_a_fresh_token` |
 
 mod common;
 
@@ -60,7 +63,7 @@ use common::{
     PROMOTED_HEADER, SERVICE_DISABLED_BODY, TOOL_ECHO, TOOL_FAIL, TOOL_PROMOTES_HEADERS,
     TOOL_SHOW_HEADERS, client_resolving, scrub_google_credential_env, service_usage_page,
     spawn_counting_service_usage_stub, spawn_failing_upstream, spawn_mcp_upstream,
-    spawn_service_usage_stub,
+    spawn_mcp_upstream_rejecting, spawn_service_usage_stub,
 };
 
 /// Quota project used by every test that needs one. Never a real project.
@@ -1428,4 +1431,215 @@ async fn a_credential_failure_is_reported_by_list_services_and_returned_by_call(
 
     session.shutdown().await;
     stub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// P3: one initialize per session, not per call
+// ---------------------------------------------------------------------------
+
+/// Dispatch `echo` with a distinct payload and assert it round-tripped.
+async fn echo_ok(proxy: &Proxy, payload: &str) {
+    let result = proxy
+        .dispatch(
+            &format!("run__{TOOL_ECHO}"),
+            Some(
+                json!({ "payload": payload })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        )
+        .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "dispatch of `{payload}` must succeed; got: {}",
+        result_text(&result)
+    );
+    let echoed: Value = serde_json::from_str(&result_text(&result)).expect("echo returns JSON");
+    assert_eq!(echoed, json!({ "payload": payload }));
+}
+
+#[tokio::test]
+async fn a_second_dispatch_reuses_the_session_and_does_not_reinitialize() {
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+    let proxy = Proxy::new(
+        fake_auth("token-reuse", TEST_PROJECT),
+        http,
+        vec![Route::from_endpoint(run)],
+    );
+
+    echo_ok(&proxy, "first").await;
+    echo_ok(&proxy, "second").await;
+    echo_ok(&proxy, "third").await;
+
+    assert_eq!(
+        upstream.initialize_count(),
+        1,
+        "three dispatches to one service must share a single handshake; \
+         the upstream saw these requests: {:?}",
+        upstream.all_requests()
+    );
+    assert_eq!(proxy.cached_sessions().await, 1);
+
+    upstream.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rotated_token_forces_a_fresh_session() {
+    use reqwest::header::HeaderMap;
+
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+
+    // Hold the auth so its generation can be advanced from the test, standing
+    // in for the hourly ADC refresh.
+    let auth = fake_auth("token-rotation", TEST_PROJECT);
+    let generation = auth
+        .apply_tracked(&mut HeaderMap::new())
+        .await
+        .expect("the fake source yields a token");
+
+    let proxy = Proxy::new(Arc::clone(&auth), http, vec![Route::from_endpoint(run)]);
+
+    echo_ok(&proxy, "before-rotation").await;
+    echo_ok(&proxy, "still-before").await;
+    assert_eq!(
+        upstream.initialize_count(),
+        1,
+        "the token has not moved, so the session is reused"
+    );
+
+    // The token rotates: the cached session was built from the old generation
+    // and must not be reused with the new one.
+    auth.invalidate(generation).await;
+
+    echo_ok(&proxy, "after-rotation").await;
+    assert_eq!(
+        upstream.initialize_count(),
+        2,
+        "a rotated token must open a new session, not reuse the old one"
+    );
+    assert_eq!(
+        proxy.cached_sessions().await,
+        1,
+        "the superseded session must be replaced, not accumulated"
+    );
+
+    upstream.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unauthorized_handshake_is_retried_once_against_a_fresh_token() {
+    // The upstream rejects the first `initialize` with a 401 + challenge, as a
+    // real endpoint rejects a revoked token, then serves normally.
+    let upstream = spawn_mcp_upstream_rejecting(&["run.googleapis.com"], "synthetic-run", 1).await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+    let proxy = Proxy::new(
+        fake_auth("token-401-retry", TEST_PROJECT),
+        http,
+        vec![Route::from_endpoint(run)],
+    );
+
+    echo_ok(&proxy, "survives-the-401").await;
+
+    assert_eq!(
+        upstream.initialize_count(),
+        2,
+        "the rejected handshake must be retried exactly once; the upstream saw: {:?}",
+        upstream.all_requests()
+    );
+    assert_eq!(proxy.cached_sessions().await, 1);
+
+    // The retry is once, not a loop: a second, un-rejected dispatch reuses the
+    // recovered session and adds no handshake.
+    echo_ok(&proxy, "reuses-the-recovered-session").await;
+    assert_eq!(upstream.initialize_count(), 2);
+
+    upstream.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_idle_session_is_reopened_after_its_ttl() {
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+    let proxy = Proxy::new(
+        fake_auth("token-idle", TEST_PROJECT),
+        http,
+        vec![Route::from_endpoint(run)],
+    )
+    .with_session_limits(Duration::from_millis(20), 16);
+
+    echo_ok(&proxy, "opens").await;
+    assert_eq!(upstream.initialize_count(), 1);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    echo_ok(&proxy, "after-idle").await;
+    assert_eq!(
+        upstream.initialize_count(),
+        2,
+        "a session idle past its ttl must be closed and reopened"
+    );
+
+    upstream.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_session_cache_is_bounded_and_evicts_least_recently_used() {
+    let run_up = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let bq_up = spawn_mcp_upstream(&["bigquery.googleapis.com"], "synthetic-bq").await;
+    let http = client_resolving(&[
+        ("run.googleapis.com", run_up.server.addr()),
+        ("bigquery.googleapis.com", bq_up.server.addr()),
+    ]);
+    let run = registry::find("run").expect("`run` is registered");
+    let bigquery = registry::find("bigquery").expect("`bigquery` is registered");
+    let proxy = Proxy::new(
+        fake_auth("token-bound", TEST_PROJECT),
+        http,
+        vec![Route::from_endpoint(run), Route::from_endpoint(bigquery)],
+    )
+    .with_session_limits(Duration::from_secs(300), 1);
+
+    echo_ok(&proxy, "run-first").await;
+    let bq = proxy
+        .dispatch(
+            &format!("bigquery__{TOOL_ECHO}"),
+            Some(
+                json!({ "payload": "bq" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        )
+        .await;
+    assert_ne!(
+        bq.is_error,
+        Some(true),
+        "bigquery dispatch: {}",
+        result_text(&bq)
+    );
+
+    // With a bound of one, opening bigquery must have closed the run session.
+    assert_eq!(proxy.cached_sessions().await, 1);
+    assert_eq!(run_up.initialize_count(), 1);
+    assert_eq!(bq_up.initialize_count(), 1);
+
+    // So the next run dispatch reopens run, not reuses it.
+    echo_ok(&proxy, "run-again").await;
+    assert_eq!(
+        run_up.initialize_count(),
+        2,
+        "the evicted run session must be reopened, not reused"
+    );
+    assert_eq!(proxy.cached_sessions().await, 1);
+
+    run_up.server.shutdown().await;
+    bq_up.server.shutdown().await;
 }

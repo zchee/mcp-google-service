@@ -1,27 +1,49 @@
 //! Per-upstream MCP clients and request dispatch.
 //!
-//! Every dispatch builds its transport with headers taken from
-//! [`AuthContext`] at call time. ADC access tokens expire hourly, so a header
-//! captured once at construction would go stale; the only safe place to read
-//! the token is immediately before the request that uses it.
+//! An upstream MCP session is opened with an `initialize` handshake and then
+//! carries the headers it was built with -- the bearer token among them --
+//! for its whole life. Sessions are therefore cached per service and keyed by
+//! the [`TokenGeneration`] their headers came from: a dispatch reuses the
+//! session while the token it was built with is still the current one, and
+//! rebuilds it the moment [`AuthContext`] reports a fresh token. ADC access
+//! tokens expire hourly, so this is what keeps a long-lived session from
+//! quietly outliving its credential.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::{
-    ServiceExt,
+    RoleClient, ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ContentBlock, JsonObject},
+    service::RunningService,
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
-    auth::AuthContext,
+    auth::{AuthContext, TokenGeneration},
     catalog::split_namespaced,
     error::{classify_upstream, sanitize_body},
     registry::Endpoint,
 };
+
+/// Longest an upstream session may sit unused before the next dispatch
+/// closes it.
+///
+/// Each live session holds its server-initiated event stream open, so an idle
+/// one is an open connection on both sides; five minutes keeps a working
+/// model's sessions warm and lets an abandoned one go.
+pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Most upstream sessions kept alive at once; the least recently used is
+/// closed first.
+///
+/// A typical project enables a handful of the registered APIs, so this is
+/// headroom, not a working limit; it exists so that 47 idle sessions cannot
+/// accumulate on a server that touched every service once.
+pub const MAX_SESSIONS: usize = 16;
 
 /// Where one service's MCP endpoint lives.
 ///
@@ -48,11 +70,27 @@ impl Route {
     }
 }
 
+/// One live upstream session and what it was built from.
+struct CachedSession {
+    /// Token generation its headers carry; a newer one means rebuild.
+    generation: TokenGeneration,
+    /// The session. Shared so a dispatch in flight keeps it alive after the
+    /// cache has let go of it; the last holder's drop closes it.
+    service: Arc<RunningService<RoleClient, ()>>,
+    /// When a dispatch last used it, for idle eviction and LRU ordering.
+    last_used: Instant,
+}
+
 /// Dispatches namespaced tool calls to the upstream that owns them.
 pub struct Proxy {
     auth: Arc<AuthContext>,
     http: reqwest::Client,
     routes: Vec<Route>,
+    /// Live sessions by service id. The lock is held only to look up, insert
+    /// or evict, never across a handshake or a call.
+    sessions: Mutex<HashMap<String, CachedSession>>,
+    idle_ttl: Duration,
+    max_sessions: usize,
 }
 
 impl Proxy {
@@ -63,7 +101,30 @@ impl Proxy {
     /// which pays TLS setup once per host per call. One pooled client amortizes
     /// connection setup across the whole process.
     pub fn new(auth: Arc<AuthContext>, http: reqwest::Client, routes: Vec<Route>) -> Self {
-        Self { auth, http, routes }
+        Self {
+            auth,
+            http,
+            routes,
+            sessions: Mutex::default(),
+            idle_ttl: SESSION_IDLE_TTL,
+            max_sessions: MAX_SESSIONS,
+        }
+    }
+
+    /// Override the session cache's idle timeout and size bound.
+    ///
+    /// The defaults ([`SESSION_IDLE_TTL`], [`MAX_SESSIONS`]) are what serve
+    /// uses; this exists so the eviction rules can be exercised by tests
+    /// without waiting minutes or opening seventeen upstreams.
+    pub fn with_session_limits(mut self, idle_ttl: Duration, max_sessions: usize) -> Self {
+        self.idle_ttl = idle_ttl;
+        self.max_sessions = max_sessions.max(1);
+        self
+    }
+
+    /// Number of upstream sessions currently cached.
+    pub async fn cached_sessions(&self) -> usize {
+        self.sessions.lock().await.len()
     }
 
     /// Build a proxy routing to the given registry endpoints.
@@ -112,6 +173,25 @@ impl Proxy {
     }
 
     /// [`Self::dispatch`] with failures as `Err(message)`.
+    ///
+    /// The upstream session is taken from the cache when one exists for the
+    /// service and was built from the token that is current now; otherwise a
+    /// new one is opened with one `initialize` handshake and cached.
+    ///
+    /// A stale token is handled two ways that never double-execute a tool.
+    /// The ordinary rotation -- the local token expiring and being refreshed --
+    /// changes the [`TokenGeneration`], so the old-generation session is not
+    /// reused and the next dispatch simply rebuilds with the fresh token. The
+    /// awkward case is a token that still looks current locally but the server
+    /// rejects (revoked, or a clock skew the expiry check missed). If that 401
+    /// arrives while *opening* a session it is detected
+    /// ([`ClientInitializeError::is_authorization_required`]) and the open is
+    /// retried once against a re-fetched token, because a rejected handshake
+    /// ran no tool. If it instead arrives on a *reused* session's call, that
+    /// call is not silently replayed -- the session is dropped and the error
+    /// returned, and the model's next call rebuilds the session, where the
+    /// same 401 is caught at the handshake and recovered. Every non-auth call
+    /// failure likewise drops the session and is returned as is.
     async fn try_dispatch(
         &self,
         namespaced_name: &str,
@@ -123,42 +203,186 @@ impl Proxy {
             .route(service_id)
             .ok_or_else(|| self.unknown_service_message(service_id))?;
 
-        let transport = StreamableHttpClientTransport::with_client(
-            self.http.clone(),
-            StreamableHttpClientTransportConfig::with_uri(route.mcp_url.clone())
-                .custom_headers(self.call_headers().await?),
-        );
-
-        let client =
-            ().serve(transport)
-                .await
-                .map_err(|error| upstream_message(&route.host, &error))?;
+        let session = self.session_for(route, tool_name).await?;
 
         let mut params = CallToolRequestParams::new(tool_name.to_owned());
         params.arguments = arguments;
-        let called = client.call_tool(params).await;
-        // Release the upstream session regardless of outcome.
-        let _ = client.cancel().await;
-
-        called.map_err(|error| upstream_message(&route.host, &error))
+        match session.call_tool(params).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                // A reused session may have gone stale under us; drop it so the
+                // next dispatch rebuilds. The call is not retried here: a
+                // transport error can arrive after the tool has run, and this
+                // tool set is not all idempotent.
+                self.evict(&route.service_id, &session).await;
+                Err(upstream_message(&route.host, &error))
+            }
+        }
     }
 
-    /// Freshly minted auth headers for one request.
+    /// A live session for `route`: the cached one when it is current and open,
+    /// otherwise a freshly opened one. A handshake the server rejects as
+    /// unauthorized is retried once against a re-fetched token.
+    ///
+    /// `tool_name` is only for the log line that attributes a handshake to the
+    /// call that caused it.
+    async fn session_for(
+        &self,
+        route: &Route,
+        tool_name: &str,
+    ) -> Result<Arc<RunningService<RoleClient, ()>>, String> {
+        let mut retried = false;
+        loop {
+            let (headers, generation) = match self.call_headers().await {
+                Ok(fresh) => fresh,
+                Err(message) => {
+                    // A session exists only while the credential it carries is
+                    // current; with none obtainable, none may linger.
+                    self.sessions.lock().await.clear();
+                    return Err(message);
+                }
+            };
+
+            match self
+                .open_or_reuse(route, generation, headers, tool_name)
+                .await
+            {
+                Ok(session) => return Ok(session),
+                Err(error) => {
+                    if !retried && error.is_authorization_required() {
+                        tracing::debug!(
+                            service = route.service_id,
+                            "upstream rejected the token at handshake; re-fetching and retrying once"
+                        );
+                        retried = true;
+                        self.auth.invalidate(generation).await;
+                        continue;
+                    }
+                    return Err(upstream_message(&route.host, &error));
+                }
+            }
+        }
+    }
+
+    /// The cached session for `route` if it was built from `generation` and
+    /// its transport is still open; otherwise a freshly initialized one, which
+    /// replaces whatever was cached.
+    ///
+    /// The handshake runs outside the cache lock. Two first dispatches to the
+    /// same service racing each other may therefore both open a session; the
+    /// later insert wins the cache and the other closes once its own call is
+    /// done, which costs one redundant handshake and nothing else.
+    async fn open_or_reuse(
+        &self,
+        route: &Route,
+        generation: TokenGeneration,
+        headers: HashMap<HeaderName, HeaderValue>,
+        tool_name: &str,
+    ) -> Result<Arc<RunningService<RoleClient, ()>>, rmcp::service::ClientInitializeError> {
+        {
+            let mut sessions = self.sessions.lock().await;
+            self.evict_idle(&mut sessions);
+            if let Some(cached) = sessions.get_mut(&route.service_id)
+                && cached.generation == generation
+                && !cached.service.is_transport_closed()
+            {
+                cached.last_used = Instant::now();
+                return Ok(Arc::clone(&cached.service));
+            }
+        }
+
+        let transport = StreamableHttpClientTransport::with_client(
+            self.http.clone(),
+            StreamableHttpClientTransportConfig::with_uri(route.mcp_url.clone())
+                .custom_headers(headers),
+        );
+        let service = Arc::new(().serve(transport).await?);
+        tracing::debug!(
+            service = route.service_id,
+            host = route.host,
+            tool = tool_name,
+            "opened upstream MCP session"
+        );
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(
+            route.service_id.clone(),
+            CachedSession {
+                generation,
+                service: Arc::clone(&service),
+                last_used: Instant::now(),
+            },
+        );
+        self.enforce_bound(&mut sessions);
+        Ok(service)
+    }
+
+    /// Drop `session` from the cache if it is still the one cached for
+    /// `service_id`; a newer replacement is left alone.
+    async fn evict(&self, service_id: &str, session: &Arc<RunningService<RoleClient, ()>>) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(service_id)
+            .is_some_and(|cached| Arc::ptr_eq(&cached.service, session))
+        {
+            sessions.remove(service_id);
+        }
+    }
+
+    /// Close sessions that have sat unused longer than the idle timeout.
+    fn evict_idle(&self, sessions: &mut HashMap<String, CachedSession>) {
+        let now = Instant::now();
+        sessions.retain(|service_id, cached| {
+            let keep = now.duration_since(cached.last_used) < self.idle_ttl;
+            if !keep {
+                tracing::debug!(service = %service_id, "closing idle upstream MCP session");
+            }
+            keep
+        });
+    }
+
+    /// Close least-recently-used sessions until the cache is within bound.
+    fn enforce_bound(&self, sessions: &mut HashMap<String, CachedSession>) {
+        while sessions.len() > self.max_sessions {
+            let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(service_id, _)| service_id.clone())
+            else {
+                return;
+            };
+            tracing::debug!(service = %oldest, "closing least recently used upstream MCP session");
+            sessions.remove(&oldest);
+        }
+    }
+
+    /// Freshly minted auth headers for one request, and the token generation
+    /// they carry.
     ///
     /// `Authorization` and `x-goog-user-project` both travel as custom headers;
     /// neither is on rmcp's reserved list, and routing the bearer token this way
     /// keeps both headers on the same call-time refresh path.
-    async fn call_headers(&self) -> Result<HashMap<HeaderName, HeaderValue>, String> {
+    async fn call_headers(
+        &self,
+    ) -> Result<(HashMap<HeaderName, HeaderValue>, TokenGeneration), String> {
         let mut headers = HeaderMap::new();
-        self.auth
-            .apply(&mut headers)
+        let generation = self
+            .auth
+            .apply_tracked(&mut headers)
             .await
             .map_err(|error| format!("could not attach Google credentials: {error}"))?;
-        Ok(headers
+        let headers = headers
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
-            .collect())
+            .collect();
+        Ok((headers, generation))
     }
+}
+
+/// The HTTP status behind an rmcp error, typed where one is carried and
+/// recovered from the rendered chain otherwise (see [`status_from_text`]).
+fn recovered_status(error: &(dyn std::error::Error + 'static)) -> Option<u16> {
+    http_status(error).or_else(|| status_from_text(&render_chain(error)))
 }
 
 /// Build the shared HTTP client used for both dispatch and Service Usage calls.
@@ -206,7 +430,7 @@ fn unnamespaced_message(name: &str) -> String {
 /// rendered.
 fn upstream_message(host: &str, error: &(dyn std::error::Error + 'static)) -> String {
     let chain = render_chain(error);
-    match http_status(error).or_else(|| status_from_text(&chain)) {
+    match recovered_status(error) {
         Some(status) => format!(
             "call to {host} failed: {}",
             classify_upstream(status, &chain)
