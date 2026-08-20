@@ -289,6 +289,7 @@ not where startup goes.
 | P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
 | P6 | none (reverted) | untouched | untouched | untouched | untouched | untouched; fan-out 6.64 -> 6.45 -> 6.32 s (A/B/A', null -- section 11) |
 | P7 | `924439d` + this commit | **-0.82 ms** (profile) **-1.12 ms** (mimalloc), paired; see 12a | same probe (`--offline`) | untouched (`[profile.bench]` pinned, section 12) | untouched | **25,200,624 (-20.5%)** |
+| P5 | `8be5bd4` + `4bc3bb3` | offline paired min 20.3 -> **8.9 ms** (-56%), medians agree -- section 13 | same probe | within band under load (section 13c) | serve load 9.32 ms -> **89.5 us / 2,852 allocs**; JSON path kept | **16,472,160 (-34.6%)** |
 
 Notes on the P2 row:
 
@@ -809,3 +810,107 @@ allocator reclaims the page afterwards does not change what is left in it.
 **Still open at this commit**: nothing from P7. The security reviewer holds
 mimalloc's trust-base question and its secure-mode option; the phase's
 measured results are complete.
+
+## 13. P5 -- the catalog as a checked archive, schemas opened on demand
+
+Commits `8be5bd4` (archive format, committed `data/catalog-snapshot.bin`,
+identity/corruption/version tests) and `4bc3bb3` (serve from the archive,
+schemas as per-tool zstd frames inflated once on first use). Both arms built
+in the same worktree (`.../mcp-google-service-p5`, target-dir
+`/Volumes/tmpfs/target-p5`), so sizes and pairings share one path per the
+section 12 caveat. `RUSTFLAGS` unset throughout.
+
+Predictions were registered with the lead before any measurement; each is
+scored below.
+
+### 13a. Startup (decisive; paired alternation, P-I)
+
+`scripts/bench-startup.sh --offline --bin <arm> --runs 10`, arms alternated
+A,B,A,B,A,B minutes apart while the machine ran load averages 6.9-15.7 --
+which is why medians wobble and minima are the stable pair, exactly the
+regime section 12a established.
+
+| Round | main `f4767ae` (min / median) | p5 `4bc3bb3` (min / median) |
+|---|---:|---:|
+| 1 | 20.30 / 39.72 | 8.88 / 23.68 |
+| 2 | 20.51 / 21.99 | 8.84 / 9.29 |
+| 3 | 19.87 / 21.45 | 8.86 / 10.65 |
+
+Minima: 20.3/20.5/19.9 against **8.9/8.8/8.9** -- a paired **-11.4 ms
+(-56%)**, stable while the load average doubled. The quiet-round medians
+(21.99 vs 9.29) agree with the minima, which is the standing bar.
+
+**P-I scored: direction right, magnitude wrong -- the win is larger than
+predicted.** Registered: -5.0 to -8.0 ms, landing at 13-15.5 ms. Measured:
+-11.4 ms, landing at ~8.9 ms, through the plan's ~13 ms target. The
+prediction accounted for removing the 9.2 ms parse (minus mimalloc's already
+-banked ~1.1 ms) and adding ~0.5-2 ms of validation+materialization; it
+missed two mechanisms, named here post-hoc and honestly as such: parsing
+touched all 11.6 MB of the embedded JSON (~2,900 page-ins now gone -- the
+archive touches ~2.2 MB and materializes ~0.5 MB), and dyld maps 8.7 MB less
+binary, which section 12a already measured at ~1 ms for a 6.7 MB reduction.
+The falsified half is the estimate of what remained after the parse: the
+serve floor under P2's 22.8 ms quiet reference was not ~13 ms of
+irreducible work, it was ~9.
+
+### 13b. The numbers behind it (frozen bench profile, P-III/P-IV/P-V)
+
+`env -u RUSTFLAGS cargo bench --bench bench_snapshot_load`, medians of 30:
+
+| Row | median | allocations | predicted bound |
+|---|---:|---:|---|
+| `parse_json_into_catalog` (the old serve load; still the `--snapshot` path) | 9.32 ms | 261,406 / 33.27 MB | unchanged -- holds |
+| **`materialize_embedded` (the new serve load)** | **89.54 us** | **2,852 / 538.8 KB** | P-III: <2 ms, <6,000 -- **104x under the old load** |
+| `access_file` (checked validation alone) | 23.16 us | 774 KB transient | P-V: <0.5 ms -- holds 21x over; `access_unchecked` is not worth discussing |
+| `describe_first_touch_one_tool` | 6.48 us | 14.2 KB | P-IV: <300 us -- holds 46x over |
+| `assemble_serve_catalog_all_endpoints` | 111.9 us | | was 270.6 us at baseline |
+
+### 13c. Size (P-II) and search parity
+
+Binary, same path both arms: 25,200,624 -> **16,472,160 bytes
+(-8,728,464, -34.6%)**; `__TEXT,__const` 12.6 MB -> 3.08 MB (the 11.64 MB
+JSON replaced by the 2.22 MB archive). **P-II scored: hit** -- registered
+15.5-16.5 MB, landed at the top edge. The committed archive is 2,220,096
+bytes; per-tool zstd-19 with content checksums compresses the 6.95 MB of
+compact schema JSON about 5.2x, inside the predicted 4-6x.
+
+`bench_search` on the P5 branch under the same load: warm `cloud run`
+71.89 us / `instances` 39.49 / misses 34.99 and 59.62, all with the alloc
+sections absent (still zero on the query path). Against section 10's 67.7 /
+37.2 / 34.0 / 56.2 that is +2-6% with slowest samples 60% over the fastest
+-- the load, not the change; the search code is untouched and the golden
+suite passes against the archive-materialized catalog.
+
+### 13d. What the identity tests caught before measurement did
+
+Two defects died in the suite rather than in the field, which is the reason
+those tests exist and worth recording: (1) the first committed archive was
+generated by a stale pre-checksum binary; the archive/JSON identity test
+refused it. (2) `ToolSpec`'s serializer round-tripped annotations through
+`serde_json::Value`, whose sorted maps silently reorder keys -- same byte
+count, different bytes; the byte-identity test (materialized catalog ->
+`to_json` == the committed 11,637,929 bytes exactly) caught it and forced
+typed serialization through `rmcp::model::ToolAnnotations`.
+
+Notes for team-verify and later work:
+
+- Trust boundary (F1): operator `--snapshot PATH` files remain JSON through
+  serde; foreign bytes never reach rkyv. The embedded archive is validated
+  (bytecheck) anyway; corruption at any payload byte is a clean
+  `ArchiveError::Invalid` (full-sweep test), a flipped bit inside a zstd
+  frame -- invisible to structural validation -- dies at the frame's content
+  checksum, and a version-tagged header refuses stale artifacts by message.
+- `zstd` adds a C library (zstd-sys) to the trust base, same review posture
+  as mimalloc's C; rkyv is pure Rust (MSRV 1.81).
+- Flat mode inflates every schema at `initialize` (its list carries them);
+  that is the 1.9 s network-bound path by design, and the inflate cost is
+  ~548 x ~7 us. Two-tier never pays it. A background refresh comparison
+  (`drift_from`) inflates and caches as it compares; worst-case memory
+  equals the pre-P5 resident catalog.
+- `print-catalog` still reads the working tree's JSON and falls back to the
+  embedded archive, so its report follows the reviewed file, not the binary.
+- The `snapshot` subcommand writes `.bin` beside `--out` and gains `--from
+  JSON` (fan-out skipped, `generated_at` preserved, byte-identical JSON
+  re-emit proven on the committed file), which is how the committed pair is
+  regenerated together; the identity test makes landing them apart
+  impossible.
