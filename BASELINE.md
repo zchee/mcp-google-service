@@ -496,7 +496,22 @@ deploy or create twice. The session is dropped instead, and the next dispatch
 rebuilds -- where a stale-token rejection arrives at the handshake, before any
 tool runs, and is retried there. Bound is 16 sessions, idle TTL 5 minutes.
 
-Measurement note: worker-2's P4 work was in the same working tree during this
-phase, so the hermetic gate for P3 was run as
-`nextest run -E 'not binary(search_ranking)'` -> **148/148 passed**; the
-excluded binary is P4's golden-ranking tests, written red before that rewrite.
+Gate note, for anyone re-running these at this commit. P4 was under way in
+the same working tree during P3, so a whole-tree `nextest` here reports
+failures that are not P3's: P4's golden-ranking tests are written red on
+purpose, before the ranking rewrite they pin. The P3 gates were therefore run
+in a separate git worktree containing this branch and nothing else --
+`fmt --check` clean, `clippy --all-targets -- -D warnings` clean,
+`nextest run` **148/148 passed, 0 skipped**, full suite with nothing excluded.
+An earlier scoped run in the shared tree,
+`nextest run -E 'not binary(search_ranking)'`, agreed at 147/147 before the
+eviction test was added.
+
+Two traps that cost time and would cost it again. `direnv exec .` does nothing
+in a fresh worktree -- direnv refuses an `.envrc` it has not been told to
+allow at that path, so the shell's nightly `RUSTFLAGS` pass through and cargo
+fails with "the option `Z` is only accepted on the nightly compiler"; use
+`env -u RUSTFLAGS` there, or `direnv allow` the path. And a worktree needs its
+own `build.target-dir` (`--config 'build.target-dir="..."'`): the binary path
+under `target/` is fixed, so two checkouts otherwise collide and serialize on
+the same build lock, which is the interference the worktree exists to avoid.
