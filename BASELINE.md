@@ -286,6 +286,7 @@ not where startup goes.
 | baseline (P1) | `d341bbb` | 1809.31 | 137.80 | 58.89 / 1,099 | 9.86 | 30,442,048 |
 | P2 | `b4b184d` + `7e7af67` | **22.84** | **22.78** | 58.64 / 1,099 (untouched) | 9.21 (untouched) | 31,586,464 |
 | P3 | `26b0cd3` (+ addendum) | unchanged | unchanged | untouched | untouched | see section 9 |
+| P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
 
 Notes on the P2 row:
 
@@ -441,7 +442,7 @@ decision for team-verify, not a P2 change. Binary grew by 1,115,552 bytes
 (+3.7%) with the readiness machinery and the lazy credential source; size is
 P5/P7's concern and is recorded, not optimized, here.
 | P3 | `26b0cd3` | see section 9 | | | | |
-| P4 | | | | | | |
+| P4 | `b121b12` | see section 10 | | | | |
 | P5 | | | | | | |
 | P6 | | | | | | |
 | P7 | | | | | | |
@@ -515,3 +516,110 @@ fails with "the option `Z` is only accepted on the nightly compiler"; use
 own `build.target-dir` (`--config 'build.target-dir="..."'`): the binary path
 under `target/` is fixed, so two checkouts otherwise collide and serialize on
 the same build lock, which is the interference the worktree exists to avoid.
+
+## 10. P4 -- search: ranked by what the query names, allocating nothing
+
+Commit `b121b12`. Same machine and flag regime as section 2
+(`env -u RUSTFLAGS cargo bench --bench bench_search`, divan, timer precision
+41 ns, serial, worker-1 confirmed idle for the whole window). Endpoint: every
+number in this section is an in-process micro-benchmark over the embedded
+47/548 snapshot, except the startup probes at the end, which are
+process-start -> `tools/list` over stdio via `scripts/bench-startup.sh` on a
+fresh `env -u RUSTFLAGS cargo build --release` binary (31,684,224 bytes,
+sha256 `ac26ba3a...`, +0.3% over P2's: the index code and the score fields).
+
+What changed: the catalog builds a search index on first use (every
+searchable string lowercased once into one arena; CamelCase names also
+indexed as `_`-separated words), `search_with(query, filter, limit, visit)`
+ranks against it with a stack-held query, a reused thread-local candidate
+buffer and `select_nth_unstable` top-k instead of a full sort (P1 finding
+#5), and the scorer now sees service ids: a run of query tokens that spells
+one (a leading `cloud` being brand, not id: Google publishes `run` but
+`cloudtrace`) outranks name-substring accidents like `cloud` inside
+`gcloud`. `search_tools` passes its limit down and reports `score` and
+`total_matches` (lead-approved surface ruling). The 2-arg `search` stays as
+an allocating convenience wrapper, which is what `warm_collected` measures.
+
+### 10a. Allocations per query (the acceptance criterion)
+
+divan `AllocProfiler`, per iteration. Baseline figures are section 2a
+(`d341bbb`, the same wrapper `warm_collected` still measures).
+
+| Row | cloud run | instances | miss (`zzzznomatch`) |
+|---|---:|---:|---:|
+| baseline `warm` (= the wrapper) | 1,099 / 275.7 KB | 1,099 / 275.7 KB | 1,098 / 275.6 KB |
+| **P4 `warm` (serve path, limit 20)** | **0 / 0 B** | **0 / 0 B** | **0 / 0 B** |
+| P4 `warm_unbounded` (full ranking) | 0 / 0 B | 0 / 0 B | 0 / 0 B |
+| P4 `warm_collected` (wrapper: result `Vec` only) | 4 events / 256 B peak | 5 events / 512 B peak | 0 / 0 B |
+| P4 `warm_filtered_to_run` | 0 / 0 B (baseline: 13 / 2.4 KB) | | |
+| P4 `warm_empty_query` | 0 / 0 B (baseline: 2 / 8.8 KB) | | |
+
+Acceptance "zero allocations on the query path" is met on the path the
+server actually calls, and even when the entire ranking is delivered. What
+remains in the wrapper is the returned `Vec` itself. The cost moved to
+construction, where it is paid once per catalog instead of per query: `cold`
+(first search on a fresh catalog) is 3 allocations / 326.7 KB -- the index
+arena plus its two span tables -- and 105-139 us total, i.e. ~70 us of index
+build on top of the query. A catalog is created twice per process (startup
+assembly, live-refresh swap), and the build is lazy, so startup never pays
+it; the first `search_tools` after a swap does.
+
+### 10b. Latency (not the target; one regression, declared)
+
+Warm medians, P4 vs section 2a. All under the plan's 100 us line.
+
+| Query | baseline | P4 | delta |
+|---|---:|---:|---:|
+| `instances` | 47.47 us | **37.20 us** | -22% |
+| `zzzznomatch` (miss) | 48.52 us | **34.04 us** | -30% |
+| `list cloud zzzznomatch` (miss) | 59.11 us | **56.24 us** | -5% |
+| `cloud run` | 58.89 us | **67.70 us** | **+15%** |
+| `list cloud run` | 57.56 us | **62.99 us** | +9% |
+| `list` filtered to `run` | 407.9 ns | **392.9 ns** | -4% |
+| empty query | 3.94 us | **3.54 us** | -10% |
+
+The regression on multi-token hit queries is real and expected: the scorer
+now walks name words, spells service ids and verifies adjacent-token
+phrases, which costs more per candidate than the removed per-tool
+lowercasing saved on those two queries. It is declared rather than reverted
+because ranking correctness is the phase's point, the plan's latency line
+(<100 us) holds with 32% headroom, and per-query time is 68 us against
+Google's 1-6 s tool latencies. If a later phase wants the 8 us back,
+`memchr::memmem` on the description scans is the first candidate; it was
+not adopted here because no target required it.
+
+Parse is untouched (re-measured: `parse_embedded` 9.21 ms vs 9.86 baseline;
+`assemble_serve_catalog_all_endpoints` 219.8 us vs 270.6 -- run-to-run
+variance, no code on that path changed).
+
+### 10c. Ranking (the correctness defect)
+
+`tests/golden/search-ranking.txt` pins the head of fifteen rankings;
+`tests/search_ranking.rs` checks them plus the properties that justify
+them. Written and run RED against `3f72987` before the rewrite: 3 of 10
+tests failed, 7 of 15 blocks diverged. The E2E case as recorded red, query
+`cloud run`: actual head was `cloudcli__run_gcloud_command,
+cloudcli__run_bq_command, alloydb__export_data, alloydb__import_data,
+bigquery__execute_sql_readonly, ...` with `run__*` at ranks 12-16; `run`
+led with `bigquerydatatransfer__*_transfer_run`; `pubsub topics` returned
+zero hits (no description spells "pubsub"). After the rewrite all 10 pass:
+`cloud run` returns exactly Cloud Run's five tools first, then the gcloud
+escape hatch; `pubsub topics` resolves via the service id. Full suite
+168/168 (was 139 at baseline; the golden tests, the scorer unit tests and
+the payload-shape tests are the growth, alongside P3's).
+
+Notes for later phases and team-verify:
+
+- `benches/bench_search.rs` (P1's instrument) was modified because the API
+  under measurement changed; the profiler, query set and cold/warm split
+  are unchanged, and `warm_collected` measures the same call the baseline
+  did, so the before/after above is apples-to-apples.
+- `src/server.rs` was touched under an explicit lead ruling: the
+  `search_payload` hunk, the `search_tools` description, and two payload
+  tests. Ranking goldens did not change for it (additive fields only).
+- Still open, reported not fixed: `first_line()` truncates descriptions
+  mid-sentence (server.rs, E2E finding #2).
+- P5 interaction: the index is derived data behind a `OnceLock` -- a clone
+  or a snapshot round-trip starts without it and rebuilds lazily, so the
+  rkyv migration does not need to serialize it; `NamespacedTool`'s wire
+  shape is unchanged (`#[serde(skip)]` on the catalog's index field).
