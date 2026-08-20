@@ -5,14 +5,15 @@
 //! hundreds, loading schemas on demand; `--expose flat` registers every pruned
 //! namespaced tool with its real schema. Dispatch is identical in both.
 
+use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        Tool,
+        InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ServerCapabilities, Tool,
     },
     service::{RequestContext, RoleServer},
 };
@@ -209,6 +210,24 @@ impl GoogleMcpServer {
 }
 
 impl ServerHandler for GoogleMcpServer {
+    /// Cap negotiation below `2026-07-28`.
+    ///
+    /// rmcp 3.1.3 will agree to `2026-07-28` when a client offers it, even
+    /// though that revision is newer than the SDK's own `LATEST`, and it then
+    /// emits a bare `resultType: "complete"` where the revision expects a cache
+    /// descriptor carrying `ttlMs` and `cacheScope`. Claude Code offers
+    /// `2026-07-28` and rejects the malformed `tools/list` outright, so the
+    /// server is reachable but has no usable tools. Nothing here needs anything
+    /// newer than `2025-11-25`, so the revision is simply not offered.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2024_11_05,
+        ])
+    }
+
     fn get_info(&self) -> InitializeResult {
         let instructions = match self.expose {
             ExposeMode::TwoTier => format!(
@@ -545,6 +564,27 @@ mod tests {
             },
         ])
         .expect("valid test catalog")
+    }
+
+    #[test]
+    fn protocol_negotiation_never_offers_the_revision_rmcp_serializes_wrongly() {
+        // Regression: rmcp 3.1.3 agrees to 2026-07-28 when a client offers it,
+        // then emits `resultType: "complete"` where that revision expects a
+        // cache descriptor with ttlMs and cacheScope. Claude Code offers
+        // 2026-07-28 and rejects the resulting tools/list, leaving the server
+        // connected but toolless. Offering the revision at all is the bug.
+        let handler = server(catalog(), ExposeMode::TwoTier);
+        let offered = ServerHandler::supported_protocol_versions(&handler);
+        assert!(
+            !offered.contains(&ProtocolVersion::V_2026_07_28),
+            "2026-07-28 must not be offered while rmcp serializes its results \
+             incorrectly; offered = {offered:?}"
+        );
+        assert!(
+            offered.contains(&ProtocolVersion::V_2025_11_25),
+            "the newest revision rmcp serializes correctly must stay on offer; \
+             offered = {offered:?}"
+        );
     }
 
     #[test]
