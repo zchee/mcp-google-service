@@ -26,6 +26,15 @@ pub struct Config {
     pub exclude: Vec<String>,
     /// Tool-surface mode.
     pub expose: ExposeMode,
+    /// Resolve credentials and enablement before serving, failing fast.
+    ///
+    /// Off by default: `serve` answers `initialize` and `tools/list` from the
+    /// snapshot immediately and resolves both in the background, surfacing
+    /// problems on the first `call` and in `list_services`. On, the pre-P2
+    /// behaviour: a credential that cannot be acquired stops the server before
+    /// it serves anything. Implied by [`ExposeMode::Flat`], whose tool list is
+    /// fixed at `initialize` and therefore has to be final before serving.
+    pub strict_startup: bool,
 }
 
 impl Config {
@@ -36,6 +45,7 @@ impl Config {
         only: Vec<String>,
         exclude: Vec<String>,
         expose: ExposeMode,
+        strict_startup: bool,
     ) -> Result<Self, Error> {
         let quota_project = resolve_quota_project(
             project_flag,
@@ -49,12 +59,14 @@ impl Config {
             only,
             exclude,
             expose,
+            strict_startup: strict_startup || expose == ExposeMode::Flat,
         };
         tracing::debug!(
             quota_project = %cfg.quota_project,
             only = ?cfg.only,
             exclude = ?cfg.exclude,
             expose = ?cfg.expose,
+            strict_startup = cfg.strict_startup,
             "configuration resolved"
         );
         Ok(cfg)

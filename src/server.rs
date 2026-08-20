@@ -18,13 +18,15 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 
 use crate::{
+    auth::AuthContext,
     catalog::{Catalog, CatalogError, CatalogSource, Snapshot},
-    config::ExposeMode,
+    config::{Config, ExposeMode},
     proxy::Proxy,
-    registry::Endpoint,
+    prune,
+    registry::{self, Endpoint},
 };
 
 /// Meta-tool: enumerate the exposed services.
@@ -65,15 +67,21 @@ pub type SharedCatalog = Arc<RwLock<Arc<Catalog>>>;
 pub struct CatalogState {
     live: SharedCatalog,
     startup: Arc<Catalog>,
+    readiness: watch::Sender<Readiness>,
 }
 
 impl CatalogState {
     /// Freeze `catalog` as the startup surface and start serving it live.
+    ///
+    /// Readiness starts as [`Readiness::pending`]: nothing has been resolved
+    /// on the caller's behalf until something publishes otherwise.
     pub fn new(catalog: Catalog) -> Self {
         let startup = Arc::new(catalog);
+        let (readiness, _) = watch::channel(Readiness::pending());
         Self {
             live: Arc::new(RwLock::new(Arc::clone(&startup))),
             startup,
+            readiness,
         }
     }
 
@@ -90,6 +98,126 @@ impl CatalogState {
     /// The catalog as it stands now.
     async fn current(&self) -> Arc<Catalog> {
         Arc::clone(&*self.live.read().await)
+    }
+
+    /// The most recently published startup readiness.
+    pub fn readiness(&self) -> Readiness {
+        self.readiness.borrow().clone()
+    }
+
+    /// Publish a readiness transition to every reader.
+    pub fn publish_readiness(&self, readiness: Readiness) {
+        self.readiness.send_replace(readiness);
+    }
+
+    /// A receiver that observes readiness transitions as they are published.
+    pub fn readiness_watch(&self) -> watch::Receiver<Readiness> {
+        self.readiness.subscribe()
+    }
+}
+
+/// Whether the process holds usable Google credentials yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialState {
+    /// Not acquired yet: the background startup has not reached them, and no
+    /// `call` has forced them.
+    Pending,
+    /// A token was acquired and is cached.
+    Ready,
+    /// Acquisition failed; the text is what every `call` returns until it
+    /// succeeds on a later attempt.
+    Failed(String),
+}
+
+impl CredentialState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Failed(reason) => Some(reason),
+            Self::Pending | Self::Ready => None,
+        }
+    }
+}
+
+/// How the exposed set relates to what Service Usage reports as enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnablementState {
+    /// Service Usage has not been consulted yet; every configured service is
+    /// exposed meanwhile, and a call to a disabled one fails upstream with the
+    /// classified `SERVICE_DISABLED` remediation.
+    Pending,
+    /// Narrowed to the APIs Service Usage reports enabled.
+    Pruned,
+    /// `--only` named the services, so Service Usage was deliberately not
+    /// asked.
+    Skipped,
+    /// Service Usage could not be consulted; the configured selection is
+    /// exposed unpruned and the text says why.
+    Unknown(String),
+}
+
+impl EnablementState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Pruned => "pruned",
+            Self::Skipped => "skipped",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Unknown(reason) => Some(reason),
+            Self::Pending | Self::Pruned | Self::Skipped => None,
+        }
+    }
+}
+
+/// Startup progress, reported through `list_services`.
+///
+/// `serve` answers `initialize` and `tools/list` before it has credentials or
+/// knows which APIs are enabled; this is how a caller tells "not yet" from
+/// "broken" without reading the server's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Readiness {
+    /// Credential acquisition.
+    pub credentials: CredentialState,
+    /// Enablement pruning.
+    pub enablement: EnablementState,
+}
+
+impl Readiness {
+    /// Nothing resolved yet.
+    pub fn pending() -> Self {
+        Self {
+            credentials: CredentialState::Pending,
+            enablement: EnablementState::Pending,
+        }
+    }
+
+    /// Readiness of any one exposed service, as the label `list_services`
+    /// shows next to it.
+    ///
+    /// `failed` means no call can succeed until credentials are repaired;
+    /// `pending` means the answer is not in yet; `unverified` means the
+    /// credentials are good but the API's enablement could not be checked, so
+    /// a call may still fail upstream with `SERVICE_DISABLED`; `ready` means
+    /// both are settled.
+    pub fn service_label(&self) -> &'static str {
+        match (&self.credentials, &self.enablement) {
+            (CredentialState::Failed(_), _) => "failed",
+            (CredentialState::Pending, _) | (_, EnablementState::Pending) => "pending",
+            (CredentialState::Ready, EnablementState::Unknown(_)) => "unverified",
+            (CredentialState::Ready, EnablementState::Pruned | EnablementState::Skipped) => "ready",
+        }
     }
 }
 
@@ -121,6 +249,205 @@ pub fn assemble_serve_catalog(
             .restricted_to(exposed)
             .marked_as(CatalogSource::Snapshot),
     ))
+}
+
+/// The endpoints the configuration admits before enablement is known:
+/// the registry narrowed by `--only` and `--exclude`.
+pub fn configured_endpoints(cfg: &Config) -> Vec<&'static Endpoint> {
+    prune::select_services(registry::ENDPOINTS, None, &cfg.only, &cfg.exclude)
+}
+
+/// Which endpoints to expose, and how that was decided.
+pub struct Exposure {
+    /// Endpoints to expose, in registry order.
+    pub endpoints: Vec<&'static Endpoint>,
+    /// Whether Service Usage was consulted, skipped, or could not answer.
+    pub enablement: EnablementState,
+}
+
+/// Decide which endpoints to expose, consulting Service Usage only when the
+/// configuration has not already pinned the set.
+///
+/// `--only` names the services outright, so Service Usage is not asked: the
+/// answer could not change the selection, and the call costs a token fetch
+/// plus a round trip that was measured at ~1.5 s. A Service Usage failure is
+/// never fatal: it warns, names the cause, and exposes the configured
+/// selection unpruned (plan P3 fallback policy), which the returned
+/// [`EnablementState::Unknown`] makes visible to callers.
+pub async fn resolve_enablement(
+    cfg: &Config,
+    auth: &AuthContext,
+    http: &reqwest::Client,
+) -> Exposure {
+    if !cfg.only.is_empty() {
+        let endpoints = configured_endpoints(cfg);
+        tracing::info!(
+            services = endpoints.len(),
+            of = registry::ENDPOINTS.len(),
+            "`--only` pins the exposed services; Service Usage not consulted"
+        );
+        return Exposure {
+            endpoints,
+            enablement: EnablementState::Skipped,
+        };
+    }
+
+    match prune::enabled_services(auth, &cfg.quota_project, http).await {
+        Ok(enabled) => {
+            tracing::info!(
+                enabled = enabled.len(),
+                project = %cfg.quota_project,
+                "Service Usage reported enabled APIs"
+            );
+            let endpoints = prune::select_services(
+                registry::ENDPOINTS,
+                Some(&enabled),
+                &cfg.only,
+                &cfg.exclude,
+            );
+            tracing::info!(
+                services = endpoints.len(),
+                of = registry::ENDPOINTS.len(),
+                "services selected for exposure"
+            );
+            Exposure {
+                endpoints,
+                enablement: EnablementState::Pruned,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                project = %cfg.quota_project,
+                cause = %error,
+                "could not determine enabled APIs; exposing the configured selection unpruned"
+            );
+            Exposure {
+                endpoints: configured_endpoints(cfg),
+                enablement: EnablementState::Unknown(error.to_string()),
+            }
+        }
+    }
+}
+
+/// Refresh the live catalog from the upstreams and swap it in when it lands.
+///
+/// A failed refresh leaves the current catalog in place and says so; the
+/// snapshot keeps being served.
+pub async fn refresh_live_catalog(
+    shared: SharedCatalog,
+    exposed: Vec<&'static Endpoint>,
+    http: reqwest::Client,
+) {
+    let fallback = Arc::clone(&*shared.read().await);
+    match Catalog::build_live(exposed, &http, Some(&fallback)).await {
+        Ok(fresh) => {
+            let (services, tools) = (fresh.services.len(), fresh.tool_count());
+            let diff = fallback.drift_from(&fresh);
+            *shared.write().await = Arc::new(fresh);
+            tracing::info!(services, tools, "live catalog refreshed and swapped in");
+            if !diff.is_empty() {
+                tracing::warn!(
+                    added = ?diff.added,
+                    removed = ?diff.removed,
+                    schema_changed = ?diff.schema_changed,
+                    "catalog drifted from the committed snapshot; \
+                     re-pin it with the `snapshot` subcommand"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            cause = %error,
+            "live catalog refresh failed; continuing to serve the snapshot"
+        ),
+    }
+}
+
+/// The work `serve` takes off its critical path: credentials, enablement,
+/// then the live catalog, in that order, publishing readiness as each lands.
+///
+/// Credentials go first because enablement needs them. Enablement goes before
+/// the refresh because pruning shrinks the fan-out from every registered host
+/// to the ones actually enabled. Everything here runs after the client's
+/// `initialize` has been answered, so none of it competes with the handshake.
+pub struct BackgroundStartup {
+    /// Catalog and readiness the running server reads from.
+    pub state: CatalogState,
+    /// Lazily discovered credentials; the first `apply` here is what acquires
+    /// them.
+    pub auth: Arc<AuthContext>,
+    /// Shared client for Service Usage and the refresh fan-out.
+    pub http: reqwest::Client,
+    /// Resolved configuration.
+    pub config: Config,
+}
+
+impl BackgroundStartup {
+    /// Acquire credentials and resolve enablement, narrowing the live catalog
+    /// to the exposed set and publishing readiness at each step. Returns the
+    /// endpoints left exposed.
+    ///
+    /// Never fails: every problem is published as readiness and logged, and
+    /// the configured selection stays served.
+    pub async fn resolve(&self) -> Vec<&'static Endpoint> {
+        let credentials = match self
+            .auth
+            .apply(&mut reqwest::header::HeaderMap::new())
+            .await
+        {
+            Ok(()) => CredentialState::Ready,
+            Err(error) => {
+                tracing::warn!(
+                    cause = %error,
+                    "credentials could not be acquired; every `call` will report this \
+                     until a later attempt succeeds"
+                );
+                CredentialState::Failed(error.to_string())
+            }
+        };
+        self.state.publish_readiness(Readiness {
+            credentials: credentials.clone(),
+            enablement: EnablementState::Pending,
+        });
+
+        // `--only` needs no credentials to decide; anything else does.
+        let exposure = match &credentials {
+            CredentialState::Failed(reason) if self.config.only.is_empty() => Exposure {
+                endpoints: configured_endpoints(&self.config),
+                enablement: EnablementState::Unknown(format!("credentials unavailable: {reason}")),
+            },
+            _ => resolve_enablement(&self.config, &self.auth, &self.http).await,
+        };
+        if exposure.enablement == EnablementState::Pruned {
+            let current = self.state.current().await;
+            let narrowed = current.restricted_to(&exposure.endpoints);
+            tracing::info!(
+                services = narrowed.services.len(),
+                tools = narrowed.tool_count(),
+                "exposed set narrowed to the enabled APIs"
+            );
+            *self.state.live.write().await = Arc::new(narrowed);
+        }
+        self.state.publish_readiness(Readiness {
+            credentials,
+            enablement: exposure.enablement,
+        });
+        exposure.endpoints
+    }
+
+    /// [`Self::resolve`], then the live catalog refresh for the two-tier
+    /// surface (flat mode is pinned at startup and never refreshes).
+    pub async fn run(self) {
+        let exposed = self.resolve().await;
+        match self.config.expose {
+            ExposeMode::TwoTier => {
+                refresh_live_catalog(self.state.live(), exposed, self.http).await
+            }
+            ExposeMode::Flat => tracing::debug!(
+                "not refreshing the catalog: `--expose flat` pins the tool list at \
+                 startup, so a refresh would be discarded"
+            ),
+        }
+    }
 }
 
 /// The stdio MCP server aggregating every exposed Google endpoint.
@@ -160,7 +487,9 @@ impl GoogleMcpServer {
     ) -> CallToolResult {
         let args = arguments.unwrap_or_default();
         match name {
-            TOOL_LIST_SERVICES => json_result(&list_services_payload(catalog)),
+            TOOL_LIST_SERVICES => {
+                json_result(&list_services_payload(catalog, &self.catalog.readiness()))
+            }
             TOOL_SEARCH_TOOLS => {
                 let Some(query) = args.get("query").and_then(Value::as_str) else {
                     return missing_argument("query", TOOL_SEARCH_TOOLS);
@@ -303,8 +632,12 @@ static META_TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
         Tool::new(
             TOOL_LIST_SERVICES,
             "List the Google Cloud services exposed by this server, with each one's \
-             tool count, Service Usage API name, and whether its tools came from a \
-             live fetch or the bundled snapshot.",
+             tool count, Service Usage API name, whether its tools came from a live \
+             fetch or the bundled snapshot, and its readiness: credentials and the \
+             enabled-API check resolve in the background after startup, so a \
+             service is `pending` until they land, `ready` once they have, \
+             `unverified` if enablement could not be checked, or `failed` if no \
+             credentials could be acquired (the `startup` block carries the reason).",
             schema(json!({ "type": "object", "properties": {}, "additionalProperties": false })),
         ),
         Tool::new(
@@ -398,7 +731,13 @@ fn schema(value: Value) -> Arc<JsonObject> {
 }
 
 /// `list_services` payload.
-fn list_services_payload(catalog: &Catalog) -> Value {
+///
+/// Readiness is the same for every service (credentials and the enablement
+/// check are process-wide), so it is repeated per entry for a model that
+/// reads one service at a time and summarized once in `startup`, with the
+/// failure text a caller would otherwise only find in the server's log.
+fn list_services_payload(catalog: &Catalog, readiness: &Readiness) -> Value {
+    let label = readiness.service_label();
     let services: Vec<Value> = catalog
         .services
         .iter()
@@ -408,6 +747,7 @@ fn list_services_payload(catalog: &Catalog) -> Value {
                 "api_name": crate::registry::find(&service.service_id).map(|e| e.api_name),
                 "tool_count": service.tools.len(),
                 "source": service.source.to_string(),
+                "readiness": label,
             })
         })
         .collect();
@@ -415,6 +755,12 @@ fn list_services_payload(catalog: &Catalog) -> Value {
         "services": services,
         "service_count": catalog.services.len(),
         "tool_count": catalog.tool_count(),
+        "startup": {
+            "credentials": readiness.credentials.label(),
+            "credentials_error": readiness.credentials.detail(),
+            "enablement": readiness.enablement.label(),
+            "enablement_error": readiness.enablement.detail(),
+        },
     })
 }
 
@@ -472,7 +818,7 @@ fn not_exposed_message(name: &str, catalog: &Catalog) -> String {
     format!(
         "`{name}` is not an exposed tool. Exposed services: {}. \
          Use `{TOOL_SEARCH_TOOLS}` to find a tool, or check that its API is enabled \
-         on the quota project. The enabled-service list is read once at startup, so \
+         on the quota project. The enabled-service list is read once per process, so \
          restart this server after running `gcloud services enable`.",
         services.join(", ")
     )
@@ -646,7 +992,7 @@ mod tests {
 
     #[test]
     fn list_services_reports_counts_and_source() {
-        let payload = list_services_payload(&catalog());
+        let payload = list_services_payload(&catalog(), &Readiness::pending());
         assert_eq!(payload["service_count"], json!(2));
         assert_eq!(payload["tool_count"], json!(3));
 
@@ -655,6 +1001,161 @@ mod tests {
         assert_eq!(bigquery["source"], json!("snapshot"));
         assert_eq!(bigquery["api_name"], json!("bigquery.googleapis.com"));
         assert_eq!(payload["services"][1]["source"], json!("live"));
+    }
+
+    #[test]
+    fn list_services_reports_readiness_per_service_and_the_reason_once() {
+        let pending = list_services_payload(&catalog(), &Readiness::pending());
+        assert_eq!(pending["services"][0]["readiness"], json!("pending"));
+        assert_eq!(pending["services"][1]["readiness"], json!("pending"));
+        assert_eq!(pending["startup"]["credentials"], json!("pending"));
+        assert_eq!(pending["startup"]["enablement"], json!("pending"));
+        assert_eq!(pending["startup"]["credentials_error"], Value::Null);
+
+        let failed = list_services_payload(
+            &catalog(),
+            &Readiness {
+                credentials: CredentialState::Failed("no ADC file".to_owned()),
+                enablement: EnablementState::Unknown("credentials unavailable".to_owned()),
+            },
+        );
+        assert_eq!(failed["services"][0]["readiness"], json!("failed"));
+        assert_eq!(failed["startup"]["credentials"], json!("failed"));
+        assert_eq!(failed["startup"]["credentials_error"], json!("no ADC file"));
+        assert_eq!(failed["startup"]["enablement"], json!("unknown"));
+        assert_eq!(
+            failed["startup"]["enablement_error"],
+            json!("credentials unavailable")
+        );
+
+        let ready = list_services_payload(
+            &catalog(),
+            &Readiness {
+                credentials: CredentialState::Ready,
+                enablement: EnablementState::Pruned,
+            },
+        );
+        assert_eq!(ready["services"][1]["readiness"], json!("ready"));
+        assert_eq!(ready["startup"]["enablement_error"], Value::Null);
+    }
+
+    #[test]
+    fn service_readiness_label_follows_credentials_then_enablement() {
+        // Credentials decide first: without them nothing can succeed, whatever
+        // enablement says. With them, enablement decides between ready,
+        // unverified and pending.
+        let label = |credentials: CredentialState, enablement: EnablementState| {
+            Readiness {
+                credentials,
+                enablement,
+            }
+            .service_label()
+        };
+        let failed = || CredentialState::Failed("x".to_owned());
+        let unknown = || EnablementState::Unknown("y".to_owned());
+
+        assert_eq!(label(failed(), EnablementState::Pruned), "failed");
+        assert_eq!(label(failed(), EnablementState::Pending), "failed");
+        assert_eq!(
+            label(CredentialState::Pending, EnablementState::Pruned),
+            "pending"
+        );
+        assert_eq!(
+            label(CredentialState::Ready, EnablementState::Pending),
+            "pending"
+        );
+        assert_eq!(label(CredentialState::Ready, unknown()), "unverified");
+        assert_eq!(
+            label(CredentialState::Ready, EnablementState::Pruned),
+            "ready"
+        );
+        assert_eq!(
+            label(CredentialState::Ready, EnablementState::Skipped),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn a_freshly_assembled_catalog_is_pending_until_something_publishes() {
+        let snapshot = catalog().to_snapshot("2026-08-19T00:00:00Z".to_owned());
+        let run = crate::registry::find("run").expect("run is registered");
+        let state = assemble_serve_catalog(snapshot, &[run]).expect("valid fixture");
+        assert_eq!(state.readiness(), Readiness::pending());
+
+        let watch = state.readiness_watch();
+        state.publish_readiness(Readiness {
+            credentials: CredentialState::Ready,
+            enablement: EnablementState::Skipped,
+        });
+        assert!(
+            watch.has_changed().expect("the sender is alive"),
+            "a publish must be observable by a subscriber"
+        );
+        assert_eq!(state.readiness().service_label(), "ready");
+        // A clone shares the channel: readiness is process state, not per-copy.
+        assert_eq!(state.clone().readiness().service_label(), "ready");
+    }
+
+    fn config(only: &[&str]) -> Config {
+        Config {
+            quota_project: "test-project".to_owned(),
+            only: only.iter().map(|s| (*s).to_owned()).collect(),
+            exclude: Vec::new(),
+            expose: ExposeMode::TwoTier,
+            strict_startup: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_skips_service_usage_entirely() {
+        // `UnusedTokens` panics if a token is requested, and Service Usage
+        // cannot be called without one: finishing at all proves the call was
+        // never attempted, which is what the flag's documentation promises.
+        let auth = AuthContext::with_source(Arc::new(UnusedTokens), "test-project")
+            .expect("a literal project id is a valid header value");
+        let exposure = resolve_enablement(&config(&["run"]), &auth, &reqwest::Client::new()).await;
+
+        assert_eq!(exposure.enablement, EnablementState::Skipped);
+        let ids: Vec<&str> = exposure.endpoints.iter().map(|e| e.service_id).collect();
+        assert_eq!(ids, ["run"]);
+    }
+
+    /// A token source whose credentials are broken.
+    struct BrokenTokens;
+
+    impl TokenSource for BrokenTokens {
+        fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+            Box::pin(async { Err(Error::QuotaProjectUnresolved) })
+        }
+    }
+
+    #[tokio::test]
+    async fn background_startup_publishes_failed_credentials_and_keeps_serving() {
+        let state = CatalogState::new(catalog());
+        let startup = BackgroundStartup {
+            state: state.clone(),
+            auth: Arc::new(
+                AuthContext::with_source(Arc::new(BrokenTokens), "test-project")
+                    .expect("a literal project id is a valid header value"),
+            ),
+            http: reqwest::Client::new(),
+            // `--only` keeps enablement off the network too, so this resolves
+            // without any upstream at all.
+            config: config(&["run", "bigquery"]),
+        };
+
+        let exposed = startup.resolve().await;
+
+        let readiness = state.readiness();
+        assert!(
+            matches!(&readiness.credentials, CredentialState::Failed(reason) if reason.contains("quota project")),
+            "the failure text the caller will see must be published: {readiness:?}"
+        );
+        assert_eq!(readiness.enablement, EnablementState::Skipped);
+        assert_eq!(readiness.service_label(), "failed");
+        assert_eq!(exposed.len(), 2);
+        // Nothing was pruned: the configured catalog is still what is served.
+        assert_eq!(state.current().await.tool_count(), 3);
     }
 
     #[test]
@@ -909,7 +1410,7 @@ mod tests {
         *state.live().write().await = Arc::new(refreshed);
 
         let current = two_tier.catalog().await;
-        let payload = list_services_payload(&current);
+        let payload = list_services_payload(&current, &Readiness::pending());
         assert_eq!(
             payload["service_count"],
             json!(1),

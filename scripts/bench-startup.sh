@@ -52,6 +52,7 @@ MODE=real
 SLEEP=1
 TIMEOUT=60
 KEEP_LOGS=0
+STRICT=0
 
 usage() {
     cat <<EOF
@@ -66,6 +67,8 @@ usage: $(basename "$0") [--runs N] [--bin PATH] [--project ID] [--sleep SECS]
   --sleep SECS    pause between runs, excluded from timing (default $SLEEP)
   --timeout SECS  per-run limit waiting for a response (default $TIMEOUT)
   --keep-logs     keep each run's stderr under the temp dir printed at the end
+  --strict        pass --strict-startup to the server (credentials and
+                  enablement resolved before serving, the pre-P2 path)
   --offline       stub credentials + dead proxy; see the header comment
   --print-catalog time the \`print-catalog\` subcommand instead of an MCP session
 EOF
@@ -79,6 +82,7 @@ while (( $# )); do
         --sleep) SLEEP=$2; shift 2 ;;
         --timeout) TIMEOUT=$2; shift 2 ;;
         --keep-logs) KEEP_LOGS=1; shift ;;
+        --strict) STRICT=1; shift ;;
         --offline) MODE=offline; shift ;;
         --print-catalog) MODE=print-catalog; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -212,7 +216,7 @@ BIN_SHA=$(shasum -a 256 "$BIN" | cut -d' ' -f1)
 TOOLCHAIN=$(cd "$ROOT" && rustc --version 2>/dev/null || echo "rustc: not on PATH")
 CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -p)
 
-echo "bench-startup: mode=$MODE runs=$RUNS sleep=${SLEEP}s timeout=${TIMEOUT}s"
+echo "bench-startup: mode=$MODE runs=$RUNS sleep=${SLEEP}s timeout=${TIMEOUT}s strict-startup=$( (( STRICT )) && echo yes || echo no )"
 echo "  binary:    $BIN"
 echo "  size:      $BIN_SIZE bytes  sha256=$BIN_SHA  mtime=$BIN_MTIME"
 echo "  toolchain: $TOOLCHAIN  RUSTFLAGS=<unset>"
@@ -278,6 +282,7 @@ run_mcp_once() {
     local n=$1 log="$WORK/run-$1.stderr" line t0 t1 in out pid
     local -a cmd=("$BIN")
     [[ -n $PROJECT ]] && cmd+=(--project "$PROJECT")
+    (( STRICT )) && cmd+=(--strict-startup)
 
     t0=$EPOCHREALTIME
     coproc SRV { exec "${cmd[@]}" 2>"$log"; }

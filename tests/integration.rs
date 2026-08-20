@@ -23,13 +23,17 @@
 //! | flat surface stability | `flat_mode_keeps_the_startup_tool_list_across_a_refresh` |
 //! | pagination guard | `a_pagination_token_that_repeats_ends_the_listing_with_an_error` |
 //! | outbound header hygiene | `a_dispatch_attaches_only_the_two_auth_headers_despite_promotion_annotations` |
+//! | P2 serve-first startup | `serve_answers_before_credentials_and_enablement_resolve_then_narrows` |
+//! | P2 `--only` skips Service Usage | `only_never_consults_service_usage` |
+//! | P2 failure surfacing | `a_credential_failure_is_reported_by_list_services_and_returned_by_call` |
 
 mod common;
 
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::Duration,
 };
 
 use hyper::StatusCode;
@@ -42,17 +46,21 @@ use serde_json::{Value, json};
 use mcp_google_service::{
     auth::{AuthContext, FetchedToken, TokenSource},
     catalog::{Catalog, CatalogSource, ServiceCatalog},
-    config::ExposeMode,
+    config::{Config, ExposeMode},
     error::Error,
     proxy::{Proxy, Route},
     prune, registry,
-    server::{CatalogState, GoogleMcpServer, assemble_serve_catalog},
+    server::{
+        BackgroundStartup, CatalogState, CredentialState, EnablementState, GoogleMcpServer,
+        assemble_serve_catalog,
+    },
 };
 
 use common::{
     PROMOTED_HEADER, SERVICE_DISABLED_BODY, TOOL_ECHO, TOOL_FAIL, TOOL_PROMOTES_HEADERS,
     TOOL_SHOW_HEADERS, client_resolving, scrub_google_credential_env, service_usage_page,
-    spawn_failing_upstream, spawn_mcp_upstream, spawn_service_usage_stub,
+    spawn_counting_service_usage_stub, spawn_failing_upstream, spawn_mcp_upstream,
+    spawn_service_usage_stub,
 };
 
 /// Quota project used by every test that needs one. Never a real project.
@@ -1132,4 +1140,292 @@ async fn a_service_disabled_403_reaches_the_caller_as_an_enable_command() {
     );
 
     upstream.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// P2: serve first, resolve credentials and enablement behind the handshake
+// ---------------------------------------------------------------------------
+
+/// A token source whose token is released by the test.
+///
+/// Holds the server in the "credentials pending" state for exactly as long as
+/// the test wants, so serve-first is observed rather than raced against.
+struct GatedToken {
+    gate: tokio::sync::watch::Receiver<bool>,
+    token: &'static str,
+}
+
+impl TokenSource for GatedToken {
+    fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+        let mut gate = self.gate.clone();
+        let value = zeroize::Zeroizing::new(self.token.to_owned());
+        Box::pin(async move {
+            gate.wait_for(|open| *open)
+                .await
+                .expect("the test keeps the gate's sender alive");
+            Ok(FetchedToken {
+                value,
+                expires_at: None,
+            })
+        })
+    }
+}
+
+/// A token source that never succeeds, with a realistic failure.
+struct BrokenToken;
+
+impl TokenSource for BrokenToken {
+    fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+        Box::pin(async { Err(Error::TokenFetchTimeout(Duration::from_secs(30))) })
+    }
+}
+
+/// Configuration for the default, non-strict serve path.
+fn lazy_config(only: &[&str]) -> Config {
+    Config {
+        quota_project: TEST_PROJECT.to_owned(),
+        only: only.iter().map(|id| (*id).to_owned()).collect(),
+        exclude: Vec::new(),
+        expose: ExposeMode::TwoTier,
+        strict_startup: false,
+    }
+}
+
+/// Parse a meta-tool's JSON text result.
+fn payload(result: &CallToolResult) -> Value {
+    serde_json::from_str(&result_text(result)).expect("meta-tools return a JSON payload")
+}
+
+/// The `readiness` label of every service in a `list_services` payload.
+fn readiness_labels(listed: &Value) -> Vec<&str> {
+    listed["services"]
+        .as_array()
+        .expect("list_services reports a services array")
+        .iter()
+        .filter_map(|s| s["readiness"].as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn serve_answers_before_credentials_and_enablement_resolve_then_narrows() {
+    let (stub, requests) =
+        spawn_counting_service_usage_stub(vec![service_usage_page(&["run.googleapis.com"], None)])
+            .await;
+    let http = client_resolving(&[("serviceusage.googleapis.com", stub.addr())]);
+    let (open, gate) = tokio::sync::watch::channel(false);
+    let auth = Arc::new(
+        AuthContext::with_source(
+            Arc::new(GatedToken {
+                gate,
+                token: "token-after-the-gate",
+            }),
+            TEST_PROJECT,
+        )
+        .expect("a literal project id is a valid header value"),
+    );
+
+    // Three configured services; Service Usage will report only `run` enabled.
+    let configured: Vec<_> = ["run", "bigquery", "compute"]
+        .iter()
+        .map(|id| registry::find(id).expect("a registered endpoint"))
+        .collect();
+    let snapshot = Catalog::new(vec![
+        synthetic_service("run", CatalogSource::Snapshot),
+        synthetic_service("bigquery", CatalogSource::Snapshot),
+        synthetic_service("compute", CatalogSource::Snapshot),
+    ])
+    .expect("synthetic services satisfy the namespacing invariants")
+    .to_snapshot("2026-08-19T00:00:00Z".to_owned());
+    let state = assemble_serve_catalog(snapshot, &configured)
+        .expect("the fixture satisfies the namespacing invariants");
+    let proxy = Proxy::new(
+        Arc::clone(&auth),
+        http.clone(),
+        configured.iter().map(|e| Route::from_endpoint(e)).collect(),
+    );
+    let session = Session::connect(GoogleMcpServer::new(
+        state.clone(),
+        Arc::new(proxy),
+        ExposeMode::TwoTier,
+    ))
+    .await;
+
+    // The handshake completed and tools are listed with nothing resolved: no
+    // token has been issued and Service Usage has not been asked.
+    assert_eq!(session.list_tool_names().await.len(), 4);
+    let listed = payload(&session.call("list_services", json!({})).await);
+    assert_eq!(listed["service_count"], json!(3));
+    assert_eq!(readiness_labels(&listed), ["pending", "pending", "pending"]);
+    assert_eq!(listed["startup"]["credentials"], json!("pending"));
+    assert_eq!(listed["startup"]["enablement"], json!("pending"));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "nothing may reach Service Usage before the background work runs"
+    );
+
+    // The background work starts but blocks on credentials; the server keeps
+    // answering from the configured selection meanwhile.
+    let startup = BackgroundStartup {
+        state: state.clone(),
+        auth: Arc::clone(&auth),
+        http: http.clone(),
+        config: lazy_config(&[]),
+    };
+    let resolving = tokio::spawn(async move { startup.resolve().await });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let listed = payload(&session.call("list_services", json!({})).await);
+    assert_eq!(
+        readiness_labels(&listed),
+        ["pending", "pending", "pending"],
+        "credentials are gated, so nothing can have resolved yet: {listed}"
+    );
+
+    open.send(true).expect("the gated source holds a receiver");
+    let exposed = resolving.await.expect("the background task completes");
+    let exposed_ids: Vec<&str> = exposed.iter().map(|e| e.service_id).collect();
+    assert_eq!(exposed_ids, ["run"]);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "Service Usage is consulted exactly once, after credentials landed"
+    );
+    let readiness = state.readiness();
+    assert_eq!(readiness.credentials, CredentialState::Ready);
+    assert_eq!(readiness.enablement, EnablementState::Pruned);
+
+    // The live surface narrowed underneath the running session, and says so.
+    let listed = payload(&session.call("list_services", json!({})).await);
+    assert_eq!(listed["service_count"], json!(1), "payload: {listed}");
+    assert_eq!(listed["services"][0]["service_id"], json!("run"));
+    assert_eq!(readiness_labels(&listed), ["ready"]);
+    assert_eq!(listed["startup"]["credentials"], json!("ready"));
+    assert_eq!(listed["startup"]["enablement"], json!("pruned"));
+
+    // A pruned-away service is refused by the catalog before any dispatch.
+    let refused = session
+        .dispatch("bigquery__synthetic_probe", json!({}))
+        .await;
+    assert_eq!(refused.is_error, Some(true));
+    assert!(
+        result_text(&refused).contains("is not an exposed tool"),
+        "got: {}",
+        result_text(&refused)
+    );
+
+    session.shutdown().await;
+    stub.shutdown().await;
+}
+
+#[tokio::test]
+async fn only_never_consults_service_usage() {
+    let (stub, requests) =
+        spawn_counting_service_usage_stub(vec![service_usage_page(&["run.googleapis.com"], None)])
+            .await;
+    let http = client_resolving(&[("serviceusage.googleapis.com", stub.addr())]);
+    let state = CatalogState::new(
+        Catalog::new(vec![synthetic_service("run", CatalogSource::Snapshot)])
+            .expect("synthetic services satisfy the namespacing invariants"),
+    );
+
+    // Credentials are valid and the stub would answer, so the only thing
+    // standing between this test and a request is the `--only` rule.
+    let startup = BackgroundStartup {
+        state: state.clone(),
+        auth: fake_auth("token-for-only", TEST_PROJECT),
+        http,
+        config: lazy_config(&["run"]),
+    };
+    let exposed = startup.resolve().await;
+
+    let exposed_ids: Vec<&str> = exposed.iter().map(|e| e.service_id).collect();
+    assert_eq!(exposed_ids, ["run"]);
+    let readiness = state.readiness();
+    assert_eq!(readiness.credentials, CredentialState::Ready);
+    assert_eq!(readiness.enablement, EnablementState::Skipped);
+    assert_eq!(readiness.service_label(), "ready");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "`--only` documents that enablement pruning is skipped; the stub must \
+         never be reached"
+    );
+
+    stub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_credential_failure_is_reported_by_list_services_and_returned_by_call() {
+    let (stub, requests) =
+        spawn_counting_service_usage_stub(vec![service_usage_page(&["run.googleapis.com"], None)])
+            .await;
+    let http = client_resolving(&[("serviceusage.googleapis.com", stub.addr())]);
+    let auth = Arc::new(
+        AuthContext::with_source(Arc::new(BrokenToken), TEST_PROJECT)
+            .expect("a literal project id is a valid header value"),
+    );
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+    let state = CatalogState::new(
+        Catalog::new(vec![synthetic_service("run", CatalogSource::Snapshot)])
+            .expect("synthetic services satisfy the namespacing invariants"),
+    );
+    let session = Session::connect(GoogleMcpServer::new(
+        state.clone(),
+        Arc::new(Proxy::new(
+            Arc::clone(&auth),
+            http.clone(),
+            vec![Route::from_endpoint(run)],
+        )),
+        ExposeMode::TwoTier,
+    ))
+    .await;
+
+    BackgroundStartup {
+        state: state.clone(),
+        auth,
+        http,
+        config: lazy_config(&[]),
+    }
+    .resolve()
+    .await;
+
+    let readiness = state.readiness();
+    assert!(
+        matches!(&readiness.credentials, CredentialState::Failed(reason) if reason.contains("timed out")),
+        "the failure must be published with its text: {readiness:?}"
+    );
+    assert!(
+        matches!(&readiness.enablement, EnablementState::Unknown(reason) if reason.contains("credentials unavailable")),
+        "enablement cannot be checked without credentials and must say so: {readiness:?}"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "Service Usage must not be attempted without credentials"
+    );
+
+    // Visible to a caller through list_services, not only in the log.
+    let listed = payload(&session.call("list_services", json!({})).await);
+    assert_eq!(readiness_labels(&listed), ["failed"]);
+    assert_eq!(listed["startup"]["credentials"], json!("failed"));
+    assert!(
+        listed["startup"]["credentials_error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("timed out")),
+        "payload: {listed}"
+    );
+
+    // And returned, not swallowed, by the first call.
+    let result = session.dispatch("run__synthetic_probe", json!({})).await;
+    assert_eq!(result.is_error, Some(true));
+    let text = result_text(&result);
+    assert!(
+        text.contains("could not attach Google credentials") && text.contains("timed out"),
+        "the call must carry the credential failure to the caller; got: {text}"
+    );
+
+    session.shutdown().await;
+    stub.shutdown().await;
 }

@@ -117,7 +117,7 @@ for them up front.
 
 | Tool | Purpose |
 |---|---|
-| `list_services` | Exposed services, each with tool count, Service Usage API name, and whether its tools came from a live fetch or the snapshot. |
+| `list_services` | Exposed services, each with tool count, Service Usage API name, whether its tools came from a live fetch or the snapshot, and its readiness (`pending`, `ready`, `unverified`, `failed`; see [Startup](#startup-what-is-resolved-when)). A `startup` block carries the credential and enablement state with the failure text, if any. |
 | `search_tools` | Rank tools by keyword across all exposed services. Takes `query`, optional `service`, optional `limit` (default 20). |
 | `describe_tools` | Full input and output JSON schemas for named tools. Takes `names`. |
 | `call` | Invoke a namespaced tool and return its result unchanged. Takes `name` and `arguments`. |
@@ -207,6 +207,7 @@ mcp-google-service [OPTIONS] [COMMAND]
 | `--exclude <IDS>` | Never expose these service ids, comma-separated. Applied last, so it wins over `--only`. |
 | `--expose <MODE>` | `two-tier` (default) or `flat`. |
 | `--snapshot <PATH>` | Serve tool metadata from this snapshot file instead of the embedded one. Unreadable or invalid paths are fatal. |
+| `--strict-startup` | Acquire credentials and the enabled-API list **before** serving, and exit if credentials cannot be acquired. By default both are resolved in the background after `initialize` is answered (see [Startup](#startup-what-is-resolved-when)); this flag restores the fail-fast behaviour. Implied by `--expose flat`. |
 
 These are serving options. They belong either before a subcommand
 (`mcp-google-service --project p`, which runs `serve` by default) or on `serve`
@@ -286,6 +287,7 @@ startup; the rest are reported and survivable.
 
 | Message begins | Meaning | Fix |
 |---|---|---|
+| `could not attach Google credentials: failed to acquire Google credentials via ADC` (on `call`) / `failed to acquire Google credentials via ADC` (at startup with `--strict-startup`) | No usable Application Default Credentials were found, or the credential source refused. By default this is reported by `list_services` (`readiness: failed`, the reason in `startup.credentials_error`) and returned by every `call` until a later attempt succeeds; with `--strict-startup` it ends the process before anything is served. | `gcloud auth application-default login`, then retry the call; no restart is needed unless `--strict-startup` was used. |
 | `the resolved quota project is neither a valid Google Cloud project id nor a project number` | The resolved value matches neither grammar. It may have come from `GOOGLE_MCP_QUOTA_PROJECT`, `GOOGLE_CLOUD_PROJECT` or the ADC file, not just `--project`, and it is never echoed back. | Pass an id (`my-project`) or a number (`123456789012`). Check the environment and `quota_project_id` in the ADC file. |
 | `catalog snapshot {path} could not be read` / `is not a valid catalog snapshot` | An explicit `--snapshot <PATH>` is missing or unparseable. Never falls back. | Fix the path, or drop the flag to use the embedded snapshot. |
 | `acquiring a Google access token timed out after 30s` | The credential source (ADC, metadata server, `gcloud`) did not answer. | Check `gcloud auth application-default print-access-token`, or the metadata server's reachability. |
@@ -315,6 +317,34 @@ deliberately one-shot rather than periodic: a long-running session's tool
 surface stays stable, and a client that wants a fresh catalog restarts the
 server. Until the refresh lands, every service reports `source: snapshot`, so
 `list_services` never overstates freshness.
+
+### Startup: what is resolved when
+
+Nothing that needs the network sits on the path to the first tool response.
+`serve` parses the snapshot, answers `initialize` and `tools/list`, and only
+then -- in the background, in this order -- acquires credentials, asks Service
+Usage which APIs are enabled (unless `--only` pinned the set), narrows the
+exposed services to the enabled ones, and runs the live refresh. Measured on
+the reference machine this takes process start to `tools/list` from ~1.8 s
+(one Service Usage listing alone was ~1.5 s of it) to the non-network floor
+(`BASELINE.md`).
+
+Until those steps land, `list_services` shows every configured service with
+`readiness: pending`; a `call` made meanwhile simply waits for credentials and
+then goes upstream, where a disabled API answers with the classified
+`SERVICE_DISABLED` remediation. When they land, the readiness flips to `ready`
+(or `unverified` if Service Usage could not be consulted, in which case the
+configured selection stays exposed unpruned) and the `startup` block records
+the outcome. A credential failure is not swallowed: `list_services` reports
+`readiness: failed` with the reason, every `call` returns it, and the next
+call retries discovery, so `gcloud auth application-default login` takes
+effect without a restart.
+
+`--strict-startup` restores the earlier behaviour for operators who would
+rather the process exit than serve with broken credentials: credentials and
+enablement are resolved before serving and a credential failure is fatal.
+`--expose flat` implies it, because the flat tool list is fixed at
+`initialize` and so must be final before anything is served.
 
 ### Regenerating and reviewing drift
 

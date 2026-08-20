@@ -10,9 +10,8 @@ use rmcp::{ServiceExt, transport::stdio};
 use mcp_google_service::{
     auth, catalog,
     config::{Config, ExposeMode},
-    proxy, prune,
-    registry::{self, Endpoint},
-    server,
+    proxy, registry,
+    server::{self, BackgroundStartup, CredentialState, Readiness},
 };
 
 /// Aggregates Google Cloud remote MCP endpoints behind one stdio server.
@@ -64,6 +63,18 @@ struct ServeArgs {
     /// for them. An unreadable or invalid path here is fatal.
     #[arg(long, value_name = "PATH")]
     snapshot: Option<PathBuf>,
+
+    /// Resolve credentials and the enabled-API list before serving; fail fast.
+    ///
+    /// By default the server answers `initialize` and `tools/list` from the
+    /// snapshot at once and acquires credentials and the enabled-API list in
+    /// the background; a problem with either shows in `list_services` and on
+    /// the first `call`. This flag restores the earlier behaviour for operators
+    /// who would rather the process exit than serve with broken credentials.
+    /// `--expose flat` implies it, because its tool list is fixed at
+    /// `initialize` and so has to be final before anything is served.
+    #[arg(long)]
+    strict_startup: bool,
 }
 
 /// Top-level subcommands; `serve` is the default when none is given.
@@ -117,12 +128,14 @@ async fn main() -> anyhow::Result<()> {
 
 /// Run the stdio MCP server.
 ///
-/// The catalog is served from the snapshot immediately and refreshed once in
-/// the background, so time-to-first-tool-response does not wait on a 47-host
-/// fan-out. In two-tier mode the four exposed tools never change, so swapping
-/// the catalog underneath needs no `listChanged` notification; flat mode
-/// therefore keeps serving the startup catalog, since its tool list *is* the
-/// catalog and the client has no way to be told it moved.
+/// The catalog is served from the snapshot immediately, and everything that
+/// needs the network -- acquiring credentials, asking Service Usage which APIs
+/// are enabled, refreshing the catalog from the upstreams -- runs after the
+/// client's `initialize` has been answered. In two-tier mode the four exposed
+/// tools never change, so narrowing or refreshing the catalog underneath needs
+/// no `listChanged` notification; flat mode's tool list *is* the catalog and
+/// the client has no way to be told it moved, so flat mode resolves the
+/// exposed set before serving and keeps serving that startup catalog.
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     tracing::debug!(
         project = ?args.project,
@@ -130,124 +143,95 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         exclude = ?args.exclude,
         expose = ?args.expose,
         snapshot = ?args.snapshot,
+        strict_startup = args.strict_startup,
         "parsed command line"
     );
 
-    let cfg = Config::resolve(args.project, args.only, args.exclude, args.expose)?;
-    let auth = Arc::new(auth::AuthContext::new(&cfg).await?);
+    let cfg = Config::resolve(
+        args.project,
+        args.only,
+        args.exclude,
+        args.expose,
+        args.strict_startup,
+    )?;
     let http = proxy::shared_http_client().context("building the shared HTTP client")?;
-
-    let exposed = resolve_exposed_endpoints(&cfg, &auth, &http).await;
-    tracing::info!(
-        services = exposed.len(),
-        of = registry::ENDPOINTS.len(),
-        "services selected for exposure"
-    );
-
     let snapshot = catalog::serve_snapshot(args.snapshot.as_deref())?;
     catalog::warn_on_registry_drift(&snapshot);
-    let state = server::assemble_serve_catalog(snapshot, &exposed)?;
-    let refresh_note = match cfg.expose {
-        ExposeMode::TwoTier => "live refresh running in the background",
-        ExposeMode::Flat => "tool list pinned at startup (`--expose flat`)",
+
+    // Two ways to a served catalog. Strict resolves credentials and enablement
+    // first and fails fast, so nothing is served with broken credentials. The
+    // default serves the configured selection at once with credentials
+    // discovered on first use, and resolves both behind the handshake.
+    let (auth, state, exposed, background) = if cfg.strict_startup {
+        let auth = Arc::new(auth::AuthContext::new(&cfg).await?);
+        let exposure = server::resolve_enablement(&cfg, &auth, &http).await;
+        let state = server::assemble_serve_catalog(snapshot, &exposure.endpoints)?;
+        state.publish_readiness(Readiness {
+            credentials: CredentialState::Ready,
+            enablement: exposure.enablement,
+        });
+        (auth, state, exposure.endpoints, None)
+    } else {
+        let auth = Arc::new(auth::AuthContext::new_lazy(&cfg)?);
+        let configured = server::configured_endpoints(&cfg);
+        let state = server::assemble_serve_catalog(snapshot, &configured)?;
+        let background = BackgroundStartup {
+            state: state.clone(),
+            auth: Arc::clone(&auth),
+            http: http.clone(),
+            config: cfg.clone(),
+        };
+        (auth, state, configured, Some(background))
+    };
+    let startup_note = match (cfg.strict_startup, cfg.expose) {
+        (true, ExposeMode::Flat) => {
+            "credentials and enablement resolved before serving; tool list pinned (`--expose flat`)"
+        }
+        (true, ExposeMode::TwoTier) => {
+            "credentials and enablement resolved before serving (`--strict-startup`)"
+        }
+        (false, _) => "credentials, enablement and the live refresh resolving in the background",
     };
     tracing::info!(
         services = state.startup().services.len(),
         tools = state.startup().tool_count(),
-        "serving from snapshot; {refresh_note}"
+        "serving from snapshot; {startup_note}"
     );
 
-    // The refresh task takes ownership of the endpoint list; dispatch keeps its own copy.
-    let exposed_routes = exposed.clone();
-    match cfg.expose {
-        ExposeMode::TwoTier => spawn_catalog_refresh(state.live(), exposed, http.clone()),
-        // Nothing would read the result: the flat surface is pinned to the
-        // startup catalog, so refreshing would spend a 47-host fan-out to
-        // update a catalog no request consults, and log that it swapped in.
-        ExposeMode::Flat => tracing::debug!(
-            "not refreshing the catalog: `--expose flat` pins the tool list at \
-             startup, so a refresh would be discarded"
-        ),
-    }
-
+    // Exposure is enforced by the catalog, which both surfaces consult before
+    // dispatching, so the proxy can route to every configured endpoint and
+    // the background narrowing only has to swap the catalog.
     let handler = server::GoogleMcpServer::new(
-        state,
-        Arc::new(proxy::Proxy::from_endpoints(auth, http, &exposed_routes)),
+        state.clone(),
+        Arc::new(proxy::Proxy::from_endpoints(auth, http.clone(), &exposed)),
         cfg.expose,
     );
     let running = handler
         .serve(stdio())
         .await
         .context("starting the stdio MCP server")?;
+
+    // `serve` returns once the client's `initialize` has been answered. Only
+    // now does anything reach for the network, so neither credential
+    // discovery nor the refresh fan-out competes with the handshake.
+    match (background, cfg.expose) {
+        (Some(background), _) => {
+            tokio::spawn(background.run());
+        }
+        (None, ExposeMode::TwoTier) => {
+            tokio::spawn(server::refresh_live_catalog(state.live(), exposed, http));
+        }
+        // Nothing would read the result: the flat surface is pinned to the
+        // startup catalog, so refreshing would spend a fan-out to update a
+        // catalog no request consults, and log that it swapped in.
+        (None, ExposeMode::Flat) => tracing::debug!(
+            "not refreshing the catalog: `--expose flat` pins the tool list at \
+             startup, so a refresh would be discarded"
+        ),
+    }
+
     running.waiting().await.context("serving stdio MCP")?;
     Ok(())
-}
-
-/// Decide which endpoints to expose, degrading loudly when pruning fails.
-///
-/// A Service Usage failure must not take the server down: it warns, names the
-/// cause, and falls back to the configured selection (per plan P3).
-async fn resolve_exposed_endpoints(
-    cfg: &Config,
-    auth: &auth::AuthContext,
-    http: &reqwest::Client,
-) -> Vec<&'static Endpoint> {
-    let enabled = match prune::enabled_services(auth, &cfg.quota_project, http).await {
-        Ok(enabled) => {
-            tracing::info!(
-                enabled = enabled.len(),
-                project = %cfg.quota_project,
-                "Service Usage reported enabled APIs"
-            );
-            Some(enabled)
-        }
-        Err(error) => {
-            tracing::warn!(
-                project = %cfg.quota_project,
-                cause = %error,
-                "could not determine enabled APIs; exposing the configured selection unpruned"
-            );
-            None
-        }
-    };
-    prune::select_services(
-        registry::ENDPOINTS,
-        enabled.as_ref(),
-        &cfg.only,
-        &cfg.exclude,
-    )
-}
-
-/// Refresh the catalog from the upstreams and swap it in when it lands.
-fn spawn_catalog_refresh(
-    shared: server::SharedCatalog,
-    exposed: Vec<&'static Endpoint>,
-    http: reqwest::Client,
-) {
-    tokio::spawn(async move {
-        let fallback = Arc::clone(&*shared.read().await);
-        match catalog::Catalog::build_live(exposed, &http, Some(&fallback)).await {
-            Ok(fresh) => {
-                let (services, tools) = (fresh.services.len(), fresh.tool_count());
-                let diff = fallback.drift_from(&fresh);
-                *shared.write().await = Arc::new(fresh);
-                tracing::info!(services, tools, "live catalog refreshed and swapped in");
-                if !diff.is_empty() {
-                    tracing::warn!(
-                        added = ?diff.added,
-                        removed = ?diff.removed,
-                        schema_changed = ?diff.schema_changed,
-                        "catalog drifted from the committed snapshot; \
-                         re-pin it with the `snapshot` subcommand"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!(
-                cause = %error,
-                "live catalog refresh failed; continuing to serve the snapshot"
-            ),
-        }
-    });
 }
 
 /// Fetch every registered endpoint live and emit the snapshot JSON.

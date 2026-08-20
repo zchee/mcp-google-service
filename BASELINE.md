@@ -283,8 +283,63 @@ not where startup goes.
 
 | Phase | Commit | Startup real median (ms) | Offline median (ms) | Search warm `cloud run` (µs / allocs) | Parse (ms) | Binary (B) |
 |---|---|---:|---:|---:|---:|---:|
-| baseline (P1) | this commit | 1809.31 | 137.80 | 58.89 / 1,099 | 9.86 | 30,442,048 |
-| P2 | | | | | | |
+| baseline (P1) | `d341bbb` | 1809.31 | 137.80 | 58.89 / 1,099 | 9.86 | 30,442,048 |
+| P2 | see section 8 | **22.84** | **22.78** | 58.64 / 1,099 (untouched) | 9.21 (untouched) | 31,557,600 |
+
+## 8. P2 -- network off the startup critical path
+
+Same harness, same machine, same flag regime as section 1. Binary:
+`target/release/mcp-google-service`, 31,557,600 bytes, sha256
+`fd033937a79799f99b18ed06b78d34a47c83dbfef0b3ab8aee76a95de13b5db2`, built
+2026-08-20T15:33:01+0900 with `env -u RUSTFLAGS cargo build --release`.
+
+What changed: `serve` parses the snapshot, answers `initialize` and
+`tools/list`, and only then -- after rmcp has answered `initialize`, in one
+background task -- acquires credentials (gcp_auth discovery is now lazy),
+consults Service Usage (skipped under `--only`), narrows the exposed set, and
+runs the live refresh. `--strict-startup` keeps the pre-P2 ordering;
+`--expose flat` implies it. `list_services` reports per-service readiness plus
+a `startup` block with the credential/enablement state and failure text.
+
+| Mode | 20 serial runs | min | **median** | p95 | max | mean | baseline median | delta |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| real | `scripts/bench-startup.sh --runs 20` | 21.60 | **22.84** | 51.46 | 54.02 | 27.35 | 1809.31 | **-98.7% (79x)** |
+| `--offline` | `--offline --runs 20` | 21.84 | **22.78** | 24.12 | 24.47 | 22.83 | 137.80 | -83.5% |
+| real, `--strict` | `--strict --runs 20` (passes `--strict-startup`) | 1075.84 | **1785.55** | 2036.72 | 2071.27 | 1765.86 | 1809.31 | -1.3% (the old path, unchanged within noise) |
+
+Per-run values, sorted:
+
+- real: 21.60 22.07 22.33 22.41 22.52 22.59 22.65 22.73 22.74 22.82 22.87 22.92
+  23.50 23.91 24.13 25.20 34.94 39.63 51.46 54.02
+- offline: 21.84 21.85 21.94 22.09 22.18 22.20 22.42 22.56 22.60 22.73 22.83
+  22.86 22.89 22.97 23.13 23.16 23.75 23.94 24.12 24.47
+- strict: 1075.84 1243.74 1721.53 1740.20 1740.92 1746.65 1755.92 1764.62
+  1773.30 1783.51 1787.58 1791.56 1793.91 1830.94 1840.84 1936.25 1938.69
+  1943.21 2036.72 2071.27
+
+Reading: real and offline now agree to within 0.1 ms, which is the proof that
+nothing network-dependent is left on the path; what remains (~23 ms) is the
+`print-catalog` envelope from section 1 (exec + dyld + a ~10 ms snapshot parse
++ assembly + the handshake). The revised P2 acceptance (median < 160 ms) is met
+with a 7x margin; the plan's original `< 60 ms` is met as well, because the
+gcp_auth root-store load moved off the startup path together with the network
+calls (it is now paid by the background task, or by the first `call` if that
+comes first). The real-mode p95 (51 ms) is wider than offline's (24 ms): in
+real mode the background task's first step (the ~120 ms trust-store load)
+starts right after `initialize`, and in four of twenty runs it overlapped the
+`tools/list` response on the runtime.
+
+What the caller sees between startup and readiness is documented in
+`README.md` ("Startup: what is resolved when") and covered by
+`tests/integration.rs` (`serve_answers_before_credentials_and_enablement_resolve_then_narrows`,
+`only_never_consults_service_usage`,
+`a_credential_failure_is_reported_by_list_services_and_returned_by_call`).
+
+Not done here, on purpose: the gcp_auth native-root-store load (~120 ms) still
+precedes the first `call`; replacing it with bundled roots is a security
+decision for team-verify, not a P2 change. Binary grew by 1,115,552 bytes
+(+3.7%) with the readiness machinery and the lazy credential source; size is
+P5/P7's concern and is recorded, not optimized, here.
 | P3 | | | | | | |
 | P4 | | | | | | |
 | P5 | | | | | | |

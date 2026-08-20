@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use zeroize::Zeroizing;
 
 use crate::config::Config;
@@ -69,18 +69,47 @@ struct GcpTokenSource {
 
 impl TokenSource for GcpTokenSource {
     fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+        Box::pin(async { fetch_from(&*self.provider).await })
+    }
+}
+
+/// [`GcpTokenSource`] whose ADC chain is discovered on first use.
+///
+/// `gcp_auth::provider()` is not free: it loads the system trust store for its
+/// own HTTP client (~120 ms on macOS) and, for a gcloud `authorized_user`
+/// file, exchanges the refresh token eagerly (a network round trip). Deferring
+/// it to the first token request keeps both off the startup path. A discovery
+/// that fails is not cached, so an operator who repairs their credentials
+/// (`gcloud auth application-default login`) is picked up by the next call
+/// without a restart.
+#[derive(Default)]
+struct LazyGcpTokenSource {
+    provider: OnceCell<Arc<dyn gcp_auth::TokenProvider>>,
+}
+
+impl TokenSource for LazyGcpTokenSource {
+    fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
         Box::pin(async {
-            let token = self.provider.token(SCOPES).await?;
-            let expires_st: SystemTime = token.expires_at().into();
-            let expires_at = expires_st
-                .duration_since(SystemTime::now())
-                .map_or_else(|_already_past| Instant::now(), |ttl| Instant::now() + ttl);
-            Ok(FetchedToken {
-                value: Zeroizing::new(token.as_str().to_owned()),
-                expires_at: Some(expires_at),
-            })
+            let provider = self
+                .provider
+                .get_or_try_init(|| async { gcp_auth::provider().await.map_err(Error::from) })
+                .await?;
+            fetch_from(&**provider).await
         })
     }
+}
+
+/// Request a token for [`SCOPES`] from `provider` and convert its expiry.
+async fn fetch_from(provider: &dyn gcp_auth::TokenProvider) -> Result<FetchedToken, Error> {
+    let token = provider.token(SCOPES).await?;
+    let expires_st: SystemTime = token.expires_at().into();
+    let expires_at = expires_st
+        .duration_since(SystemTime::now())
+        .map_or_else(|_already_past| Instant::now(), |ttl| Instant::now() + ttl);
+    Ok(FetchedToken {
+        value: Zeroizing::new(token.as_str().to_owned()),
+        expires_at: Some(expires_at),
+    })
 }
 
 /// Cached, pre-encoded `Authorization` header plus its refresh deadline.
@@ -138,10 +167,23 @@ pub struct AuthContext {
 
 impl AuthContext {
     /// Build a context on the gcp_auth ADC chain for the configured quota
-    /// project.
+    /// project, discovering the chain now.
+    ///
+    /// Fails fast: an unusable credential source is reported here, before
+    /// anything is served. This is what `--strict-startup` asks for.
     pub async fn new(cfg: &Config) -> Result<Self, Error> {
         let provider = gcp_auth::provider().await?;
         Self::with_source(Arc::new(GcpTokenSource { provider }), &cfg.quota_project)
+    }
+
+    /// Build a context on the gcp_auth ADC chain for the configured quota
+    /// project, discovering the chain on the first token request instead.
+    ///
+    /// Nothing touches the credential source until [`AuthContext::apply`] is
+    /// first called, so a missing or expired credential surfaces on that call
+    /// rather than at startup. See [`LazyGcpTokenSource`].
+    pub fn new_lazy(cfg: &Config) -> Result<Self, Error> {
+        Self::with_source(Arc::new(LazyGcpTokenSource::default()), &cfg.quota_project)
     }
 
     /// Build a context over an arbitrary token source.

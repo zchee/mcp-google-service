@@ -24,7 +24,11 @@ rmcp = { version = "3.1", features = ["server", "client", "transport-io", "trans
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# `sync` is named explicitly: the readiness watch channel, the lazy credential
+# cell and the catalog lock all come from `tokio::sync`, and relying on a
+# transitive dependency to switch it on would make this crate's build depend on
+# rmcp's feature choices.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Scrubs the cached access token's heap buffer on drop, so a token does not

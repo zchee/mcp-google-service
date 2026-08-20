@@ -30,7 +30,10 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
-    sync::{Arc, Mutex, Once},
+    sync::{
+        Arc, Mutex, Once,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -496,10 +499,24 @@ pub fn service_usage_page(api_names: &[&str], next_page_token: Option<&str>) -> 
 /// `nextPageToken`, and the stub hands back the page the token names, so
 /// `enabled_services` must actually follow the chain to see every API.
 pub async fn spawn_service_usage_stub(pages: Vec<String>) -> TestServer {
+    spawn_counting_service_usage_stub(pages).await.0
+}
+
+/// [`spawn_service_usage_stub`] that also counts the requests it answers.
+///
+/// The counter is how a test proves a code path did *not* consult Service
+/// Usage: `--only` promises to skip the enablement lookup, and a stub that
+/// merely answers could not tell the difference between skipped and ignored.
+pub async fn spawn_counting_service_usage_stub(
+    pages: Vec<String>,
+) -> (TestServer, Arc<AtomicUsize>) {
     let pages = Arc::new(pages);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
 
     let service = service_fn(move |request: Request<Incoming>| {
         let pages = Arc::clone(&pages);
+        counter.fetch_add(1, Ordering::SeqCst);
         async move {
             let query = request.uri().query().unwrap_or_default().to_owned();
             // `pageToken=page-N` selects page N; its absence means the first.
@@ -517,7 +534,8 @@ pub async fn spawn_service_usage_stub(pages: Vec<String>) -> TestServer {
         }
     });
 
-    spawn_tls(vec!["serviceusage.googleapis.com".to_owned()], service).await
+    let server = spawn_tls(vec!["serviceusage.googleapis.com".to_owned()], service).await;
+    (server, requests)
 }
 
 /// Start an upstream that answers every request with `status` and `body`.
