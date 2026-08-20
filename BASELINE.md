@@ -53,9 +53,27 @@ narrower than it looks.** Two effects, both measured:
   checks **one invariant fewer** than the same command with `RUSTFLAGS` unset,
   while both report a confident green. Gate runs use `env -u RUSTFLAGS`.
 
-Anything that asserts a *timing* is covered by the benchmark rule regardless
-of whether it is called a benchmark: the live tier's latency budgets are
-measurements, so they run with `RUSTFLAGS` unset and strictly serially.
+**Gate protocol, amended.** The blindness above was hit independently by the
+verification lane on the same tree, and located by diffing the test roster:
+under `direnv` the suite reports **189/189, no skip and no signal**, because
+`a_route_off_google_trips_the_guard` is compiled out rather than skipped; under
+`env -u RUSTFLAGS` it is **190/190** with that test passing. A vanished test
+leaves no trace in a pass count -- which is the same defect class the commit
+that added it had just closed for `#[ignore]`, reopened through `cfg`. So:
+
+| Gate | Environment |
+|---|---|
+| `fmt`, `clippy`, `doc`, `build` | `direnv exec . cargo ...` |
+| **`nextest`** | **`env -u RUSTFLAGS cargo --config <dev> nextest run`** -- canonical count **190** |
+| benches, live tier, startup probes | `env -u RUSTFLAGS`, serial |
+
+`nextest` is the only gate whose *result set* -- not just its timings --
+depends on ambient codegen flags. Running it with `RUSTFLAGS` unset makes the
+count reproducible, matches this ledger's rule for anything compared against a
+recorded number, and executes the suite with debug-assertions and
+overflow-checks **on**, which is strictly stronger. The composite rule:
+**`direnv` for `fmt`/`clippy`/`doc`/`build`; `env -u RUSTFLAGS` for `nextest`
+and for anything timed.**
 
 ### Reproduce
 
@@ -528,6 +546,45 @@ online. The first response does not wait on background work. The handler is
 also synchronous by inspection (`readiness()` is a snapshot, `service_label()`
 a pure match, the payload a 47-entry map), so the time is round-trip and
 codegen, not payload cost.
+
+**Decomposed, so no component is left named-by-elimination.** Five
+`list_services` calls in one session, driven over stdio as raw JSON-RPC (no
+client-library overhead), both profiles:
+
+| Profile | r1 | r2 | r3 | r4 | r5 | first-touch cost |
+|---|---:|---:|---:|---:|---:|---:|
+| release (shipped) | **0.256 ms** | 0.154 | 0.146 | 0.123 | 0.137 | **0.110 ms** |
+| debug | 2.272 ms | 0.863 | 0.848 | 0.809 | 0.832 | **1.424 ms** |
+
+Two mechanisms, both real, in the ratio that matters. A **first-touch cost**
+exists -- work P5 moved off startup lands on the first call, which is the
+design working as intended -- but it is 0.110 ms in the shipped profile. The
+**steady state differs ~6x by profile** (0.14 ms release against 0.83 ms
+debug), which is the profile explanation reappearing in a measurement that has
+nothing to do with section 9. No per-call regression exists: r2 through r5 are
+flat.
+
+**Release r1 (0.256 ms) is faster than the 334 µs this section published**, and
+r2 settles at 0.154 ms. P5 moved work from startup into first touch and the
+first touch still came out ahead.
+
+Bound on the claim: `list_services` reports counts and never touches tool
+schemas, so this is the first-touch cost **on that path only** -- it is not a
+measurement of P5's lazy schema inflation, which a first `describe_tools` or
+`search` would exercise and which could be larger. Do not quote 0.110 ms as
+the general cost of P5's laziness.
+
+**Why this was ever comparable in the wrong direction:** the budgets are wide
+enough to hide the very mismatch that produced them. A 100 ms budget passes a
+334 µs release figure and a 4 ms debug figure alike, so the profile confusion
+survived every green run until someone compared two numbers instead of
+comparing a number to its limit. **Loose budgets are a defect class of their
+own**: they do not merely fail to catch a regression, they actively conceal
+the conditions under which their own reference numbers were taken.
+
+**Standing rule, adopted from this correction: every published latency figure
+carries its build profile.** A latency number without its profile is not
+reproducible, and this ledger has now demonstrated the failure mode once.
 
 Correctness of the cache, all asserted by test rather than by argument:
 
@@ -1239,3 +1296,28 @@ estimate is not re-proposed from the same reasoning.
 The canonical build command carries no `direnv` and no `RUSTFLAGS`; the
 `Reproduce` block above is the authority, and section 12 is why a size row
 without its target-dir path cannot be compared.
+
+## 19. What the review lanes caught, and about whom
+
+Two findings from the review cycle are recorded with their provenance,
+because in both cases the provenance is the lesson.
+
+**F-HDRVAL was an exposure *created by* the MEDIUM-3 remediation, and caught
+by a *different* lane.** A token that fetches successfully but cannot be
+rendered as an HTTP header left through `?`, bypassing the failure cooldown
+entirely, so the credential chain was re-walked on every call for as long as
+the source kept producing it. That path did not exist before the MEDIUM-3 fix;
+the remediation introduced it, and the code-review lane that produced the
+remediation did not see it. The separate security lane did. This is not a
+routine catch to be filed with the others: **a fix lane cannot review its own
+remediation**, and the only reason this was caught is that two independent
+lanes looked at the same code with different questions.
+
+**The `googleapis.com` route invariant holds by construction in shipped
+binaries, and is checked at test time -- never at runtime.** `debug_assert!` is
+elided under `--release`, so no shipped binary evaluates it. What guarantees
+the property in production is that `registry::ENDPOINTS` is a compile-time
+constant containing only `*.googleapis.com` hosts; the assertion and its
+`#[cfg(debug_assertions)]` guard test exist to catch a *future edit* to that
+table during development. Any ledger or review text describing this as a
+runtime check is wrong, and would overstate what ships.

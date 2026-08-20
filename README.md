@@ -300,6 +300,8 @@ startup; the rest are reported and survivable.
 | `could not attach Google credentials: failed to acquire Google credentials via ADC` (on `call`) / `failed to acquire Google credentials via ADC` (at startup with `--strict-startup`) | No usable Application Default Credentials were found, or the credential source refused. By default this is reported by `list_services` (`readiness: failed`, the reason in `startup.credentials_error`) and returned by every `call` until a later attempt succeeds; with `--strict-startup` it ends the process before anything is served. A failed (or timed-out) fetch is not retried for 30 s: calls inside that window return the same text at once, suffixed `the credential source is not retried for another Ns`, instead of each paying the credential chain's own retries. | `gcloud auth application-default login`, then retry the call; no restart is needed unless `--strict-startup` was used. |
 | `the resolved quota project is neither a valid Google Cloud project id nor a project number` | The resolved value matches neither grammar. It may have come from `GOOGLE_MCP_QUOTA_PROJECT`, `GOOGLE_CLOUD_PROJECT` or the ADC file, not just `--project`, and it is never echoed back. | Pass an id (`my-project`) or a number (`123456789012`). Check the environment and `quota_project_id` in the ADC file. |
 | `catalog snapshot {path} could not be read` / `is not a valid catalog snapshot` | An explicit `--snapshot <PATH>` is missing or unparseable. Never falls back. | Fix the path, or drop the flag to use the embedded snapshot. |
+| `failed to deserialize ApplicationCredentials: missing field private_key` | The ADC file is an **impersonated** credential (`type: impersonated_service_account`), which `gcp_auth` 0.12.7 cannot use. The message is misleading: nothing is missing, the credential shape is simply unsupported. **Do not create a service-account key to satisfy it.** | Re-run `gcloud auth application-default login` *without* `--impersonate-service-account`. |
+| `WARN ... failed to refresh token, trying again ... dns error ... JoinError::Cancelled` seen on immediate shutdown | Not a failure. The background credential fetch was cancelled mid-DNS by process teardown; `Interrupted` plus `JoinError::Cancelled` is the signature. Expected when the server is started and stopped at once. | None. |
 | `acquiring a Google access token timed out after 30s` | The credential source (ADC, metadata server, `gcloud`) did not answer. | Check `gcloud auth application-default print-access-token`, or the metadata server's reachability. |
 | `Service Usage returned a pagination token it had already served` / `Service Usage listing did not terminate within 50 pages` | The enabled-API listing stopped making progress and was abandoned. Pruning degrades: the configured selection is exposed unpruned, with a `WARN`. | None required. If it persists, `--only` pins the services to expose without consulting Service Usage. |
 | `` `call` requires `arguments` to be a JSON object `` | `call` was given `arguments` as an array, string, number or boolean. | Read the schema with `describe_tools` and pass an object. Omitting `arguments` (or passing `null`) is valid for a tool that takes none. |
@@ -464,3 +466,11 @@ Not supported in v1, each for a specific reason:
 - API-key authentication. Cloud endpoints reject it outright: "API keys are
   not supported by this API."
 - An HTTP-facing server mode. stdio covers Claude Code.
+- **Impersonated ADC** (`gcloud auth application-default login
+  --impersonate-service-account=...`). The underlying `gcp_auth` 0.12.7 has no
+  impersonation support, so the credential is rejected while being parsed. See
+  the troubleshooting row below -- the error names a missing `private_key`,
+  which is misleading for a credential that deliberately has no key.
+- **Workload Identity Federation** (`external_account` ADC) is **unprobed**,
+  like the regional hosts above: it was never exercised, so it is listed as
+  untested rather than claimed to work or claimed to fail.
