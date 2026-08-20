@@ -6,6 +6,7 @@
 //! snapshot, and embedded in the binary as an offline fallback.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     cmp::Reverse,
     collections::{BTreeMap, HashMap},
@@ -366,41 +367,28 @@ impl ToolSpec {
             Self::Live(tool) => Ok((**tool).clone()),
             Self::Archived(tool) => {
                 let parsed = tool.parsed()?;
-                let mut object = serde_json::Map::new();
-                object.insert(
-                    "name".to_owned(),
-                    serde_json::Value::String(tool.name.clone()),
+                // Built through `Tool::new` and its public fields rather than
+                // a JSON round trip, so the cached schema `Arc`s are shared
+                // with the returned tool instead of being copied twice on the
+                // way through `serde_json::Value`; the type is
+                // `#[non_exhaustive]`, which rules out a literal but not this.
+                let mut materialized = Tool::new(
+                    tool.name.clone(),
+                    tool.description.clone().unwrap_or_default(),
+                    Arc::clone(&parsed.input),
                 );
-                if let Some(description) = &tool.description {
-                    object.insert(
-                        "description".to_owned(),
-                        serde_json::Value::String(description.clone()),
-                    );
-                }
-                object.insert(
-                    "inputSchema".to_owned(),
-                    serde_json::Value::Object((*parsed.input).clone()),
-                );
-                if let Some(output) = &parsed.output {
-                    object.insert(
-                        "outputSchema".to_owned(),
-                        serde_json::Value::Object((**output).clone()),
-                    );
-                }
-                if let Some(annotations) = tool.annotations_json {
-                    let value =
+                materialized.description = tool.description.clone().map(Cow::Owned);
+                materialized.output_schema = parsed.output.as_ref().map(Arc::clone);
+                materialized.annotations = tool
+                    .annotations_json
+                    .map(|annotations| {
                         serde_json::from_str(annotations).map_err(|source| SchemaError::Parse {
                             tool: tool.name.clone(),
                             source,
-                        })?;
-                    object.insert("annotations".to_owned(), value);
-                }
-                serde_json::from_value(serde_json::Value::Object(object)).map_err(|source| {
-                    SchemaError::Assemble {
-                        tool: tool.name.clone(),
-                        source,
-                    }
-                })
+                        })
+                    })
+                    .transpose()?;
+                Ok(materialized)
             }
         }
     }
@@ -1557,7 +1545,7 @@ pub fn load_snapshot_file(path: &Path) -> Result<Snapshot, CatalogError> {
 ///
 /// # Errors
 ///
-/// Per [`embedded_snapshot`] or [`load_snapshot_file`]; an unusable explicit
+/// Per [`embedded_catalog`] or [`load_snapshot_file`]; an unusable explicit
 /// path is fatal rather than a silent fall back to the embedded copy.
 pub fn serve_catalog(override_path: Option<&Path>) -> Result<Catalog, CatalogError> {
     match override_path {
@@ -1570,11 +1558,11 @@ pub fn serve_catalog(override_path: Option<&Path>) -> Result<Catalog, CatalogErr
 ///
 /// Only for the repository-facing subcommands (`print-catalog`), whose whole
 /// purpose is to report on the file in the tree. The serve path must not use
-/// this; see [`serve_snapshot`].
+/// this; see [`serve_catalog`].
 ///
 /// # Errors
 ///
-/// Per [`embedded_snapshot`], which is the fallback.
+/// Per `embedded_fallback_snapshot`, which is the fallback.
 pub fn load_working_tree_snapshot() -> Result<Snapshot, CatalogError> {
     let path = Path::new(SNAPSHOT_PATH);
     match std::fs::read_to_string(path) {
@@ -2026,15 +2014,21 @@ mod tests {
     }
 
     #[test]
-    fn serve_defaults_to_the_embedded_snapshot() {
+    fn serve_defaults_to_the_embedded_archive() {
         // Not "prefers": the default path has no disk branch at all, which is
         // what keeps a working directory chosen by the client from deciding
-        // which tool descriptions a model reads.
+        // which tool descriptions a model reads. Archive provenance is the
+        // observable: a file can only ever yield live (serde-parsed) tools.
         let served = serve_catalog(None).expect("the embedded archive always materializes");
-        assert_eq!(served, embedded_catalog().expect("embedded materializes"));
         assert!(
-            served.services.len() > 1,
+            served.services.len() > 1 && served.tool_count() > 0,
             "sanity: the embedded archive carries the real registry"
+        );
+        assert!(
+            served
+                .tools()
+                .all(|entry| matches!(entry.tool, ToolSpec::Archived(_))),
+            "the default serve path must materialize from the archive, not parse a file"
         );
     }
 

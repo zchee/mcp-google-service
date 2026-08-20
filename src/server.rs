@@ -237,8 +237,10 @@ impl Readiness {
 ///
 /// # Errors
 ///
-/// Per [`Snapshot::into_catalog`]: the snapshot must satisfy the namespacing
-/// invariants.
+/// None today: `catalog` already passed [`Catalog::new`]'s namespacing
+/// checks, and narrowing and relabelling cannot fail. The `Result` keeps the
+/// seam's shape for its callers and carries any assembly-time check added
+/// later.
 pub fn assemble_serve_catalog(
     catalog: Catalog,
     exposed: &[&Endpoint],
@@ -717,23 +719,36 @@ fn meta_tools() -> Vec<Tool> {
 ///
 /// Materializes archived schemas: flat mode hands the client every schema at
 /// `initialize`, so this is where the lazy frames are paid for -- by the one
-/// mode whose startup is network-bound anyway.
+/// mode whose startup is network-bound anyway. A tool whose definition cannot
+/// be materialized is logged and omitted rather than emptying the whole list,
+/// the per-tool stance `describe_tools` already takes; only a list that would
+/// be empty because of such failures is an error.
 fn flat_tools(catalog: &Catalog) -> Result<Vec<Tool>, McpError> {
-    catalog
-        .tools()
-        .map(|entry| {
-            let mut tool = entry.tool.to_rmcp().map_err(|error| {
+    let mut tools = Vec::new();
+    let mut omitted = 0usize;
+    for entry in catalog.tools() {
+        match entry.tool.to_rmcp() {
+            Ok(mut tool) => {
+                tool.name = entry.namespaced_name.clone().into();
+                tools.push(tool);
+            }
+            Err(error) => {
+                omitted += 1;
                 tracing::error!(
                     %error,
                     tool = entry.namespaced_name,
-                    "flat listing could not materialize a tool definition"
+                    "flat listing could not materialize a tool definition; omitting it"
                 );
-                McpError::internal_error("a tool definition could not be materialized", None)
-            })?;
-            tool.name = entry.namespaced_name.clone().into();
-            Ok(tool)
-        })
-        .collect()
+            }
+        }
+    }
+    if tools.is_empty() && omitted > 0 {
+        return Err(McpError::internal_error(
+            format!("none of the {omitted} tool definitions could be materialized"),
+            None,
+        ));
+    }
+    Ok(tools)
 }
 
 /// Coerce a `json!` object into the shape `Tool::new` wants.
@@ -999,6 +1014,68 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    /// Shipped flat mode runs over archived tools, not the live fixtures the
+    /// other flat tests use: every tool of a service materializes from the
+    /// embedded archive, namespaced, with a real input schema.
+    #[test]
+    fn flat_mode_materializes_archived_tools_with_their_schemas() {
+        let run = crate::registry::find("run").expect("run is registered");
+        let catalog = crate::catalog::embedded_catalog()
+            .expect("the embedded archive materializes")
+            .restricted_to(&[run]);
+        let expected = catalog.tool_count();
+        assert!(
+            expected > 0,
+            "sanity: run has tools in the committed snapshot"
+        );
+
+        let tools = flat_tools(&catalog).expect("archived schemas inflate");
+        assert_eq!(tools.len(), expected);
+        for tool in &tools {
+            assert!(
+                tool.name.starts_with("run__"),
+                "{} is not namespaced",
+                tool.name
+            );
+            assert!(
+                !tool.input_schema.is_empty(),
+                "{} materialized with an empty input schema",
+                tool.name
+            );
+        }
+    }
+
+    /// One tool that cannot be materialized is omitted and logged, not the
+    /// reason the client sees an empty list; only a list that would be empty
+    /// for that reason is the error.
+    #[test]
+    fn flat_mode_omits_an_unmaterializable_tool_instead_of_emptying_the_list() {
+        let healthy = crate::catalog::embedded_catalog()
+            .expect("the embedded archive materializes")
+            .get("run__list_services")
+            .expect("present in the committed catalog")
+            .clone();
+        let broken = crate::catalog::NamespacedTool {
+            namespaced_name: "run__broken".to_owned(),
+            service_id: "run".to_owned(),
+            tool: crate::catalog::ToolSpec::broken_for_tests("broken"),
+        };
+        let service = |tools: Vec<crate::catalog::NamespacedTool>| crate::catalog::ServiceCatalog {
+            service_id: "run".to_owned(),
+            source: CatalogSource::Snapshot,
+            tools,
+        };
+
+        let mixed = Catalog::new(vec![service(vec![healthy, broken.clone()])]).expect("valid");
+        let listed = flat_tools(&mixed).expect("the healthy tool carries the list");
+        let names: Vec<&str> = listed.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(names, ["run__list_services"]);
+
+        let all_broken = Catalog::new(vec![service(vec![broken])]).expect("valid");
+        let error = flat_tools(&all_broken).expect_err("nothing materialized is an error");
+        assert!(error.message.contains("1 tool"), "got {}", error.message);
     }
 
     #[test]
