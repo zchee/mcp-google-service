@@ -2503,4 +2503,18 @@ mod tests {
             assert_eq!(a, b, "ranking diverged for `{query}`");
         }
     }
+
+    /// The invariant checked access depends on, pinned rather than assumed:
+    /// the embedded archive's rkyv payload starts 16-aligned. The aligned
+    /// wrapper provides it (`include_bytes!` alone guarantees alignment 1)
+    /// and the 16-byte header preserves it; if a refactor drops either, this
+    /// goes red instead of `archive::access` failing mysteriously.
+    #[test]
+    fn the_embedded_archive_payload_is_16_aligned() {
+        assert_eq!(std::mem::align_of_val(EMBEDDED_ARCHIVE), 16);
+        assert_eq!(EMBEDDED_ARCHIVE.0.as_ptr() as usize % 16, 0);
+        let payload = &EMBEDDED_ARCHIVE.0[archive::ARCHIVE_HEADER_LEN..];
+        assert_eq!(payload.as_ptr() as usize % 16, 0);
+        assert_eq!(archive::ARCHIVE_HEADER_LEN % 16, 0);
+    }
 }

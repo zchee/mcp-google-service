@@ -167,6 +167,15 @@ pub struct ToolEntry {
 
 /// Serialize `snapshot` into a complete archive file: header plus payload.
 ///
+/// # Determinism
+///
+/// The output is a pure function of the snapshot: the zstd level is pinned,
+/// frames carry no timestamps, `generated_at` is copied from the source
+/// rather than read from a clock, and the header's reserved bytes are zero.
+/// Regenerating from unchanged JSON is therefore byte-identical, which is
+/// what lets `git status` answer "did the snapshot change?" and lets the
+/// identity test hold the committed pair equal.
+///
 /// # Errors
 ///
 /// Any [`ArchiveError`] variant except the read-side ones; in particular
@@ -357,6 +366,11 @@ mod tests {
     fn an_archive_round_trips_every_field() {
         let snapshot = sample_snapshot();
         let bytes = build(&snapshot).expect("sample archives");
+        assert_eq!(
+            bytes,
+            build(&snapshot).expect("sample archives twice"),
+            "building the same snapshot twice must be byte-identical"
+        );
         let archived = access(&bytes).expect("a freshly built archive validates");
 
         assert_eq!(archived.generated_at.as_str(), snapshot.generated_at);
