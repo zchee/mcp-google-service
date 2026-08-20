@@ -7,51 +7,6 @@ rust-version = "1.88"
 # snapshot and targets one operator workflow.
 publish = false
 
-# Stripping corrupts the Mach-O LINKEDIT segment of proc-macro dylibs on macOS,
-# and dyld then refuses to load them ("mis-aligned LINKEDIT string pool"). The
-# build fails claiming it cannot find `serde_derive`, `tokio_macros` and every
-# other derive crate, which points nowhere near the real cause.
-#
-# The two settings below are the whole of P7's size win, measured one at a time
-# against a 31,683,456-byte baseline (BASELINE.md section 11): together they
-# remove 6,688,864 bytes, 21.1%. Both are deliberately here rather than in
-# ambient `RUSTFLAGS`, so the shipped binary is decided by the repository and a
-# benchmark can never inherit them by accident.
-[profile.release]
-strip = "none"
-# -5,871,808 B on its own: the larger half of the win, and the only knob that
-# moved `__LINKEDIT` (-2,588,672) as well as `__text` (-2,168,180).
-codegen-units = 1
-# A further -817,056 B on top of `codegen-units = 1`. "fat" specifically:
-# "thin" was measured and is *worse than no LTO at all* here (+240,048 B
-# against `codegen-units = 1` alone), trading 547 KB more `__text` for 262 KB
-# less `__LINKEDIT`. Costs ~112 s to link instead of ~40 s, which is paid by
-# whoever builds a release and by nobody else.
-lto = "fat"
-
-# Frozen deliberately at what `[profile.release]` used to be, and NOT to be
-# "simplified" back into inheriting it.
-#
-# `[profile.bench]` inherits `[profile.release]` by default, so the settings
-# above would otherwise reach every benchmark binary -- measured: `cargo bench
-# --no-run` went from ~40 s to 110 s, and the divan numbers recorded in
-# `BASELINE.md` sections 2a, 10 and 12 would have been taken under a profile
-# that no longer exists.
-#
-# The two instruments have different jobs. The divan benches are the
-# *differential* instrument: their value is comparing this crate's own code
-# across phases, which requires the profile underneath them to hold still, and
-# P5 has yet to be judged against them. The *decisive* instrument for a phase
-# ruling is `scripts/bench-startup.sh` against the real release binary, which
-# measures the shipped configuration by construction. So the shipped profile is
-# free to diverge for size while the diagnostic one stays fixed; fidelity to
-# the shipped link step is covered by the startup probe, not by these.
-#
-# (`[profile.test]` inherits dev, not release, so `nextest` pays none of this.)
-[profile.bench]
-codegen-units = 16
-lto = false
-
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -110,6 +65,51 @@ rustls = "0.23"
 # so that test costs microseconds instead of the real 30s budget.
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "test-util"] }
 tokio-rustls = "0.26"
+
+# Stripping corrupts the Mach-O LINKEDIT segment of proc-macro dylibs on macOS,
+# and dyld then refuses to load them ("mis-aligned LINKEDIT string pool"). The
+# build fails claiming it cannot find `serde_derive`, `tokio_macros` and every
+# other derive crate, which points nowhere near the real cause.
+#
+# The two settings below are the whole of P7's size win, measured one at a time
+# against a 31,683,456-byte baseline (BASELINE.md section 11): together they
+# remove 6,688,864 bytes, 21.1%. Both are deliberately here rather than in
+# ambient `RUSTFLAGS`, so the shipped binary is decided by the repository and a
+# benchmark can never inherit them by accident.
+[profile.release]
+strip = "none"
+# -5,871,808 B on its own: the larger half of the win, and the only knob that
+# moved `__LINKEDIT` (-2,588,672) as well as `__text` (-2,168,180).
+codegen-units = 1
+# A further -817,056 B on top of `codegen-units = 1`. "fat" specifically:
+# "thin" was measured and is *worse than no LTO at all* here (+240,048 B
+# against `codegen-units = 1` alone), trading 547 KB more `__text` for 262 KB
+# less `__LINKEDIT`. Costs ~112 s to link instead of ~40 s, which is paid by
+# whoever builds a release and by nobody else.
+lto = "fat"
+
+# Frozen deliberately at what `[profile.release]` used to be, and NOT to be
+# "simplified" back into inheriting it.
+#
+# `[profile.bench]` inherits `[profile.release]` by default, so the settings
+# above would otherwise reach every benchmark binary -- measured: `cargo bench
+# --no-run` went from ~40 s to 110 s, and the divan numbers recorded in
+# `BASELINE.md` sections 2a, 10 and 12 would have been taken under a profile
+# that no longer exists.
+#
+# The two instruments have different jobs. The divan benches are the
+# *differential* instrument: their value is comparing this crate's own code
+# across phases, which requires the profile underneath them to hold still, and
+# P5 has yet to be judged against them. The *decisive* instrument for a phase
+# ruling is `scripts/bench-startup.sh` against the real release binary, which
+# measures the shipped configuration by construction. So the shipped profile is
+# free to diverge for size while the diagnostic one stays fixed; fidelity to
+# the shipped link step is covered by the startup probe, not by these.
+#
+# (`[profile.test]` inherits dev, not release, so `nextest` pays none of this.)
+[profile.bench]
+codegen-units = 16
+lto = false
 
 # Micro-benchmarks over the committed 47-service / 548-tool snapshot. Each is a
 # divan binary (`harness = false`), so `cargo bench` runs them one after
