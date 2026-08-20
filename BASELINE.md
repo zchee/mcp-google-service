@@ -288,6 +288,7 @@ not where startup goes.
 | P3 | `26b0cd3` (+ addendum) | unchanged | unchanged | untouched | untouched | see section 9 |
 | P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
 | P6 | none (reverted) | untouched | untouched | untouched | untouched | untouched; fan-out 6.64 -> 6.45 -> 6.32 s (A/B/A', null -- section 11) |
+| P7 | this commit | pending the granted window (predicted 0) | pending | untouched (`[profile.bench]` pinned, section 12) | untouched | **24,994,592 (-21.1%)** |
 
 Notes on the P2 row:
 
@@ -442,11 +443,6 @@ precedes the first `call`; replacing it with bundled roots is a security
 decision for team-verify, not a P2 change. Binary grew by 1,115,552 bytes
 (+3.7%) with the readiness machinery and the lazy credential source; size is
 P5/P7's concern and is recorded, not optimized, here.
-| P3 | `26b0cd3` | see section 9 | | | | |
-| P4 | `b121b12` | see section 10 | | | | |
-| P5 | | | | | | |
-| P6 | reverted | see section 11 | | | | |
-| P7 | | | | | | |
 
 ## 9. P3 -- one round trip per dispatch, not two
 
@@ -666,3 +662,82 @@ Reverted: `Cargo.toml` and `Cargo.lock` are byte-identical to `b121b12`'s;
 nothing landed on the code. **P6 is closed.** If a future change makes
 per-host concurrency real, re-run this section's probe rather than assuming
 either outcome.
+
+## 12. P7 -- build settings: a size phase, as predicted
+
+Commit `53a20c2` plus this one. Same machine and toolchain as section 1
+(rustc 1.97.1). Size is deterministic, so these arms need no measurement
+window; each was built into a **fresh** target directory, because codegen and
+link flags do not reliably force a relink of a cached binary and a stale
+artifact would attribute bytes to the wrong flag.
+
+| Arm | total | Δ vs base | `__text` | `__LINKEDIT` |
+|---|---:|---:|---:|---:|
+| base (no flags) | 31,683,456 | -- | 9,787,284 | 6,209,536 |
+| `codegen-units = 1` | 25,811,648 | **-5,871,808** | 7,619,104 | 3,620,864 |
+| `-Wl,-dead_strip` | 31,683,456 | **0** | 9,787,284 | 6,209,536 |
+| `cu=1` + `lto = "thin"` | 26,051,696 | -5,631,760 | 8,166,016 | 3,358,720 |
+| **`cu=1` + `lto = "fat"`** | **24,994,592** | **-6,688,864 (-21.1%)** | 7,739,040 | 3,047,424 |
+
+Adopted: `codegen-units = 1` and `lto = "fat"` in `[profile.release]`. The
+built binary reproduces 24,994,592 exactly and works (`print-catalog` returns
+47 services / 548 tools). Release link time goes from ~40 s to ~112 s; the
+test profile inherits dev, so `nextest` pays none of it.
+
+**`lto = "thin"` is worse than no LTO at all here** -- the obvious "safe
+middle" choice would have shipped a **+240,048 B regression** against
+`codegen-units = 1` alone. It trades 546,912 B more `__text` for 262,144 B
+less `__LINKEDIT`; `"fat"` makes the opposite trade (+119,936 `__text`,
+-573,440 `__LINKEDIT`) and wins. Nobody should adopt `"thin"` here on the
+reasonable-sounding grounds that it is the moderate option.
+
+**`dead_strip` is a structural null, not an observed one.** It removed zero
+bytes from every section, and the mechanism is that `rustc` already passes
+`-Wl,-dead_strip` on every Apple link: `rustc -O --print link-args` on the
+pinned **1.97.1** contains exactly one occurrence, so the explicit flag was a
+duplicate. That is why the totals were byte-identical while the sha differed --
+the link command changed, the link result could not. It cannot buy a byte on
+this target under any invocation shape, so the question of how to deliver it
+(ambient `RUSTFLAGS`, a committed `.cargo/config.toml`, a `build.rs` emitting
+`cargo::rustc-link-arg-bins`, or a separate release command) is moot, and the
+crate keeps its "no build scripts" property.
+
+This also explains the earlier -5.18 MB figure in section 3 as a **confound**:
+that comparison was against a build carrying the entire direnv set
+(`target-cpu=native`, `opt-level=3`, `lto=thin`, and more), and the two flags
+it was attributed to were simply the two that had been named.
+
+**Positive control, run even though adoption no longer depended on it.** The
+ambient `dead_strip` arm changed the hashes of **all 17 proc-macro dylibs**.
+So the contamination mechanism behind `ae92467` is demonstrated rather than
+feared: an ambient link flag does reach proc-macro dylib links. Had a link
+flag been needed, `cargo::rustc-link-arg-bins` would have been the right shape
+precisely because that equality check would then have meant something.
+
+**Why `[profile.bench]` is pinned.** It inherits `[profile.release]`, so the
+settings above would otherwise reach every benchmark binary -- measured,
+`cargo bench --no-run` went from ~40 s to 110 s -- and the divan numbers in
+sections 2a, 10 and here would have been taken under a profile that no longer
+exists. The benches are the *differential* instrument: their worth is
+comparing this crate's code across phases, which requires the profile beneath
+them to hold still, and P5 is still to be judged against them. The *decisive*
+instrument for a phase ruling is `scripts/bench-startup.sh` against the real
+release binary, which measures the shipped configuration by construction. So
+the shipped profile diverges for size while the diagnostic one stays frozen.
+
+**Method note.** The first `lto` arms were driven through `RUSTFLAGS`, where
+`-C lto` is incompatible with the `-C embed-bitcode=no` cargo passes to
+dependencies. Both builds died instantly -- and because the harness redirected
+stderr to `/dev/null`, they reported as `build=0s` with empty sizes: shaped
+like data, not like failure. It was caught only because a zero-second release
+build is impossible. A harness that renders failures as empty results is how a
+wrong number gets archived; the arms were re-run through
+`--config 'profile.release.lto=...'`, which is also the shape actually adopted.
+
+**Still open at this commit**, both pre-registered before measurement:
+startup effect predicted **0** (`codegen-units = 1` can move runtime either
+way through cross-CGU inlining, so a delta in *either* direction is to be
+reported, not buried), and the allocator arm, whose prediction of 0 was
+flagged by its own author as resting on weak reasoning -- a 260,841-allocation
+parse burst is exactly where allocators differ. Both are measured on the
+adopted profile in the granted window.
