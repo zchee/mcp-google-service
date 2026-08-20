@@ -287,6 +287,7 @@ not where startup goes.
 | P2 | `b4b184d` + `7e7af67` | **22.84** | **22.78** | 58.64 / 1,099 (untouched) | 9.21 (untouched) | 31,586,464 |
 | P3 | `26b0cd3` (+ addendum) | unchanged | unchanged | untouched | untouched | see section 9 |
 | P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
+| P6 | none (reverted) | untouched | untouched | untouched | untouched | untouched; fan-out 6.64 -> 6.45 -> 6.32 s (A/B/A', null -- section 11) |
 
 Notes on the P2 row:
 
@@ -444,7 +445,7 @@ P5/P7's concern and is recorded, not optimized, here.
 | P3 | `26b0cd3` | see section 9 | | | | |
 | P4 | `b121b12` | see section 10 | | | | |
 | P5 | | | | | | |
-| P6 | | | | | | |
+| P6 | reverted | see section 11 | | | | |
 | P7 | | | | | | |
 
 ## 9. P3 -- one round trip per dispatch, not two
@@ -623,3 +624,45 @@ Notes for later phases and team-verify:
   or a snapshot round-trip starts without it and rebuilds lazily, so the
   rkyv migration does not need to serialize it; `NamespacedTool`'s wire
   shape is unchanged (`#[serde(skip)]` on the catalog's index field).
+
+## 11. P6 -- the HTTP/2 one-off: measured, null, reverted
+
+Per the W4 ruling P6 was reduced to one question -- does enabling reqwest's
+`http2` feature (suppressed today by `default-features = false`) move the
+47-host discovery fan-out? -- with the phase dropped either way, its other
+bullets having been eaten by P2 (refresh after serve) and P3 (session reuse,
+shared pool).
+
+Probe: `snapshot --out /tmp/...` (the full unauthenticated 47-host fan-out;
+process-exit endpoint; a partial fan-out exits non-zero and would invalidate
+the run -- all runs completed 47/47). hyperfine, `RUSTFLAGS` unset, fresh
+release build per arm, A-B-A so drift between arms cannot pose as the
+feature. Decision rule fixed before measuring: keep only if B moves >10%
+AND clears the wider arm's spread.
+
+| Arm | Binary | mean +- sigma | min .. max | runs |
+|---|---|---:|---:|---:|
+| A: HTTP/1.1 (HEAD) | `ac26ba3a...` | 6.643 s +- 0.383 | 5.905 .. 7.026 | 6 |
+| B: + `http2` | `a272adeb...` | 6.453 s +- 0.305 | 5.946 .. 6.783 | 6 |
+| A': HTTP/1.1 again | `ac26ba3a...` | 6.319 s +- 0.556 | 5.781 .. 6.892 | 3 |
+
+That B actually spoke HTTP/2 was verified, not assumed: `RUST_LOG=h2=debug`
+on the B binary logged 1,727 `h2::` frames during one fan-out; the same
+probe on the reverted binary logged zero. So the comparison is real and the
+answer is null: A-to-B is -2.9% while A-to-A' is -4.9% with no change at
+all -- the network's own drift exceeds the feature's effect, exactly the
+revert rule's case.
+
+Why it cannot help here, mechanically: the fan-out contacts 47 *distinct*
+hostnames, one connection each; HTTP/2 multiplexes streams within one
+connection and hyper does no cross-host origin coalescing, so there is
+nothing for it to multiplex. The sequential initialize -> tools/list on a
+warm connection costs the same round trips on either protocol. Where h2
+*could* matter is many concurrent calls to one host through P3's cached
+session -- that session is rmcp's transport, not this client, and no
+measured workload does that today.
+
+Reverted: `Cargo.toml` and `Cargo.lock` are byte-identical to `b121b12`'s;
+nothing landed on the code. **P6 is closed.** If a future change makes
+per-host concurrency real, re-run this section's probe rather than assuming
+either outcome.
