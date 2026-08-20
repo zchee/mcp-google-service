@@ -288,7 +288,7 @@ not where startup goes.
 | P3 | `26b0cd3` (+ addendum) | unchanged | unchanged | untouched | untouched | see section 9 |
 | P4 | `b121b12` | untouched (index is lazy; offline min 22.42 vs P2's 22.78, section 10) | 47.64 under load avg 2.8-5.8 (control 55.74) | **67.70 / 0** | 9.21 (unchanged) | 31,684,224 |
 | P6 | none (reverted) | untouched | untouched | untouched | untouched | untouched; fan-out 6.64 -> 6.45 -> 6.32 s (A/B/A', null -- section 11) |
-| P7 | this commit | pending the granted window (predicted 0) | pending | untouched (`[profile.bench]` pinned, section 12) | untouched | **24,994,592 (-21.1%)** |
+| P7 | `924439d` + this commit | **-0.82 ms** (profile) **-1.12 ms** (mimalloc), paired; see 12a | same probe (`--offline`) | untouched (`[profile.bench]` pinned, section 12) | untouched | **25,200,624 (-20.5%)** |
 
 Notes on the P2 row:
 
@@ -680,8 +680,25 @@ artifact would attribute bytes to the wrong flag.
 | **`cu=1` + `lto = "fat"`** | **24,994,592** | **-6,688,864 (-21.1%)** | 7,739,040 | 3,047,424 |
 
 Adopted: `codegen-units = 1` and `lto = "fat"` in `[profile.release]`. The
-built binary reproduces 24,994,592 exactly and works (`print-catalog` returns
-47 services / 548 tools). Release link time goes from ~40 s to ~112 s; the
+built binary works (`print-catalog` returns 47 services / 548 tools).
+
+**The exact byte count is reproducible only for a given pair of paths**, which
+is worth stating because two "exact" figures for the same commit would
+otherwise look like a contradiction. `strip = "none"` keeps DWARF, and DWARF
+embeds absolute build paths, so the total moves with the *length* of the
+source and target-dir paths. Three builds of identical source:
+
+| Source dir | Target dir | bytes |
+|---|---|---:|
+| `...-p3` (worktree) | `/Volumes/tmpfs/target-p7` (24 ch) | 24,994,592 |
+| `...mcp-google-service` | `/Volumes/tmpfs/target-reconcile` (31 ch) | 24,994,736 |
+| `...mcp-google-service` | `<repo>/target` (61 ch) | 24,995,424 |
+
+Monotonic in path length and consistent in magnitude: the 30-character
+target-dir difference in the last row costs 688 B, the 7-character difference
+in the first costs ~144 B, i.e. roughly one path copy per compilation unit.
+So the 832 B spread across this section's builds is explained, not noise, and
+any future byte-for-byte comparison has to hold both paths fixed. Release link time goes from ~40 s to ~112 s; the
 test profile inherits dev, so `nextest` pays none of it.
 
 **`lto = "thin"` is worse than no LTO at all here** -- the obvious "safe
@@ -695,8 +712,9 @@ reasonable-sounding grounds that it is the moderate option.
 bytes from every section, and the mechanism is that `rustc` already passes
 `-Wl,-dead_strip` on every Apple link: `rustc -O --print link-args` on the
 pinned **1.97.1** contains exactly one occurrence, so the explicit flag was a
-duplicate. That is why the totals were byte-identical while the sha differed --
-the link command changed, the link result could not. It cannot buy a byte on
+duplicate. That is why the totals were byte-identical while the sha differed: ld64
+hashes the link command line into `LC_UUID`, so the recorded identity of the
+build changed while the emitted code did not. It cannot buy a byte on
 this target under any invocation shape, so the question of how to deliver it
 (ambient `RUSTFLAGS`, a committed `.cargo/config.toml`, a `build.rs` emitting
 `cargo::rustc-link-arg-bins`, or a separate release command) is moot, and the
@@ -734,10 +752,60 @@ build is impossible. A harness that renders failures as empty results is how a
 wrong number gets archived; the arms were re-run through
 `--config 'profile.release.lto=...'`, which is also the shape actually adopted.
 
-**Still open at this commit**, both pre-registered before measurement:
-startup effect predicted **0** (`codegen-units = 1` can move runtime either
-way through cross-CGU inlining, so a delta in *either* direction is to be
-reported, not buried), and the allocator arm, whose prediction of 0 was
-flagged by its own author as resting on weak reasoning -- a 260,841-allocation
-parse burst is exactly where allocators differ. Both are measured on the
-adopted profile in the granted window.
+### 12a. Startup: both pre-registrations falsified, both favourably
+
+Both predictions were recorded *before* measuring; both were wrong, and both
+were wrong in the direction that flatters the change, which is exactly when a
+pre-registration has to be honoured loudest.
+
+**The machine forced the design.** The desktop sat at load 8-13 for the whole
+window (WindowServer and Chrome, nothing of this project's), and the section-1
+control confirmed the regime: `print-catalog` median **40.62 ms** against its
+quiet **26.12 ms**. Comparing against the quiet-machine 22.84 ms reference
+would have measured the desktop. So nothing here is reported against a
+historical number. The pre-P7-profile binary (`codegen-units = 16`,
+`lto = false`, 31,740,336 B) was rebuilt and every comparison is **same-session
+paired alternation**: the two binaries measured minutes apart under identical
+conditions, `--offline` (lower variance, and startup is a CPU and dyld
+question, not a network one).
+
+A first attempt used coarse A-B-A and **was rejected by its own brackets**: the
+two "new" arms disagreed by 11.34 ms (31.83 then 43.17), more than the A-vs-B
+gap they were supposed to bound, so those medians were measuring drift.
+Shortening each arm and alternating more often collapsed it.
+
+| Arm | Predicted | Measured | Evidence |
+|---|---|---|---|
+| A: profile (`codegen-units=1` + `lto="fat"`) | **0** | **~0.82 ms faster** | minima 8/8 rounds, mean +0.82, median +0.74 (sign test p = 0.0039); medians 6/8, +0.50 |
+| B: mimalloc as `#[global_allocator]` | **0** (author-flagged as weak) | **~1.1-1.5 ms faster** | minima 10/12, mean +1.12, median +1.05; medians 10/12, mean +1.51, median +1.20 |
+
+**Arm A's mechanism was in the author's own notes and left out of the
+prediction anyway**: the binary is 6,744,912 B smaller, so dyld maps less. The
+prediction reasoned about codegen quality and forgot the size effect that the
+W4 decision table had already named. ~3.9% of a ~21 ms floor.
+
+**Arm B was nearly reported as a result when it was a coin-flip.** The first
+run (8 rounds, heavier load) gave minima 7/8 **+1.23 ms** but medians 5/8
+**-0.37 ms** -- the two statistics disagreeing. That was not reported; it was
+re-run at 12 rounds once load settled, where both agree. Best single runs:
+system 21.46 ms, mimalloc **19.52 ms**. The flagged doubt was right and the
+prediction wrong: a 260,841-allocation parse burst is where an allocator shows.
+
+**Derived, not measured:** applying both paired deltas to the quiet-machine
+reference gives **22.84 -> ~20.9 ms**. No run produced that number directly;
+the deltas were measured under load and the reference was not.
+
+Binary with mimalloc: **25,200,624 B**, +205,200 over the allocator-free build,
+so the phase nets **-20.5%** from 31,683,456 rather than -21.1%.
+
+**Trust base.** mimalloc compiles a C library into a binary that handles
+credentials. That is flagged for the security reviewer rather than assumed
+free, along with the question of whether mimalloc's secure mode (guard pages,
+encrypted free lists) earns its cost -- the numbers above are default mode, so
+the reviewer can price the option against a measured baseline. **`zeroize` is
+unaffected**: the token buffer is scrubbed *before* being freed, so which
+allocator reclaims the page afterwards does not change what is left in it.
+
+**Still open at this commit**: nothing from P7. The security reviewer holds
+mimalloc's trust-base question and its secure-mode option; the phase's
+measured results are complete.

@@ -104,6 +104,24 @@ enum Command {
     PrintCatalog,
 }
 
+/// Process-wide allocator.
+///
+/// Adopted on a measured win, and only on the binary: loading the snapshot is
+/// a burst of 260,841 allocations, and paired against the system allocator
+/// over 12 alternating rounds mimalloc reaches the first tool response
+/// ~1.1-1.5 ms sooner (`BASELINE.md` section 12) -- about 5-6% of a ~21 ms
+/// startup, and the largest single item left after P2.
+///
+/// It lives here rather than in the library so that this crate's consumers --
+/// the integration and bench harnesses -- keep the system allocator and are
+/// unaffected by the choice. `zeroize` is unaffected either way: the token
+/// buffer is scrubbed *before* it is freed, so which allocator takes the page
+/// back afterwards does not change what is left in it. The C dependency this
+/// adds to a credential-handling binary is flagged for the security reviewer
+/// in `Cargo.toml`.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
