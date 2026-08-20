@@ -24,7 +24,10 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 /// credential source that hangs (an unreachable metadata server, a wedged
 /// `gcloud`) would otherwise stall every upstream call in the process behind
 /// it with no upper bound.
-const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Public because it is observable: a caller of [`AuthContext::apply`] waits
+/// this long in the worst case.
+pub const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a failed fetch is held against the source before it is retried.
 ///
@@ -35,7 +38,11 @@ const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// that again just to return the same error. Within it the first failure is
 /// returned at once; after it, one call retries, so a repaired credential is
 /// picked up without a restart.
-const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+///
+/// Public because it is observable: it is the window
+/// [`Error::CredentialsCoolingDown`] reports a retry horizon against, and the
+/// delay before a repaired credential is picked up.
+pub const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Lifetime granted to a token whose expiry is already in the past.
 ///
@@ -241,7 +248,12 @@ impl AuthContext {
     ///
     /// Nothing touches the credential source until [`AuthContext::apply`] is
     /// first called, so a missing or expired credential surfaces on that call
-    /// rather than at startup. See [`LazyGcpTokenSource`].
+    /// rather than at startup. Discovery is what is being deferred, and it is
+    /// not cheap: it loads the system trust store for gcp_auth's own HTTP
+    /// client and, for a gcloud `authorized_user` file, exchanges the refresh
+    /// token eagerly. A discovery that fails is not remembered as a verdict on
+    /// the credentials, so repairing them needs no restart -- the next call
+    /// past [`FETCH_FAILURE_COOLDOWN`] tries again.
     pub fn new_lazy(cfg: &Config) -> Result<Self, Error> {
         Self::with_source(Arc::new(LazyGcpTokenSource::default()), &cfg.quota_project)
     }
