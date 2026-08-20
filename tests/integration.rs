@@ -1682,6 +1682,191 @@ async fn a_credential_failure_drops_every_cached_session() {
     upstream.server.shutdown().await;
 }
 
+/// `--strict-startup` must not serve while claiming credentials it never got.
+///
+/// The trap this pins: `AuthContext::new` only *discovers* the credential
+/// chain, it mints nothing. A service-account key is discoverable from its
+/// file alone, so discovery succeeds even when the token endpoint is dead --
+/// and with `--only` the Service Usage call that would otherwise have forced
+/// a token is skipped by design. Before the fix, that combination let the
+/// strict path serve while publishing `credentials: ready` having never held
+/// a token, which is worse than reporting nothing.
+///
+/// Driven against the real binary because the wiring under test lives in
+/// `main.rs`. Skips cleanly, and says so, where `openssl` is unavailable to
+/// mint the throwaway key -- the same posture the live tier takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_startup_refuses_to_serve_without_a_real_token() {
+    let dir = std::env::temp_dir().join(format!("mcp-strict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let key = dir.join("key.pem");
+
+    let generated = std::process::Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+        ])
+        .arg(&key)
+        .output();
+    match generated {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            eprintln!("strict-startup test inert: `openssl` unavailable to mint a throwaway key");
+            return;
+        }
+    }
+
+    // Structurally valid, so gcp_auth *discovers* it; `token_uri` is a closed
+    // port, so no token can actually be minted.
+    let pem = std::fs::read_to_string(&key).expect("the generated key reads");
+    let account = json!({
+        "type": "service_account",
+        "project_id": "strict-test",
+        "private_key_id": "strict-test",
+        "private_key": pem,
+        "client_email": "strict-test@strict-test.iam.gserviceaccount.com",
+        "client_id": "0",
+        "token_uri": "http://127.0.0.1:1/token",
+    });
+    let account_path = dir.join("service-account.json");
+    std::fs::write(&account_path, account.to_string()).expect("write the throwaway account");
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-google-service"));
+    command
+        .arg("--strict-startup")
+        .arg("--only")
+        .arg("run")
+        .arg("--project")
+        .arg(TEST_PROJECT)
+        .env("GOOGLE_APPLICATION_CREDENTIALS", &account_path)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("the built binary must be spawnable");
+
+    // Hold stdin OPEN for the whole wait. Closing it makes a *serving* process
+    // exit too -- on "connection closed: initialize request" -- which is a
+    // non-zero status that has nothing to do with credentials and would let
+    // this test pass against the very bug it exists to catch.
+    let _stdin = child.stdin.take().expect("stdin was piped");
+
+    let finished = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    let output = match finished {
+        Ok(output) => output.expect("the child is waitable"),
+        Err(_elapsed) => panic!(
+            "`--strict-startup` was still running with a credential it can never \
+             mint a token from, so it had reached the serving state. Fail-fast is \
+             the entire point of this mode."
+        ),
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The discriminating assertion. A process that got as far as this line has
+    // published `credentials: ready` without ever holding a token, which is
+    // precisely the defect; every other signal here (exit status, the word
+    // "credential" appearing in an INFO line) is satisfied by the buggy build
+    // too.
+    assert!(
+        !stderr.contains("serving from snapshot"),
+        "the strict path reached the serving state without a token; it must \
+         fail before serving. stderr was:\n{stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "`--strict-startup` must exit non-zero when no token can be acquired; \
+         it exited {:?}",
+        output.status
+    );
+    assert!(
+        stderr.contains("failed to acquire Google credentials"),
+        "the failure must be the credential acquisition itself, not a \
+         downstream symptom; stderr was:\n{stderr}"
+    );
+}
+
+/// Two dispatches racing the *first* open of a service.
+///
+/// The concurrent axis the P3 tests never covered: they all opened the first
+/// session from a single caller. `open_or_reuse` deliberately runs the
+/// handshake outside the cache lock, so a race here is documented as costing
+/// at most one redundant handshake -- this pins that documented bound rather
+/// than trusting the comment, and pins the invariant that actually matters:
+/// however many handshakes the race costs, exactly one session survives in
+/// the cache and every caller gets a working result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_dispatches_leave_exactly_one_cached_session() {
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+    let proxy = Arc::new(Proxy::new(
+        fake_auth("token-concurrent", TEST_PROJECT),
+        http,
+        vec![Route::from_endpoint(run)],
+    ));
+
+    let mut joined = tokio::task::JoinSet::new();
+    for n in 0..4 {
+        let proxy = Arc::clone(&proxy);
+        joined.spawn(async move {
+            proxy
+                .dispatch(
+                    &format!("run__{TOOL_ECHO}"),
+                    Some(
+                        json!({ "payload": format!("racer-{n}") })
+                            .as_object()
+                            .cloned()
+                            .expect("object"),
+                    ),
+                )
+                .await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(result) = joined.join_next().await {
+        results.push(result.expect("no dispatch task panics"));
+    }
+
+    assert_eq!(results.len(), 4);
+    for result in &results {
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "every racing caller must get a real result; got: {}",
+            result_text(result)
+        );
+    }
+    assert_eq!(
+        proxy.cached_sessions().await,
+        1,
+        "a race must not leave more than one session cached"
+    );
+    let handshakes = upstream.initialize_count();
+    assert!(
+        (1..=4).contains(&handshakes),
+        "a first-open race costs at most one handshake per racer and no more; \
+         saw {handshakes}"
+    );
+
+    // Whatever the race cost, the cache is settled afterwards: a further
+    // dispatch adds no handshake at all.
+    echo_ok(&proxy, "after-the-race").await;
+    assert_eq!(
+        upstream.initialize_count(),
+        handshakes,
+        "once the race settles the cached session must be reused"
+    );
+
+    upstream.server.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_idle_session_is_reopened_after_its_ttl() {
     let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;

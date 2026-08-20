@@ -188,6 +188,18 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
              failure is fatal here"
         );
         let auth = Arc::new(auth::AuthContext::new(&cfg).await?);
+        // Discovery is not acquisition. `AuthContext::new` only finds the
+        // credential chain; it mints nothing, so on its own it cannot tell a
+        // usable credential from a discoverable one. `--only` then skips
+        // Service Usage, which is the one call that would otherwise have
+        // forced a token, so without this the strict path could serve while
+        // reporting `credentials: ready` having never held a token -- a false
+        // ready being strictly worse than no readiness at all, and the exact
+        // failure this mode exists to prevent. Fatal here by design: that is
+        // what `--strict-startup` asks for.
+        auth.apply(&mut reqwest::header::HeaderMap::new())
+            .await
+            .context("acquiring Google credentials before serving (`--strict-startup`)")?;
         let exposure = server::resolve_enablement(&cfg, &auth, &http).await;
         let state = server::assemble_serve_catalog(catalog, &exposure.endpoints)?;
         state.publish_readiness(Readiness {

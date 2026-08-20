@@ -127,9 +127,23 @@ lto = "fat"
 # the shipped link step is covered by the startup probe, not by these.
 #
 # (`[profile.test]` inherits dev, not release, so `nextest` pays none of this.)
+# VALUE-MATCH FREEZE, not a diff against release: every key below is pinned to
+# its pre-P7 release default, and any NEW key added to `[profile.release]`
+# would otherwise be inherited here silently and de-freeze the instrument
+# without anyone noticing. Enumerated in full so that adding a key above is a
+# visible decision here too. `panic` is deliberately absent: cargo ignores it
+# for this profile and warns on every build if it is set, so pinning it would
+# buy a warning rather than a guarantee.
 [profile.bench]
+opt-level = 3
 codegen-units = 16
 lto = false
+debug = false
+debug-assertions = false
+overflow-checks = false
+rpath = false
+incremental = false
+strip = "none"
 
 # Micro-benchmarks over the committed 47-service / 548-tool snapshot. Each is a
 # divan binary (`harness = false`), so `cargo bench` runs them one after

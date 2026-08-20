@@ -44,6 +44,15 @@ pub const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// delay before a repaired credential is picked up.
 pub const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Budget for discovering the credential chain.
+///
+/// Separate from [`TOKEN_FETCH_TIMEOUT`] because it bounds a different thing:
+/// that one bounds the whole `fetch`, this one bounds the blocking discovery
+/// *inside* it (see [`drive_blocking`] for why an outer timeout cannot). Kept
+/// equal so a caller sees one budget rather than two, and so the outer bound
+/// stays the backstop rather than the thing that fires first.
+const DISCOVERY_TIMEOUT: Duration = TOKEN_FETCH_TIMEOUT;
+
 /// Lifetime granted to a token whose expiry is already in the past.
 ///
 /// A source can hand back a token that already looks expired locally, which in
@@ -128,14 +137,42 @@ impl TokenSource for LazyGcpTokenSource {
 /// runtime. A current-thread runtime (tests) has nothing to hand over to, so
 /// there the future is simply awaited.
 async fn discover_provider() -> Result<Arc<dyn gcp_auth::TokenProvider>, Error> {
+    drive_blocking(gcp_auth::provider(), DISCOVERY_TIMEOUT)
+        .await?
+        .map_err(Error::from)
+}
+
+/// Drive a future that blocks its thread, under a budget that actually fires.
+///
+/// The budget has to be applied **inside** the blocking region, and that is
+/// the whole point of this function existing. `block_in_place` hands the
+/// worker's queue away and then blocks the calling thread; a
+/// `timeout(..., block_in_place(...))` wrapped *outside* can never fire,
+/// because the timer future it races is on the very thread that is blocked and
+/// nothing polls it until the blocking work returns. The result was that
+/// [`TOKEN_FETCH_TIMEOUT`] could not bound credential discovery at all: a
+/// wedged metadata server or a hung `gcloud` held the token cache's lock for
+/// the life of the process, and every upstream call queued behind it forever
+/// with a restart as the only exit.
+///
+/// A current-thread runtime has no queue to hand over, so there the future is
+/// awaited and the timeout is an ordinary one.
+async fn drive_blocking<F>(future: F, budget: Duration) -> Result<F::Output, Error>
+where
+    F: Future + Send,
+    F::Output: Send,
+{
     let handle = tokio::runtime::Handle::current();
-    let discovered = match handle.runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(gcp_auth::provider()))
-        }
-        _ => gcp_auth::provider().await,
-    };
-    discovered.map_err(Error::from)
+    match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+            handle
+                .block_on(tokio::time::timeout(budget, future))
+                .map_err(|_elapsed| Error::TokenFetchTimeout(budget))
+        }),
+        _ => tokio::time::timeout(budget, future)
+            .await
+            .map_err(|_elapsed| Error::TokenFetchTimeout(budget)),
+    }
 }
 
 /// Request a token for [`SCOPES`] from `provider` and convert its expiry.
@@ -317,7 +354,16 @@ impl AuthContext {
                     ));
                 }
             };
-            state.token = Some(CachedToken::from_fetched(fetched)?);
+            // Not `?`: this can fail *after* a successful fetch, on a token
+            // that cannot be rendered as a header. Letting that escape without
+            // recording it sends the next call back down the whole credential
+            // chain, which is a retry storm for as long as the source keeps
+            // producing the same unusable token.
+            let cached = match CachedToken::from_fetched(fetched) {
+                Ok(cached) => cached,
+                Err(error) => return Err(Self::hold_failure(&mut state, error)),
+            };
+            state.token = Some(cached);
             state.failure = None;
             state.generation += 1;
         }
@@ -618,6 +664,150 @@ mod tests {
             .expect_err("the source is still broken, so the retry fails too");
         assert!(matches!(retried, Error::QuotaProjectUnresolved));
         assert_eq!(source.calls(), 2, "exactly one retry after the cooldown");
+    }
+
+    /// A slow source, to keep concurrent callers overlapping inside `apply`.
+    struct SlowSource {
+        calls: AtomicUsize,
+    }
+
+    impl TokenSource for SlowSource {
+        fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(FetchedToken {
+                    value: Zeroizing::new("single-flight".to_owned()),
+                    expires_at: None,
+                })
+            })
+        }
+    }
+
+    /// Concurrent `apply` calls must produce exactly one fetch.
+    ///
+    /// The single-flight property is what stops a burst of dispatches from
+    /// turning into a burst of credential requests, and it is asserted on the
+    /// axis the other auth tests never exercise: several callers inside
+    /// `apply` at once, on a runtime with real worker threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_applies_trigger_exactly_one_fetch() {
+        let source = Arc::new(SlowSource {
+            calls: AtomicUsize::new(0),
+        });
+        let ctx = Arc::new(
+            AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
+                .expect("valid inputs"),
+        );
+
+        let mut joined = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let ctx = Arc::clone(&ctx);
+            joined.spawn(async move { ctx.apply(&mut HeaderMap::new()).await });
+        }
+        while let Some(result) = joined.join_next().await {
+            result
+                .expect("no task panics")
+                .expect("every concurrent caller gets the token");
+        }
+
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            1,
+            "eight concurrent callers must share one fetch, not race the \
+             credential source"
+        );
+    }
+
+    /// Discovery must be bounded on the runtime that actually blocks.
+    ///
+    /// `#[tokio::test]` alone is a current-thread runtime, where
+    /// `block_in_place` is never taken and the bug is unreachable -- which is
+    /// exactly why it survived: the branch that ships is the one no test
+    /// entered. `flavor = "multi_thread"` is what makes this a regression
+    /// test rather than a tautology.
+    ///
+    /// Not `start_paused`: a paused clock does not advance while a thread is
+    /// blocked outside the runtime, so the wall-clock budget is the point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_discovery_is_bounded_by_its_own_budget() {
+        let started = std::time::Instant::now();
+        let outcome: Result<(), Error> =
+            drive_blocking(std::future::pending::<()>(), Duration::from_millis(150)).await;
+
+        let error = outcome.expect_err("a future that never resolves must hit the budget");
+        assert!(
+            matches!(error, Error::TokenFetchTimeout(budget) if budget == Duration::from_millis(150)),
+            "expected the discovery budget to fire, got: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget fired only after {:?}; if this hangs instead, the \
+             timeout is outside the blocking region again",
+            started.elapsed()
+        );
+    }
+
+    /// A token whose *value* cannot become a header must cool down like any
+    /// other failure.
+    ///
+    /// `CachedToken::from_fetched` can fail after a successful fetch -- a token
+    /// carrying a byte no `HeaderValue` accepts. That error left `apply`
+    /// through `?` without ever reaching `hold_failure`, so nothing was
+    /// recorded and the very next call walked the whole credential chain
+    /// again: a retry storm against ADC for as long as the source keeps
+    /// handing back the same unusable token.
+    struct MalformedToken {
+        calls: AtomicUsize,
+    }
+
+    impl TokenSource for MalformedToken {
+        fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(FetchedToken {
+                    // A newline is legal in a Rust string and illegal in a
+                    // header value, so this fails in `from_fetched`, after the
+                    // fetch has already "succeeded".
+                    value: Zeroizing::new("bad\ntoken".to_owned()),
+                    expires_at: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_token_that_cannot_become_a_header_still_starts_the_cooldown() {
+        let source = Arc::new(MalformedToken {
+            calls: AtomicUsize::new(0),
+        });
+        let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
+            .expect("valid inputs");
+
+        let first = ctx
+            .apply(&mut HeaderMap::new())
+            .await
+            .expect_err("a token that cannot be rendered as a header must fail");
+        assert!(
+            matches!(first, Error::InvalidHeader(_)),
+            "the caller should see why it failed, got: {first}"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+        let second = ctx
+            .apply(&mut HeaderMap::new())
+            .await
+            .expect_err("still broken");
+        assert!(
+            matches!(second, Error::CredentialsCoolingDown { .. }),
+            "the failure must be held like any other, got: {second}"
+        );
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            1,
+            "a malformed token must not send the next call back down the \
+             credential chain"
+        );
     }
 
     #[tokio::test(start_paused = true)]

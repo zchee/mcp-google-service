@@ -699,7 +699,19 @@ Monotonic in path length and consistent in magnitude: the 30-character
 target-dir difference in the last row costs 688 B, the 7-character difference
 in the first costs ~144 B, i.e. roughly one path copy per compilation unit.
 So the 832 B spread across this section's builds is explained, not noise, and
-any future byte-for-byte comparison has to hold both paths fixed. Release link time goes from ~40 s to ~112 s; the
+any future byte-for-byte comparison has to hold both paths fixed.
+
+**Mechanism, corrected.** An earlier draft of this section blamed DWARF. It is
+not DWARF: the linked Mach-O has **no `__DWARF` segment at all** (`size -m`
+lists only `__PAGEZERO`, `__TEXT`, `__DATA_CONST`, `__DATA`, `__LINKEDIT`).
+On this target the linker leaves debug info in the `.o` files and writes a
+*debug map* into the symbol table instead -- **24 `N_OSO` stabs, each carrying
+an absolute `.o` path**, which `nm -ap` shows pointing straight at the
+target-dir (`.../target-alloc/release/deps/...`). That is what moves with path
+length, and the arithmetic then lands: 24 entries x 30 characters = 720 B
+predicted against 688 B observed. The "one path copy per compilation unit"
+reading was right; the thing being counted is OSO entries, not DWARF DIEs.
+`strip = "none"` is still why they survive. Release link time goes from ~40 s to ~112 s; the
 test profile inherits dev, so `nextest` pays none of it.
 
 **`lto = "thin"` is worse than no LTO at all here** -- the obvious "safe

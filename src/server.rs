@@ -106,6 +106,14 @@ impl CatalogState {
     }
 
     /// Publish a readiness transition to every reader.
+    ///
+    /// `send_replace` rather than `send`: it is load-bearing that this
+    /// succeeds with no receivers subscribed, which is the normal case --
+    /// `list_services` reads through [`CatalogState::readiness`], which
+    /// borrows rather than subscribing, so a startup that publishes before
+    /// anyone calls `readiness_watch` must not fail. `send` returns `Err` when
+    /// the channel has no receivers, and swallowing that would be the same
+    /// silence with an extra step.
     pub fn publish_readiness(&self, readiness: Readiness) {
         self.readiness.send_replace(readiness);
     }
