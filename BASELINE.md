@@ -335,6 +335,85 @@ What the caller sees between startup and readiness is documented in
 `only_never_consults_service_usage`,
 `a_credential_failure_is_reported_by_list_services_and_returned_by_call`).
 
+### 8a. Review follow-up: the blocking discovery, the cooldown, flat mode
+
+Final P2 binary: 31,586,464 bytes, sha256
+`a4793fb00cb8d8702a5c87951a2b758f4b888eabd1a27656a2d1a79dbc6228f5`, built
+2026-08-20T15:55:35+0900 with `env -u RUSTFLAGS cargo build --release`.
+Everything in this subsection was measured on it (the one-worker probe
+"before" on its predecessor, which differed only by the `block_in_place`).
+
+**A stall the first table hid.** Re-measuring while the machine was busy
+(load average 5-10 from desktop applications) turned the real and offline
+distributions bimodal (22 ms or ~50 ms). Pinning tokio to one worker
+(`TOKIO_WORKER_THREADS=1`, offline, 10 runs) made every run slow -- min 124 /
+median 162 / max 169 ms -- which isolated the cause: gcp_auth's credential
+discovery does ~120 ms of *blocking* work (system trust-store load, key
+parsing) inside an async fn, and the background task polled it on a runtime
+worker right after `initialize`, holding that worker's queue, including the
+MCP session's own tasks, until it finished. On sixteen workers that only
+showed when the OS was slow to let another worker steal the queue; on one it
+showed every time. Discovery now runs behind `tokio::task::block_in_place`
+(`auth::discover_provider`), so the worker hands its queue over before
+blocking; the same one-worker diagnostic afterwards: min 21 / median 52 /
+max 56 ms, i.e. the 120 ms is gone and what is left is the machine.
+
+**What is left is the machine.** The control for that claim: `print-catalog`
+(no MCP session, no background task) timed through the same harness during the
+same busy window gave min 24.00 / median 56.09 / max 61.16 ms, against 22.6 ms
++- 0.6 from hyperfine minutes earlier and 26 ms in section 1. The ~30 ms slow
+mode is process-spawn and scheduling latency under load, paid equally by
+everything the harness starts, and not a property of `serve`. Final numbers
+below were taken with a `print-catalog` control run before and after, so the
+environment they were taken in is on record:
+
+| Run | 20 serial runs | min | **median** | p95 | max | mean |
+|---|---|---:|---:|---:|---:|---:|
+| control before: `--print-catalog` | load avg 8.8 | 24.18 | **54.54** | 58.69 | 59.44 | 46.00 |
+| real (two-tier) | `--runs 20` | 28.69 | **51.50** | 55.30 | 56.73 | 47.80 |
+| `--offline` | `--offline --runs 20` | 20.35 | **50.99** | 55.47 | 58.69 | 43.90 |
+| real, `--flat` (`--expose flat`, implies strict) | `--flat --runs 20` | 1039.91 | **1905.14** | 2450.93 | 2583.45 | 1960.89 |
+| control after: `--print-catalog` | load avg 8.0 | 22.93 | **56.47** | 59.08 | 60.05 | 50.14 |
+
+Per-run values, sorted:
+
+- real: 28.69 30.34 36.80 37.27 39.14 45.37 45.99 50.51 50.93 51.18 51.83 52.04
+  52.69 52.70 54.18 54.29 54.69 55.24 55.30 56.73
+- offline: 20.35 21.34 22.74 24.05 30.61 36.39 38.41 45.16 47.65 50.88 51.10
+  52.32 53.06 53.20 53.90 54.11 54.29 54.30 55.47 58.69
+- flat: 1039.91 1278.75 1799.77 1814.99 1842.26 1851.71 1870.11 1871.63 1883.05
+  1904.61 1905.68 1915.52 1925.97 1958.83 2199.41 2283.28 2390.39 2447.63
+  2450.93 2583.45
+
+Reading: under this load, two-tier real (51.5), offline (51.0) and the
+network-free control (54.5 / 56.5) are the same distribution -- the serve path
+costs nothing beyond spawning a process here -- and the quiet-machine figures
+in the first table (22.84 / 22.78 ms) remain the intrinsic numbers. The
+acceptance (median < 160 ms) holds in both environments with a 3-7x margin.
+
+Flat mode is measured separately because it is *not* expected to move:
+
+Flat stays on the network-bound path by design: its tool list is fixed at
+`initialize` and there is no `listChanged`, so the exposed set must be final
+before serving. The alternative was considered and rejected: flat could serve
+every configured service unpruned and let a disabled API fail at call time
+with the existing `SERVICE_DISABLED` remediation, which would make it start as
+fast as two-tier, but it would hand the client tools that cannot be used and
+the remediation only helps after a failed call; listing unusable tools
+degrades the model's view of the world. (The flat probe reads the multi-MB
+`tools/list` line with `grep -m1` rather than bash's byte-at-a-time `read`,
+which would otherwise add seconds of its own; the grep spawn is noise at this
+scale.)
+
+Failure-path guard added after review: a failed or timed-out token fetch is
+held for 30 s (`FETCH_FAILURE_COOLDOWN`), during which every `call` returns
+the same classified failure at once with a retry horizon instead of re-walking
+gcp_auth's retry chain (~750 ms of back-off plus discovery, or the full 30 s
+timeout for a wedged source); the first call after the window retries, so a
+repaired credential still needs no restart. Unit-tested with a counting source
+(`a_failed_fetch_is_not_retried_until_the_cooldown_passes`,
+`a_repaired_source_is_picked_up_after_the_cooldown_without_a_restart`).
+
 Not done here, on purpose: the gcp_auth native-root-store load (~120 ms) still
 precedes the first `call`; replacing it with bundled roots is a security
 decision for team-verify, not a P2 change. Binary grew by 1,115,552 bytes

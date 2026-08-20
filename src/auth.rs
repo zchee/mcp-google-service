@@ -26,6 +26,17 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 /// it with no upper bound.
 const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a failed fetch is held against the source before it is retried.
+///
+/// A broken credential is expensive to re-discover: gcp_auth retries a failing
+/// token endpoint five times with back-off (~750 ms), probes the metadata
+/// server, and finally shells out to `gcloud`, and a wedged source costs the
+/// whole [`TOKEN_FETCH_TIMEOUT`]. Without this window every `call` would pay
+/// that again just to return the same error. Within it the first failure is
+/// returned at once; after it, one call retries, so a repaired credential is
+/// picked up without a restart.
+const FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Lifetime granted to a token whose expiry is already in the past.
 ///
 /// A source can hand back a token that already looks expired locally, which in
@@ -79,9 +90,10 @@ impl TokenSource for GcpTokenSource {
 /// own HTTP client (~120 ms on macOS) and, for a gcloud `authorized_user`
 /// file, exchanges the refresh token eagerly (a network round trip). Deferring
 /// it to the first token request keeps both off the startup path. A discovery
-/// that fails is not cached, so an operator who repairs their credentials
-/// (`gcloud auth application-default login`) is picked up by the next call
-/// without a restart.
+/// that fails is not cached here, so an operator who repairs their credentials
+/// (`gcloud auth application-default login`) is picked up without a restart --
+/// by the first call after [`FETCH_FAILURE_COOLDOWN`], which [`AuthContext`]
+/// enforces so a broken chain is not re-walked on every call.
 #[derive(Default)]
 struct LazyGcpTokenSource {
     provider: OnceCell<Arc<dyn gcp_auth::TokenProvider>>,
@@ -90,13 +102,33 @@ struct LazyGcpTokenSource {
 impl TokenSource for LazyGcpTokenSource {
     fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
         Box::pin(async {
-            let provider = self
-                .provider
-                .get_or_try_init(|| async { gcp_auth::provider().await.map_err(Error::from) })
-                .await?;
+            let provider = self.provider.get_or_try_init(discover_provider).await?;
             fetch_from(&**provider).await
         })
     }
+}
+
+/// Run gcp_auth's credential discovery without stalling the runtime.
+///
+/// `gcp_auth::provider()` is an async fn with blocking work inside it: it
+/// loads the system trust store (~120 ms on macOS), parses keys, and may
+/// spawn `gcloud`. Polled directly on a multi-thread worker it holds that
+/// worker -- and whatever else sits in its queue, such as the MCP session's
+/// own tasks -- for the duration; measured, that turned a 22 ms `tools/list`
+/// into ~160 ms on one worker and into a 22/50 ms coin toss on sixteen under
+/// load. `block_in_place` hands the worker's queue to a fresh thread first,
+/// and `Handle::block_on` still drives the discovery's network I/O on the
+/// runtime. A current-thread runtime (tests) has nothing to hand over to, so
+/// there the future is simply awaited.
+async fn discover_provider() -> Result<Arc<dyn gcp_auth::TokenProvider>, Error> {
+    let handle = tokio::runtime::Handle::current();
+    let discovered = match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(gcp_auth::provider()))
+        }
+        _ => gcp_auth::provider().await,
+    };
+    discovered.map_err(Error::from)
 }
 
 /// Request a token for [`SCOPES`] from `provider` and convert its expiry.
@@ -156,13 +188,30 @@ fn floor_expiry(expires_at: Option<Instant>) -> Option<Instant> {
     })
 }
 
+/// The most recent failed fetch, held against the source for
+/// [`FETCH_FAILURE_COOLDOWN`].
+struct RecentFailure {
+    /// When the failure was observed, on tokio's clock so tests can advance it.
+    at: tokio::time::Instant,
+    /// The failure, already rendered; the original error is not `Clone`.
+    cause: String,
+}
+
+/// What the cache lock guards: the live token, and the failure that stands
+/// in for it while the source is cooling down.
+#[derive(Default)]
+struct CacheState {
+    token: Option<CachedToken>,
+    failure: Option<RecentFailure>,
+}
+
 /// Authenticated outbound context: cached ADC token plus quota project.
 ///
 /// Cloneable-by-reference via `Arc`; safe to share across tasks.
 pub struct AuthContext {
     source: Arc<dyn TokenSource>,
     quota_project: HeaderValue,
-    cached: Mutex<Option<CachedToken>>,
+    cached: Mutex<CacheState>,
 }
 
 impl AuthContext {
@@ -194,7 +243,7 @@ impl AuthContext {
         Ok(Self {
             source,
             quota_project: HeaderValue::from_str(quota_project)?,
-            cached: Mutex::new(None),
+            cached: Mutex::default(),
         })
     }
 
@@ -205,22 +254,56 @@ impl AuthContext {
     /// cache lock is held across the refresh, so concurrent callers trigger
     /// a single upstream fetch (single-flight), and that fetch is bounded by
     /// [`TOKEN_FETCH_TIMEOUT`] so a stalled credential source cannot pin the
-    /// lock indefinitely.
+    /// lock indefinitely. A fetch that fails, or times out, is not retried for
+    /// [`FETCH_FAILURE_COOLDOWN`]: until then every call fails at once with
+    /// [`Error::CredentialsCoolingDown`] carrying the original failure.
     pub async fn apply(&self, headers: &mut HeaderMap) -> Result<(), Error> {
-        let mut cached = self.cached.lock().await;
-        if cached
+        let mut state = self.cached.lock().await;
+        if state
+            .token
             .as_ref()
             .is_none_or(|tok| tok.is_stale(Instant::now()))
         {
-            let fetched = tokio::time::timeout(TOKEN_FETCH_TIMEOUT, self.source.fetch())
-                .await
-                .map_err(|_elapsed| Error::TokenFetchTimeout(TOKEN_FETCH_TIMEOUT))??;
-            *cached = Some(CachedToken::from_fetched(fetched)?);
+            if let Some(failure) = &state.failure {
+                let age = failure.at.elapsed();
+                if age < FETCH_FAILURE_COOLDOWN {
+                    return Err(Error::CredentialsCoolingDown {
+                        cause: failure.cause.clone(),
+                        retry_after_secs: (FETCH_FAILURE_COOLDOWN - age).as_secs().max(1),
+                    });
+                }
+            }
+            let fetched = match tokio::time::timeout(TOKEN_FETCH_TIMEOUT, self.source.fetch()).await
+            {
+                Ok(Ok(fetched)) => fetched,
+                Ok(Err(error)) => return Err(Self::hold_failure(&mut state, error)),
+                Err(_elapsed) => {
+                    return Err(Self::hold_failure(
+                        &mut state,
+                        Error::TokenFetchTimeout(TOKEN_FETCH_TIMEOUT),
+                    ));
+                }
+            };
+            state.token = Some(CachedToken::from_fetched(fetched)?);
+            state.failure = None;
         }
-        let token = cached.as_ref().expect("token cache populated just above");
+        let token = state
+            .token
+            .as_ref()
+            .expect("token cache populated just above");
         headers.insert(AUTHORIZATION, token.header.clone());
         headers.insert(USER_PROJECT_HEADER, self.quota_project.clone());
         Ok(())
+    }
+
+    /// Record `error` as the failure the source is cooling down from, and hand
+    /// it back unchanged for this call.
+    fn hold_failure(state: &mut CacheState, error: Error) -> Error {
+        state.failure = Some(RecentFailure {
+            at: tokio::time::Instant::now(),
+            cause: error.to_string(),
+        });
+        error
     }
 }
 
@@ -373,12 +456,152 @@ mod tests {
         }
 
         // The lock must be free afterwards, or one wedged fetch would take the
-        // whole process down with it.
+        // whole process down with it -- and the wedged source must not be
+        // waited on again at once, or every call would hang for the budget.
         let second = ctx
             .apply(&mut HeaderMap::new())
             .await
-            .expect_err("the second attempt also times out");
-        assert!(matches!(second, Error::TokenFetchTimeout(_)));
+            .expect_err("the second attempt fails while the source cools down");
+        match second {
+            Error::CredentialsCoolingDown { cause, .. } => {
+                assert!(cause.contains("timed out"), "cause: {cause}");
+            }
+            other => panic!("expected the cooled-down failure, got: {other}"),
+        }
+
+        // Once the cooldown has passed the source is tried again, and times
+        // out again.
+        tokio::time::advance(FETCH_FAILURE_COOLDOWN).await;
+        let third = ctx
+            .apply(&mut HeaderMap::new())
+            .await
+            .expect_err("after the cooldown the hanging source is retried");
+        assert!(matches!(third, Error::TokenFetchTimeout(_)));
+    }
+
+    /// A source that fails a set number of times, then answers, counting
+    /// every attempt.
+    struct FlakySource {
+        failures_left: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl FlakySource {
+        fn failing(times: usize) -> Arc<Self> {
+            Arc::new(Self {
+                failures_left: AtomicUsize::new(times),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TokenSource for FlakySource {
+        fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(async move {
+                if fail {
+                    Err(Error::QuotaProjectUnresolved)
+                } else {
+                    Ok(FetchedToken {
+                        value: Zeroizing::new("token-after-repair".to_owned()),
+                        expires_at: None,
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fetch_is_not_retried_until_the_cooldown_passes() {
+        let source = FlakySource::failing(usize::MAX);
+        let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
+            .expect("valid inputs");
+
+        let first = ctx
+            .apply(&mut HeaderMap::new())
+            .await
+            .expect_err("the source fails");
+        assert!(matches!(first, Error::QuotaProjectUnresolved));
+        assert_eq!(source.calls(), 1);
+
+        // Back-to-back calls must not pay the source's failure path again:
+        // they get the same classified text, at once, with a retry horizon.
+        for _ in 0..3 {
+            let held = ctx
+                .apply(&mut HeaderMap::new())
+                .await
+                .expect_err("still failing, without a new attempt");
+            match held {
+                Error::CredentialsCoolingDown {
+                    cause,
+                    retry_after_secs,
+                } => {
+                    assert_eq!(cause, Error::QuotaProjectUnresolved.to_string());
+                    assert!(
+                        (1..=FETCH_FAILURE_COOLDOWN.as_secs()).contains(&retry_after_secs),
+                        "retry horizon must be within the cooldown: {retry_after_secs}s"
+                    );
+                }
+                other => panic!("expected the cooled-down failure, got: {other}"),
+            }
+        }
+        assert_eq!(
+            source.calls(),
+            1,
+            "no call during the cooldown may reach the source"
+        );
+
+        tokio::time::advance(FETCH_FAILURE_COOLDOWN).await;
+        let retried = ctx
+            .apply(&mut HeaderMap::new())
+            .await
+            .expect_err("the source is still broken, so the retry fails too");
+        assert!(matches!(retried, Error::QuotaProjectUnresolved));
+        assert_eq!(source.calls(), 2, "exactly one retry after the cooldown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repaired_source_is_picked_up_after_the_cooldown_without_a_restart() {
+        let source = FlakySource::failing(1);
+        let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
+            .expect("valid inputs");
+
+        ctx.apply(&mut HeaderMap::new())
+            .await
+            .expect_err("the first attempt fails");
+        ctx.apply(&mut HeaderMap::new())
+            .await
+            .expect_err("inside the cooldown the failure is held");
+        assert_eq!(source.calls(), 1);
+
+        tokio::time::advance(FETCH_FAILURE_COOLDOWN).await;
+        let mut headers = HeaderMap::new();
+        ctx.apply(&mut headers)
+            .await
+            .expect("the repaired source answers on the retry");
+        assert_eq!(source.calls(), 2);
+        assert_eq!(
+            headers.get(AUTHORIZATION).map(|v| v.to_str().ok()),
+            Some(Some("Bearer token-after-repair")),
+            "the recovered token must be the one attached"
+        );
+
+        // And the recovery clears the failure: the next call is served from
+        // the cache, touching neither the source nor the cooldown.
+        ctx.apply(&mut HeaderMap::new())
+            .await
+            .expect("cached token");
+        assert_eq!(source.calls(), 2);
     }
 
     #[test]

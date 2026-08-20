@@ -66,6 +66,24 @@ pub enum Error {
     )]
     TokenFetchTimeout(Duration),
 
+    /// A token fetch failed recently and is not retried until a cooldown
+    /// passes; `cause` is the failure that started it.
+    ///
+    /// Rendered with the original failure first so a caller sees the same
+    /// classified text as the call that hit it, then told when a retry
+    /// happens and what to fix meanwhile.
+    #[error(
+        "{cause}; the credential source is not retried for another \
+         {retry_after_secs}s after a failure, so fix it (for Application Default \
+         Credentials: `gcloud auth application-default login`) and call again"
+    )]
+    CredentialsCoolingDown {
+        /// The failure being held against the source, already rendered.
+        cause: String,
+        /// Seconds until the next call retries the source.
+        retry_after_secs: u64,
+    },
+
     /// A resolved value cannot be carried in an HTTP header.
     #[error("value is not a valid HTTP header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),

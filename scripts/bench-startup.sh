@@ -53,6 +53,7 @@ SLEEP=1
 TIMEOUT=60
 KEEP_LOGS=0
 STRICT=0
+FLAT=0
 
 usage() {
     cat <<EOF
@@ -69,6 +70,9 @@ usage: $(basename "$0") [--runs N] [--bin PATH] [--project ID] [--sleep SECS]
   --keep-logs     keep each run's stderr under the temp dir printed at the end
   --strict        pass --strict-startup to the server (credentials and
                   enablement resolved before serving, the pre-P2 path)
+  --flat          pass --expose flat (implies strict startup; the tools/list
+                  response is the whole pruned catalog, so it is read with
+                  grep rather than bash's byte-at-a-time \`read\`)
   --offline       stub credentials + dead proxy; see the header comment
   --print-catalog time the \`print-catalog\` subcommand instead of an MCP session
 EOF
@@ -83,6 +87,7 @@ while (( $# )); do
         --timeout) TIMEOUT=$2; shift 2 ;;
         --keep-logs) KEEP_LOGS=1; shift ;;
         --strict) STRICT=1; shift ;;
+        --flat) FLAT=1; shift ;;
         --offline) MODE=offline; shift ;;
         --print-catalog) MODE=print-catalog; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -216,7 +221,7 @@ BIN_SHA=$(shasum -a 256 "$BIN" | cut -d' ' -f1)
 TOOLCHAIN=$(cd "$ROOT" && rustc --version 2>/dev/null || echo "rustc: not on PATH")
 CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -p)
 
-echo "bench-startup: mode=$MODE runs=$RUNS sleep=${SLEEP}s timeout=${TIMEOUT}s strict-startup=$( (( STRICT )) && echo yes || echo no )"
+echo "bench-startup: mode=$MODE runs=$RUNS sleep=${SLEEP}s timeout=${TIMEOUT}s strict-startup=$( (( STRICT )) && echo yes || echo no ) expose=$( (( FLAT )) && echo flat || echo two-tier )"
 echo "  binary:    $BIN"
 echo "  size:      $BIN_SIZE bytes  sha256=$BIN_SHA  mtime=$BIN_MTIME"
 echo "  toolchain: $TOOLCHAIN  RUSTFLAGS=<unset>"
@@ -283,6 +288,7 @@ run_mcp_once() {
     local -a cmd=("$BIN")
     [[ -n $PROJECT ]] && cmd+=(--project "$PROJECT")
     (( STRICT )) && cmd+=(--strict-startup)
+    (( FLAT )) && cmd+=(--expose flat)
 
     t0=$EPOCHREALTIME
     coproc SRV { exec "${cmd[@]}" 2>"$log"; }
@@ -293,9 +299,23 @@ run_mcp_once() {
     line=$(read_until_id "$out" 1) || fail_run "$n" "$log" "no initialize response within ${TIMEOUT}s (or the server exited)"
     [[ $line == *'"result"'* ]] || fail_run "$n" "$log" "initialize was answered with an error: $line"
     printf '%s\n%s\n' "$INITIALIZED_NOTE" "$LIST_REQ" >&"$in" || fail_run "$n" "$log" "server closed stdin before tools/list"
-    line=$(read_until_id "$out" 2) || fail_run "$n" "$log" "no tools/list response within ${TIMEOUT}s (or the server exited)"
-    t1=$EPOCHREALTIME
-    [[ $line == *'"tools"'* ]] || fail_run "$n" "$log" "tools/list was answered with an error: $line"
+    if (( FLAT )); then
+        # The flat tools/list response is one multi-megabyte line; bash's
+        # `read` takes it a byte at a time and would add seconds of its own.
+        # grep reads in blocks and exits on the first matching line.
+        local -a waiter=(grep -m 1 -E '"id": ?2[,}]')
+        command -v timeout >/dev/null && waiter=(timeout "$TIMEOUT" "${waiter[@]}")
+        "${waiter[@]}" <&"$out" >"$WORK/run-$n.tools-list" \
+            || fail_run "$n" "$log" "no tools/list response within ${TIMEOUT}s (or the server exited)"
+        t1=$EPOCHREALTIME
+        grep -q '"tools"' "$WORK/run-$n.tools-list" \
+            || fail_run "$n" "$log" "tools/list was answered with an error: $(head -c 300 "$WORK/run-$n.tools-list")"
+        (( KEEP_LOGS )) || rm -f "$WORK/run-$n.tools-list"
+    else
+        line=$(read_until_id "$out" 2) || fail_run "$n" "$log" "no tools/list response within ${TIMEOUT}s (or the server exited)"
+        t1=$EPOCHREALTIME
+        [[ $line == *'"tools"'* ]] || fail_run "$n" "$log" "tools/list was answered with an error: $line"
+    fi
 
     # Closing stdin is the client going away; the server shuts down on EOF.
     exec {in}>&- 2>/dev/null || true

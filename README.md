@@ -194,6 +194,16 @@ would leave the client offering tools the server no longer has and hiding tools
 it does. Flat therefore keeps serving the catalog it started with; restart the
 server to pick up a changed upstream tool set.
 
+For the same reason flat mode resolves credentials and the enabled-API list
+*before* serving (it implies `--strict-startup`), so its time to the first tool
+response stays at the network-bound figure (~1.8 s on the reference machine)
+while two-tier's is ~23 ms. The alternative -- serving every configured
+service unpruned and letting a disabled API fail at call time with the
+`SERVICE_DISABLED` remediation -- would make flat start as fast, but it would
+hand the client a tool list containing tools that cannot be used, and the
+remediation only helps after a failed call; listing unusable tools degrades
+the model's view of the world, so it was rejected.
+
 ## Command-line interface
 
 ```
@@ -287,7 +297,7 @@ startup; the rest are reported and survivable.
 
 | Message begins | Meaning | Fix |
 |---|---|---|
-| `could not attach Google credentials: failed to acquire Google credentials via ADC` (on `call`) / `failed to acquire Google credentials via ADC` (at startup with `--strict-startup`) | No usable Application Default Credentials were found, or the credential source refused. By default this is reported by `list_services` (`readiness: failed`, the reason in `startup.credentials_error`) and returned by every `call` until a later attempt succeeds; with `--strict-startup` it ends the process before anything is served. | `gcloud auth application-default login`, then retry the call; no restart is needed unless `--strict-startup` was used. |
+| `could not attach Google credentials: failed to acquire Google credentials via ADC` (on `call`) / `failed to acquire Google credentials via ADC` (at startup with `--strict-startup`) | No usable Application Default Credentials were found, or the credential source refused. By default this is reported by `list_services` (`readiness: failed`, the reason in `startup.credentials_error`) and returned by every `call` until a later attempt succeeds; with `--strict-startup` it ends the process before anything is served. A failed (or timed-out) fetch is not retried for 30 s: calls inside that window return the same text at once, suffixed `the credential source is not retried for another Ns`, instead of each paying the credential chain's own retries. | `gcloud auth application-default login`, then retry the call; no restart is needed unless `--strict-startup` was used. |
 | `the resolved quota project is neither a valid Google Cloud project id nor a project number` | The resolved value matches neither grammar. It may have come from `GOOGLE_MCP_QUOTA_PROJECT`, `GOOGLE_CLOUD_PROJECT` or the ADC file, not just `--project`, and it is never echoed back. | Pass an id (`my-project`) or a number (`123456789012`). Check the environment and `quota_project_id` in the ADC file. |
 | `catalog snapshot {path} could not be read` / `is not a valid catalog snapshot` | An explicit `--snapshot <PATH>` is missing or unparseable. Never falls back. | Fix the path, or drop the flag to use the embedded snapshot. |
 | `acquiring a Google access token timed out after 30s` | The credential source (ADC, metadata server, `gcloud`) did not answer. | Check `gcloud auth application-default print-access-token`, or the metadata server's reachability. |

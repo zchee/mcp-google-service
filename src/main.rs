@@ -163,6 +163,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // default serves the configured selection at once with credentials
     // discovered on first use, and resolves both behind the handshake.
     let (auth, state, exposed, background) = if cfg.strict_startup {
+        tracing::info!(
+            reason = match cfg.expose {
+                ExposeMode::Flat => {
+                    "`--expose flat` fixes the tool list at `initialize`, so the \
+                     exposed set has to be final before anything is served"
+                }
+                ExposeMode::TwoTier => "`--strict-startup`",
+            },
+            "resolving credentials and enablement before serving; a credential \
+             failure is fatal here"
+        );
         let auth = Arc::new(auth::AuthContext::new(&cfg).await?);
         let exposure = server::resolve_enablement(&cfg, &auth, &http).await;
         let state = server::assemble_serve_catalog(snapshot, &exposure.endpoints)?;
