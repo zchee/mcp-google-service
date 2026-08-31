@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # rustup 1.28+ reads rust-toolchain.toml, so the pin and its
+      # components (clippy, rustfmt) come from the repo, not from CI.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # tests/live.rs self-skips without MCP_GOOGLE_LIVE=1, so this run
+      # stays hermetic; the gate failing open would fail the job instead
+      # of silently skipping.
+      - run: cargo nextest run
+      # nextest does not run doctests; keep them covered separately.
+      - run: cargo test --doc
+
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Mint the GitHub OIDC token codecov-action exchanges for an upload
+      # grant, replacing a long-lived CODECOV_TOKEN secret.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+      - name: Generate coverage
+        run: cargo llvm-cov nextest --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+          use_oidc: true
