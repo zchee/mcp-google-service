@@ -5,12 +5,12 @@ one process, one authentication model, and one namespaced tool surface.
 
 Google publishes MCP endpoints per service at
 `https://{service}.googleapis.com/mcp`. Registering them individually in an MCP
-client runs into three problems, all measured against the live endpoints on
-2026-08-19:
+client runs into three problems, all measured against the live endpoints
+(2026-08-19, re-measured 2026-08-31 after the registry grew to 65):
 
-- **548 tools across 47 endpoints**, which is far more than a model can be
+- **756 tools across 65 endpoints**, which is far more than a model can be
   offered at once.
-- **33 tool-name collisions** between services (several services publish a tool
+- **46 tool-name collisions** between services (several services publish a tool
   called `list_services`, for example).
 - **Hourly credential expiry.** Application Default Credentials access tokens
   expire after roughly an hour, so a client config holding a static
@@ -29,10 +29,10 @@ endpoints rather than assumed.
 | Design point | Evidence |
 |---|---|
 | One auth shape for every endpoint: `Authorization: Bearer <ADC token, scope cloud-platform>` plus `x-goog-user-project: <quota project>` | Verified against `run`, `bigquery`, `logging`, and `developerknowledge`; no per-endpoint branching was needed. |
-| Tool discovery needs no credentials | `initialize` and `tools/list` answered unauthenticated on all 47 hosts, which is what makes the bundled snapshot and the credential-free startup path possible. |
-| Prune to enabled APIs | Service Usage reports roughly 5 of the 47 APIs enabled on a typical project, so pruning removes the `SERVICE_DISABLED` failure mode before the model ever sees the tool. |
-| Namespace with `{service}__{tool}` | Eliminates all 33 collisions by construction, and the prefix is what dispatch routes on. |
-| Serve from a snapshot, refresh in the background | A full 47-host fan-out takes 7.6-8.8s. Doing it on the startup path would delay the first tool response by that much, so startup serves the bundled snapshot and swaps in live data when it arrives. |
+| Tool discovery needs no credentials | `initialize` and `tools/list` answered unauthenticated on all 65 endpoints (47 probed 2026-08-19, 18 more 2026-08-31), which is what makes the bundled snapshot and the credential-free startup path possible. |
+| Prune to enabled APIs | Service Usage reports roughly 5 of the registered APIs enabled on a typical project, so pruning removes the `SERVICE_DISABLED` failure mode before the model ever sees the tool. |
+| Namespace with `{service}__{tool}` | Eliminates all 46 collisions by construction, and the prefix is what dispatch routes on. |
+| Serve from a snapshot, refresh in the background | A full 65-endpoint fan-out takes 7.7-7.9s (measured 2026-08-31; concurrency 16 keeps it flat as the registry grows). Doing it on the startup path would delay the first tool response by that much, so startup serves the bundled snapshot and swaps in live data when it arrives. |
 
 Because the two-tier surface exposes a fixed set of four tools, swapping the
 catalog underneath the server needs no `listChanged` notification.
@@ -111,7 +111,7 @@ writes logs to stderr, so log output never corrupts the protocol stream.
 
 ## The tool surface
 
-By default the server exposes four meta-tools rather than 548 real ones.
+By default the server exposes four meta-tools rather than 756 real ones.
 Schemas load on demand, so the model gets exact argument shapes without paying
 for them up front.
 
@@ -241,13 +241,13 @@ mcp-google-service print-catalog
 ```
 
 ```
-generated_at: 2026-08-19T09:02:07Z
+generated_at: 2026-08-31T18:56:55Z
 
 SERVICE               TOOLS  SOURCE
 agentregistry            20  live
 alloydb                  17  live
 ...
-47 services             548
+65 services             756
 ```
 
 ### A note on `>` under zsh
@@ -308,8 +308,8 @@ startup; the rest are reported and survivable.
 
 ## The catalog snapshot
 
-`data/catalog-snapshot.json` is a committed, evidence-dated capture of all 47
-endpoints (548 tools, pinned 2026-08-19). It is embedded into the binary at
+`data/catalog-snapshot.json` is a committed, evidence-dated capture of all 65
+endpoints (756 tools, pinned 2026-08-31). It is embedded into the binary at
 compile time and serves three purposes: it makes startup fast, it lets a
 binary run without its repository, and it provides per-host fallback when a
 live fetch fails.
@@ -381,8 +381,8 @@ diff naming tools added, removed, and schema-changed.
 compares tool *name sets* and schema digests, not description text. The
 `cloudcli` endpoint serves per-replica description variants (`cloudcli__run_bq_command`
 flip-flops between wordings depending on which replica answers), so comparing
-descriptions would report drift forever. Tool names and counts are stable (548
-on every observed run). When reviewing a regenerated snapshot, expect
+descriptions would report drift forever. Tool names and counts are stable
+on every observed run. When reviewing a regenerated snapshot, expect
 description-only churn on `cloudcli` and disregard it; treat name or schema
 changes as real.
 

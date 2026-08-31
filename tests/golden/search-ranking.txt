@@ -23,6 +23,11 @@ cloudcli__run_gcloud_command
 
 query: list cloud run
 run__list_services
+# 2026-08-31 registry growth: the Colab Enterprise runtime-template tool
+# matches all three tokens in its name and outranks the gcloud escape hatch.
+# Pinned as observed; if ranking ever demotes name-substring matches, move
+# the cloudcli pair back up on purpose.
+vtx-notebook__colab_enterprise_list_notebook_runtime_templates
 cloudcli__run_gcloud_command
 cloudcli__run_bq_command
 
@@ -94,4 +99,6 @@ pubsub__list_topics
 # -- an exact bare tool name; two services expose it, ties break on name
 query: list_services
 agentregistry__list_services
+# 2026-08-31 registry growth: Cloud Billing publishes an exact-name match.
+cloudbilling__list_services
 run__list_services
