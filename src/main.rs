@@ -130,11 +130,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None => run_serve(cli.serve).await,
         Some(Command::Serve(args)) => run_serve(args).await,
-        Some(Command::Snapshot {
-            out,
-            allow_partial,
-            from,
-        }) => run_snapshot(out, allow_partial, from).await,
+        Some(Command::Snapshot { out, allow_partial, from }) => {
+            run_snapshot(out, allow_partial, from).await
+        }
         Some(Command::PrintCatalog) => run_print_catalog(),
     }
 }
@@ -160,13 +158,8 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         "parsed command line"
     );
 
-    let cfg = Config::resolve(
-        args.project,
-        args.only,
-        args.exclude,
-        args.expose,
-        args.strict_startup,
-    )?;
+    let cfg =
+        Config::resolve(args.project, args.only, args.exclude, args.expose, args.strict_startup)?;
     let http = proxy::shared_http_client().context("building the shared HTTP client")?;
     let catalog = catalog::serve_catalog(args.snapshot.as_deref())?;
     catalog::warn_on_registry_drift(&catalog.services);
@@ -242,10 +235,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         Arc::new(proxy::Proxy::from_endpoints(auth, http.clone(), &exposed)),
         cfg.expose,
     );
-    let running = handler
-        .serve(stdio())
-        .await
-        .context("starting the stdio MCP server")?;
+    let running = handler.serve(stdio()).await.context("starting the stdio MCP server")?;
 
     // `serve` returns once the client's `initialize` has been answered. Only
     // now does anything reach for the network, so neither credential
@@ -287,9 +277,7 @@ async fn run_snapshot(
     if let Some(path) = from {
         let snapshot = catalog::load_snapshot_file(&path)?;
         let generated_at = snapshot.generated_at.clone();
-        let catalog = snapshot
-            .into_catalog()
-            .context("validating the snapshot named by --from")?;
+        let catalog = snapshot.into_catalog().context("validating the snapshot named by --from")?;
         return write_snapshot_outputs(&catalog, generated_at, out);
     }
 
@@ -318,11 +306,7 @@ async fn run_snapshot(
             expected - reached
         );
     }
-    tracing::info!(
-        services = reached,
-        tools = catalog.tool_count(),
-        "catalog fan-out complete"
-    );
+    tracing::info!(services = reached, tools = catalog.tool_count(), "catalog fan-out complete");
 
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     write_snapshot_outputs(&catalog, generated_at, out)
@@ -359,9 +343,9 @@ fn write_snapshot_outputs(
                 "catalog archive written"
             );
         }
-        None => std::io::stdout()
-            .write_all(json.as_bytes())
-            .context("writing snapshot to stdout")?,
+        None => {
+            std::io::stdout().write_all(json.as_bytes()).context("writing snapshot to stdout")?
+        }
     }
     Ok(())
 }
@@ -417,8 +401,5 @@ fn init_tracing() {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 }

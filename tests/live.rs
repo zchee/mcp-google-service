@@ -56,10 +56,7 @@ fn live_project() -> Option<String> {
     let project = std::env::var(PROJECT_VAR).unwrap_or_else(|_| {
         panic!("{LIVE_GATE}=1 requires {PROJECT_VAR} to name the quota project to bill and prune against")
     });
-    assert!(
-        !project.trim().is_empty(),
-        "{PROJECT_VAR} must not be empty"
-    );
+    assert!(!project.trim().is_empty(), "{PROJECT_VAR} must not be empty");
     Some(project)
 }
 
@@ -82,16 +79,13 @@ impl LiveSession {
         let started = Instant::now();
         let transport = TokioChildProcess::new(command)
             .expect("the built binary must be spawnable for the live tier");
-        let client = ()
-            .serve(transport)
-            .await
-            .expect("the binary must complete the MCP initialize handshake");
+        let client =
+            ().serve(transport)
+                .await
+                .expect("the binary must complete the MCP initialize handshake");
         let ready_after = started.elapsed();
 
-        Self {
-            client,
-            ready_after,
-        }
+        Self { client, ready_after }
     }
 
     /// Invoke a two-tier meta-tool by name.
@@ -105,8 +99,7 @@ impl LiveSession {
 
     /// Dispatch a namespaced upstream tool through the two-tier `call` tool.
     async fn dispatch(&self, target: &str, arguments: Value) -> CallToolResult {
-        self.call("call", json!({ "name": target, "arguments": arguments }))
-            .await
+        self.call("call", json!({ "name": target, "arguments": arguments })).await
     }
 
     async fn shutdown(self) {
@@ -138,10 +131,7 @@ fn assert_live_dispatch_ok(target: &str, result: &CallToolResult) {
          verbatim rather than tolerated, because enabling an API on the \
          operator's project is their decision, not this test's:\n{text}"
     );
-    assert!(
-        !text.trim().is_empty(),
-        "live dispatch of `{target}` returned an empty result body"
-    );
+    assert!(!text.trim().is_empty(), "live dispatch of `{target}` returned an empty result body");
 }
 
 // ---------------------------------------------------------------------------
@@ -164,10 +154,7 @@ async fn live_run_list_services_dispatches_without_error() {
         )
         .await;
     assert_live_dispatch_ok("run__list_services", &result);
-    eprintln!(
-        "live run__list_services returned {} content block(s)",
-        result.content.len()
-    );
+    eprintln!("live run__list_services returned {} content block(s)", result.content.len());
 
     session.shutdown().await;
 }
@@ -229,9 +216,7 @@ async fn live_startup_and_first_tool_response_meet_their_latency_budgets() {
     // would report month-old tool definitions as freshly fetched.
     let payload: Value =
         serde_json::from_str(&result_text(&listed)).expect("list_services returns a JSON payload");
-    let services = payload["services"]
-        .as_array()
-        .expect("list_services reports a services array");
+    let services = payload["services"].as_array().expect("list_services reports a services array");
     assert!(
         !services.is_empty(),
         "the live tier must expose at least one service, or the provenance \
@@ -357,11 +342,8 @@ async fn live_background_catalog_refresh_completes_within_its_budget() {
         .expect("a live fan-out degrades per host rather than failing outright");
     let elapsed = started.elapsed();
 
-    let live_services = fresh
-        .services
-        .iter()
-        .filter(|s| s.source == catalog::CatalogSource::Live)
-        .count();
+    let live_services =
+        fresh.services.iter().filter(|s| s.source == catalog::CatalogSource::Live).count();
     eprintln!(
         "catalog refresh fan-out: {elapsed:?} for {} services ({live_services} live, {} tools)",
         fresh.services.len(),

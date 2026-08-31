@@ -137,11 +137,7 @@ impl Proxy {
         http: reqwest::Client,
         endpoints: &[&Endpoint],
     ) -> Self {
-        Self::new(
-            auth,
-            http,
-            endpoints.iter().map(|e| Route::from_endpoint(e)).collect(),
-        )
+        Self::new(auth, http, endpoints.iter().map(|e| Route::from_endpoint(e)).collect())
     }
 
     /// Resolve a service prefix to its route.
@@ -203,9 +199,8 @@ impl Proxy {
     ) -> Result<CallToolResult, String> {
         let (service_id, tool_name) = split_namespaced(namespaced_name)
             .ok_or_else(|| unnamespaced_message(namespaced_name))?;
-        let route = self
-            .route(service_id)
-            .ok_or_else(|| self.unknown_service_message(service_id))?;
+        let route =
+            self.route(service_id).ok_or_else(|| self.unknown_service_message(service_id))?;
 
         let session = self.session_for(route, tool_name).await?;
 
@@ -262,10 +257,7 @@ impl Proxy {
                 }
             };
 
-            match self
-                .open_or_reuse(route, generation, headers, tool_name)
-                .await
-            {
+            match self.open_or_reuse(route, generation, headers, tool_name).await {
                 Ok(session) => return Ok(session),
                 Err(error) => {
                     if !retried && error.is_authorization_required() {
@@ -326,11 +318,7 @@ impl Proxy {
         let mut sessions = self.sessions.lock().await;
         sessions.insert(
             route.service_id.clone(),
-            CachedSession {
-                generation,
-                service: Arc::clone(&service),
-                last_used: Instant::now(),
-            },
+            CachedSession { generation, service: Arc::clone(&service), last_used: Instant::now() },
         );
         self.enforce_bound(&mut sessions);
         Ok(service)
@@ -340,10 +328,7 @@ impl Proxy {
     /// `service_id`; a newer replacement is left alone.
     async fn evict(&self, service_id: &str, session: &Arc<RunningService<RoleClient, ()>>) {
         let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(service_id)
-            .is_some_and(|cached| Arc::ptr_eq(&cached.service, session))
-        {
+        if sessions.get(service_id).is_some_and(|cached| Arc::ptr_eq(&cached.service, session)) {
             sessions.remove(service_id);
         }
     }
@@ -400,10 +385,7 @@ impl Proxy {
                     sanitize_body(&error.to_string())
                 )
             })?;
-        let headers = headers
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
+        let headers = headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
         Ok((headers, generation))
     }
 }
@@ -460,10 +442,7 @@ fn unnamespaced_message(name: &str) -> String {
 fn upstream_message(host: &str, error: &(dyn std::error::Error + 'static)) -> String {
     let chain = render_chain(error);
     match recovered_status(error) {
-        Some(status) => format!(
-            "call to {host} failed: {}",
-            classify_upstream(status, &chain)
-        ),
+        Some(status) => format!("call to {host} failed: {}", classify_upstream(status, &chain)),
         None => format!("call to {host} failed: {}", sanitize_body(&chain)),
     }
 }
@@ -478,14 +457,9 @@ fn upstream_message(host: &str, error: &(dyn std::error::Error + 'static)) -> St
 /// project, API-key rejection) be classified at all.
 fn status_from_text(text: &str) -> Option<u16> {
     text.match_indices("HTTP ").find_map(|(index, marker)| {
-        let digits: String = text[index + marker.len()..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits
-            .parse()
-            .ok()
-            .filter(|code| (100..=599).contains(code))
+        let digits: String =
+            text[index + marker.len()..].chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok().filter(|code| (100..=599).contains(code))
     })
 }
 
@@ -493,9 +467,8 @@ fn status_from_text(text: &str) -> Option<u16> {
 fn http_status(error: &(dyn std::error::Error + 'static)) -> Option<u16> {
     let mut current = Some(error);
     while let Some(error) = current {
-        if let Some(status) = error
-            .downcast_ref::<reqwest::Error>()
-            .and_then(reqwest::Error::status)
+        if let Some(status) =
+            error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
         {
             return Some(status.as_u16());
         }
@@ -542,10 +515,7 @@ mod tests {
     #[test]
     fn every_route_from_the_registry_stays_on_googleapis_com() {
         let endpoints: Vec<&Endpoint> = registry::ENDPOINTS.iter().collect();
-        assert!(
-            !endpoints.is_empty(),
-            "an empty registry would make this assertion vacuous"
-        );
+        assert!(!endpoints.is_empty(), "an empty registry would make this assertion vacuous");
 
         let proxy = Proxy::from_endpoints(
             Arc::new(
@@ -669,10 +639,7 @@ mod tests {
 
         assert!(message.starts_with("call to run.googleapis.com failed: "));
         assert!(!message.contains('\u{1b}'), "an escape reached the caller");
-        assert!(
-            !message.contains('\r'),
-            "a carriage return reached the caller"
-        );
+        assert!(!message.contains('\r'), "a carriage return reached the caller");
         assert!(
             message.len() < 8 * 1024,
             "an unbounded upstream body reached the caller: {} bytes",
@@ -684,14 +651,8 @@ mod tests {
     fn dispatch_targets_split_on_the_first_separator() {
         // Upstream tool names may themselves contain `__`; only the first
         // separator delimits the service prefix.
-        assert_eq!(
-            split_namespaced("run__list_services"),
-            Some(("run", "list_services"))
-        );
-        assert_eq!(
-            split_namespaced("run__weird__name"),
-            Some(("run", "weird__name"))
-        );
+        assert_eq!(split_namespaced("run__list_services"), Some(("run", "list_services")));
+        assert_eq!(split_namespaced("run__weird__name"), Some(("run", "weird__name")));
         assert!(split_namespaced("run").is_none());
     }
 
@@ -700,10 +661,7 @@ mod tests {
         // Dispatch routing relies on no service id containing the separator.
         for endpoint in registry::ENDPOINTS {
             let namespaced = format!("{}__tool", endpoint.service_id);
-            assert_eq!(
-                split_namespaced(&namespaced),
-                Some((endpoint.service_id, "tool"))
-            );
+            assert_eq!(split_namespaced(&namespaced), Some((endpoint.service_id, "tool")));
             assert!(registry::find(endpoint.service_id).is_some());
         }
     }
@@ -745,10 +703,7 @@ mod tests {
         // Out-of-range numbers are not statuses.
         assert_eq!(status_from_text("HTTP 9999"), None);
         // Scanning continues past a non-status occurrence.
-        assert_eq!(
-            status_from_text("HTTP/1.1 -- HTTP 404 Not Found"),
-            Some(404)
-        );
+        assert_eq!(status_from_text("HTTP/1.1 -- HTTP 404 Not Found"), Some(404));
     }
 
     #[test]
@@ -762,9 +717,7 @@ mod tests {
         }
         impl std::error::Error for Echo {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                self.0
-                    .as_deref()
-                    .map(|e| e as &(dyn std::error::Error + 'static))
+                self.0.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
             }
         }
 

@@ -211,10 +211,8 @@ pub fn build(snapshot: &Snapshot) -> Result<Vec<u8>, ArchiveError> {
                     actual: service.service_id.clone(),
                 });
             }
-            let schemas = |source| ArchiveError::ToolSchema {
-                tool: tool.namespaced_name.clone(),
-                source,
-            };
+            let schemas =
+                |source| ArchiveError::ToolSchema { tool: tool.namespaced_name.clone(), source };
             let input = tool.tool.input_schema().map_err(schemas)?;
             let (input_schema_zstd, input_schema_len) =
                 compress_schema(&tool.namespaced_name, &input)?;
@@ -245,10 +243,7 @@ pub fn build(snapshot: &Snapshot) -> Result<Vec<u8>, ArchiveError> {
         });
     }
 
-    let archive = SnapshotArchive {
-        generated_at: snapshot.generated_at.clone(),
-        services,
-    };
+    let archive = SnapshotArchive { generated_at: snapshot.generated_at.clone(), services };
     let payload = rkyv::to_bytes::<rancor::Error>(&archive).map_err(ArchiveError::Serialize)?;
 
     let mut bytes = Vec::with_capacity(ARCHIVE_HEADER_LEN + payload.len());
@@ -274,20 +269,13 @@ fn compress_schema(
         compressor.compress(json)
     };
 
-    let json = serde_json::to_vec(schema).map_err(|source| ArchiveError::SchemaSerialize {
-        tool: tool.to_owned(),
-        source,
-    })?;
+    let json = serde_json::to_vec(schema)
+        .map_err(|source| ArchiveError::SchemaSerialize { tool: tool.to_owned(), source })?;
     if json.len() > MAX_SCHEMA_BYTES {
-        return Err(ArchiveError::SchemaTooLarge {
-            tool: tool.to_owned(),
-            len: json.len(),
-        });
+        return Err(ArchiveError::SchemaTooLarge { tool: tool.to_owned(), len: json.len() });
     }
-    let frame = compress(&json).map_err(|source| ArchiveError::SchemaCompress {
-        tool: tool.to_owned(),
-        source,
-    })?;
+    let frame = compress(&json)
+        .map_err(|source| ArchiveError::SchemaCompress { tool: tool.to_owned(), source })?;
     let len = u32::try_from(json.len()).expect("a schema document is far smaller than 4 GiB");
     Ok((frame, len))
 }
@@ -415,10 +403,7 @@ mod tests {
             for (archived_tool, tool) in archived_service.tools.iter().zip(&service.tools) {
                 assert_eq!(archived_tool.namespaced_name.as_str(), tool.namespaced_name);
                 assert_eq!(archived_tool.name.as_str(), tool.tool.name());
-                assert_eq!(
-                    archived_tool.description.as_deref(),
-                    tool.tool.description()
-                );
+                assert_eq!(archived_tool.description.as_deref(), tool.tool.description());
 
                 let input = decompress_schema(
                     archived_tool.input_schema_zstd.as_slice(),
@@ -568,10 +553,7 @@ mod tests {
         let mut shifted = vec![0u8; bytes.len() + 1];
         shifted[1..].copy_from_slice(&bytes);
         let error = access(&shifted[1..]).expect_err("misaligned payload must not validate");
-        assert!(
-            matches!(error, ArchiveError::Invalid(_) | ArchiveError::BadMagic),
-            "got {error}"
-        );
+        assert!(matches!(error, ArchiveError::Invalid(_) | ArchiveError::BadMagic), "got {error}");
     }
 
     #[test]

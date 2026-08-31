@@ -137,9 +137,7 @@ impl TokenSource for LazyGcpTokenSource {
 /// runtime. A current-thread runtime (tests) has nothing to hand over to, so
 /// there the future is simply awaited.
 async fn discover_provider() -> Result<Arc<dyn gcp_auth::TokenProvider>, Error> {
-    drive_blocking(gcp_auth::provider(), DISCOVERY_TIMEOUT)
-        .await?
-        .map_err(Error::from)
+    drive_blocking(gcp_auth::provider(), DISCOVERY_TIMEOUT).await?.map_err(Error::from)
 }
 
 /// Drive a future that blocks its thread, under a budget that actually fires.
@@ -203,16 +201,12 @@ impl CachedToken {
         let rendered = Zeroizing::new(format!("Bearer {}", *fetched.value));
         let mut header = HeaderValue::from_str(&rendered)?;
         header.set_sensitive(true);
-        Ok(Self {
-            header,
-            expires_at: floor_expiry(fetched.expires_at),
-        })
+        Ok(Self { header, expires_at: floor_expiry(fetched.expires_at) })
     }
 
     /// Whether the token must be refreshed before use at time `now`.
     fn is_stale(&self, now: Instant) -> bool {
-        self.expires_at
-            .is_some_and(|deadline| now + REFRESH_MARGIN >= deadline)
+        self.expires_at.is_some_and(|deadline| now + REFRESH_MARGIN >= deadline)
     }
 }
 
@@ -223,13 +217,7 @@ impl CachedToken {
 /// [`EXPIRED_TOKEN_FLOOR`] for why an elapsed one is not believed.
 fn floor_expiry(expires_at: Option<Instant>) -> Option<Instant> {
     let now = Instant::now();
-    expires_at.map(|deadline| {
-        if deadline <= now {
-            now + EXPIRED_TOKEN_FLOOR
-        } else {
-            deadline
-        }
-    })
+    expires_at.map(|deadline| if deadline <= now { now + EXPIRED_TOKEN_FLOOR } else { deadline })
 }
 
 /// The most recent failed fetch, held against the source for
@@ -339,11 +327,7 @@ impl AuthContext {
     /// current by comparing generations, without ever seeing the token.
     pub async fn apply_tracked(&self, headers: &mut HeaderMap) -> Result<TokenGeneration, Error> {
         let mut state = self.cached.lock().await;
-        if state
-            .token
-            .as_ref()
-            .is_none_or(|tok| tok.is_stale(Instant::now()))
-        {
+        if state.token.as_ref().is_none_or(|tok| tok.is_stale(Instant::now())) {
             if let Some(failure) = &state.failure {
                 let age = failure.at.elapsed();
                 if age < FETCH_FAILURE_COOLDOWN {
@@ -399,10 +383,7 @@ impl AuthContext {
             state.failure = None;
             state.generation += 1;
         }
-        let token = state
-            .token
-            .as_ref()
-            .expect("token cache populated just above");
+        let token = state.token.as_ref().expect("token cache populated just above");
         headers.insert(AUTHORIZATION, token.header.clone());
         headers.insert(USER_PROJECT_HEADER, self.quota_project.clone());
         Ok(TokenGeneration(state.generation))
@@ -427,10 +408,8 @@ impl AuthContext {
     /// Record `error` as the failure the source is cooling down from, and hand
     /// it back unchanged for this call.
     fn hold_failure(state: &mut CacheState, error: Error) -> Error {
-        state.failure = Some(RecentFailure {
-            at: tokio::time::Instant::now(),
-            cause: error.to_string(),
-        });
+        state.failure =
+            Some(RecentFailure { at: tokio::time::Instant::now(), cause: error.to_string() });
         error
     }
 }
@@ -450,11 +429,7 @@ mod tests {
 
     impl FakeSource {
         fn new(ttl: Option<Duration>, token: &'static str) -> Arc<Self> {
-            Arc::new(Self {
-                calls: AtomicUsize::new(0),
-                ttl,
-                token,
-            })
+            Arc::new(Self { calls: AtomicUsize::new(0), ttl, token })
         }
 
         fn calls(&self) -> usize {
@@ -496,9 +471,7 @@ mod tests {
             "Authorization must be marked sensitive so it is redacted from debug output"
         );
         assert_eq!(
-            headers
-                .get("x-goog-user-project")
-                .and_then(|v| v.to_str().ok()),
+            headers.get("x-goog-user-project").and_then(|v| v.to_str().ok()),
             Some("my-quota-project")
         );
     }
@@ -510,9 +483,7 @@ mod tests {
             .expect("valid inputs");
 
         for _ in 0..3 {
-            ctx.apply(&mut HeaderMap::new())
-                .await
-                .expect("apply succeeds");
+            ctx.apply(&mut HeaderMap::new()).await.expect("apply succeeds");
         }
         assert_eq!(source.calls(), 1, "a fresh token must not be refetched");
     }
@@ -524,9 +495,7 @@ mod tests {
             .expect("valid inputs");
 
         ctx.apply(&mut HeaderMap::new()).await.expect("first apply");
-        ctx.apply(&mut HeaderMap::new())
-            .await
-            .expect("second apply");
+        ctx.apply(&mut HeaderMap::new()).await.expect("second apply");
         assert_eq!(
             source.calls(),
             2,
@@ -541,9 +510,7 @@ mod tests {
             .expect("valid inputs");
 
         for _ in 0..3 {
-            ctx.apply(&mut HeaderMap::new())
-                .await
-                .expect("apply succeeds");
+            ctx.apply(&mut HeaderMap::new()).await.expect("apply succeeds");
         }
         assert_eq!(source.calls(), 1, "tokens without expiry are never stale");
     }
@@ -558,9 +525,7 @@ mod tests {
             .expect("valid inputs");
 
         for _ in 0..5 {
-            ctx.apply(&mut HeaderMap::new())
-                .await
-                .expect("apply succeeds");
+            ctx.apply(&mut HeaderMap::new()).await.expect("apply succeeds");
         }
         assert_eq!(
             source.calls(),
@@ -616,10 +581,7 @@ mod tests {
 
     impl FlakySource {
         fn failing(times: usize) -> Arc<Self> {
-            Arc::new(Self {
-                failures_left: AtomicUsize::new(times),
-                calls: AtomicUsize::new(0),
-            })
+            Arc::new(Self { failures_left: AtomicUsize::new(times), calls: AtomicUsize::new(0) })
         }
 
         fn calls(&self) -> usize {
@@ -632,9 +594,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let fail = self
                 .failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    left.checked_sub(1)
-                })
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
                 .is_ok();
             Box::pin(async move {
                 if fail {
@@ -655,10 +615,7 @@ mod tests {
         let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
             .expect("valid inputs");
 
-        let first = ctx
-            .apply(&mut HeaderMap::new())
-            .await
-            .expect_err("the source fails");
+        let first = ctx.apply(&mut HeaderMap::new()).await.expect_err("the source fails");
         assert!(matches!(first, Error::QuotaProjectUnresolved));
         assert_eq!(source.calls(), 1);
 
@@ -670,10 +627,7 @@ mod tests {
                 .await
                 .expect_err("still failing, without a new attempt");
             match held {
-                Error::CredentialsCoolingDown {
-                    cause,
-                    retry_after_secs,
-                } => {
+                Error::CredentialsCoolingDown { cause, retry_after_secs } => {
                     assert_eq!(cause, Error::QuotaProjectUnresolved.to_string());
                     assert!(
                         (1..=FETCH_FAILURE_COOLDOWN.as_secs()).contains(&retry_after_secs),
@@ -683,11 +637,7 @@ mod tests {
                 other => panic!("expected the cooled-down failure, got: {other}"),
             }
         }
-        assert_eq!(
-            source.calls(),
-            1,
-            "no call during the cooldown may reach the source"
-        );
+        assert_eq!(source.calls(), 1, "no call during the cooldown may reach the source");
 
         tokio::time::advance(FETCH_FAILURE_COOLDOWN).await;
         let retried = ctx
@@ -724,9 +674,7 @@ mod tests {
     /// `apply` at once, on a runtime with real worker threads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_applies_trigger_exactly_one_fetch() {
-        let source = Arc::new(SlowSource {
-            calls: AtomicUsize::new(0),
-        });
+        let source = Arc::new(SlowSource { calls: AtomicUsize::new(0) });
         let ctx = Arc::new(
             AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
                 .expect("valid inputs"),
@@ -738,9 +686,7 @@ mod tests {
             joined.spawn(async move { ctx.apply(&mut HeaderMap::new()).await });
         }
         while let Some(result) = joined.join_next().await {
-            result
-                .expect("no task panics")
-                .expect("every concurrent caller gets the token");
+            result.expect("no task panics").expect("every concurrent caller gets the token");
         }
 
         assert_eq!(
@@ -810,9 +756,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_token_that_cannot_become_a_header_still_starts_the_cooldown() {
-        let source = Arc::new(MalformedToken {
-            calls: AtomicUsize::new(0),
-        });
+        let source = Arc::new(MalformedToken { calls: AtomicUsize::new(0) });
         let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
             .expect("valid inputs");
 
@@ -826,10 +770,7 @@ mod tests {
         );
         assert_eq!(source.calls.load(Ordering::SeqCst), 1);
 
-        let second = ctx
-            .apply(&mut HeaderMap::new())
-            .await
-            .expect_err("still broken");
+        let second = ctx.apply(&mut HeaderMap::new()).await.expect_err("still broken");
         assert!(
             matches!(second, Error::CredentialsCoolingDown { .. }),
             "the failure must be held like any other, got: {second}"
@@ -848,9 +789,7 @@ mod tests {
         let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
             .expect("valid inputs");
 
-        ctx.apply(&mut HeaderMap::new())
-            .await
-            .expect_err("the first attempt fails");
+        ctx.apply(&mut HeaderMap::new()).await.expect_err("the first attempt fails");
         ctx.apply(&mut HeaderMap::new())
             .await
             .expect_err("inside the cooldown the failure is held");
@@ -858,9 +797,7 @@ mod tests {
 
         tokio::time::advance(FETCH_FAILURE_COOLDOWN).await;
         let mut headers = HeaderMap::new();
-        ctx.apply(&mut headers)
-            .await
-            .expect("the repaired source answers on the retry");
+        ctx.apply(&mut headers).await.expect("the repaired source answers on the retry");
         assert_eq!(source.calls(), 2);
         assert_eq!(
             headers.get(AUTHORIZATION).map(|v| v.to_str().ok()),
@@ -870,9 +807,7 @@ mod tests {
 
         // And the recovery clears the failure: the next call is served from
         // the cache, touching neither the source nor the cooldown.
-        ctx.apply(&mut HeaderMap::new())
-            .await
-            .expect("cached token");
+        ctx.apply(&mut HeaderMap::new()).await.expect("cached token");
         assert_eq!(source.calls(), 2);
     }
 
@@ -882,27 +817,16 @@ mod tests {
         let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
             .expect("valid inputs");
 
-        let first = ctx
-            .apply_tracked(&mut HeaderMap::new())
-            .await
-            .expect("first fetch");
-        let second = ctx
-            .apply_tracked(&mut HeaderMap::new())
-            .await
-            .expect("served from cache");
-        assert_eq!(
-            first, second,
-            "a cached token keeps its generation: {first:?} vs {second:?}"
-        );
+        let first = ctx.apply_tracked(&mut HeaderMap::new()).await.expect("first fetch");
+        let second = ctx.apply_tracked(&mut HeaderMap::new()).await.expect("served from cache");
+        assert_eq!(first, second, "a cached token keeps its generation: {first:?} vs {second:?}");
         assert_eq!(source.calls(), 1);
 
         // Invalidating the generation that is current forces a fresh fetch and
         // a new generation; anything built from `first` is now known stale.
         ctx.invalidate(first).await;
-        let third = ctx
-            .apply_tracked(&mut HeaderMap::new())
-            .await
-            .expect("re-fetched after invalidation");
+        let third =
+            ctx.apply_tracked(&mut HeaderMap::new()).await.expect("re-fetched after invalidation");
         assert_ne!(third, first);
         assert_eq!(source.calls(), 2);
     }
@@ -916,28 +840,16 @@ mod tests {
         let ctx = AuthContext::with_source(Arc::clone(&source) as Arc<dyn TokenSource>, "p")
             .expect("valid inputs");
 
-        let old = ctx
-            .apply_tracked(&mut HeaderMap::new())
-            .await
-            .expect("first fetch");
+        let old = ctx.apply_tracked(&mut HeaderMap::new()).await.expect("first fetch");
         ctx.invalidate(old).await;
-        let replacement = ctx
-            .apply_tracked(&mut HeaderMap::new())
-            .await
-            .expect("replacement fetched");
+        let replacement =
+            ctx.apply_tracked(&mut HeaderMap::new()).await.expect("replacement fetched");
         assert_eq!(source.calls(), 2);
 
         ctx.invalidate(old).await;
-        let still = ctx
-            .apply_tracked(&mut HeaderMap::new())
-            .await
-            .expect("served from cache");
+        let still = ctx.apply_tracked(&mut HeaderMap::new()).await.expect("served from cache");
         assert_eq!(still, replacement);
-        assert_eq!(
-            source.calls(),
-            2,
-            "a stale invalidation must not cost another fetch"
-        );
+        assert_eq!(source.calls(), 2, "a stale invalidation must not cost another fetch");
     }
 
     #[test]
@@ -966,10 +878,8 @@ mod tests {
         let now = Instant::now();
         let header = HeaderValue::from_static("Bearer x");
 
-        let at_margin = CachedToken {
-            header: header.clone(),
-            expires_at: Some(now + REFRESH_MARGIN),
-        };
+        let at_margin =
+            CachedToken { header: header.clone(), expires_at: Some(now + REFRESH_MARGIN) };
         assert!(at_margin.is_stale(now), "exactly at the margin is stale");
 
         let beyond_margin = CachedToken {
@@ -978,10 +888,7 @@ mod tests {
         };
         assert!(!beyond_margin.is_stale(now), "beyond the margin is fresh");
 
-        let no_expiry = CachedToken {
-            header,
-            expires_at: None,
-        };
+        let no_expiry = CachedToken { header, expires_at: None };
         assert!(!no_expiry.is_stale(now), "no expiry is never stale");
     }
 }

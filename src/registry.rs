@@ -105,11 +105,7 @@ mod tests {
     #[test]
     fn service_ids_and_hosts_are_unique() {
         let ids: HashSet<_> = ENDPOINTS.iter().map(|e| e.service_id).collect();
-        assert_eq!(
-            ids.len(),
-            ENDPOINTS.len(),
-            "duplicate service_id in registry"
-        );
+        assert_eq!(ids.len(), ENDPOINTS.len(), "duplicate service_id in registry");
 
         let hosts: HashSet<_> = ENDPOINTS.iter().map(|e| e.host).collect();
         assert_eq!(hosts.len(), ENDPOINTS.len(), "duplicate host in registry");
@@ -118,10 +114,7 @@ mod tests {
     #[test]
     fn derived_fields_follow_the_probed_shape() {
         for endpoint in ENDPOINTS {
-            assert_eq!(
-                endpoint.host,
-                format!("{}.googleapis.com", endpoint.service_id)
-            );
+            assert_eq!(endpoint.host, format!("{}.googleapis.com", endpoint.service_id));
             assert_eq!(endpoint.api_name, endpoint.host);
             assert_eq!(endpoint.mcp_url(), format!("https://{}/mcp", endpoint.host));
             assert!(

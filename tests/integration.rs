@@ -76,12 +76,7 @@ struct FixedToken(&'static str);
 impl TokenSource for FixedToken {
     fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
         let value = zeroize::Zeroizing::new(self.0.to_owned());
-        Box::pin(async move {
-            Ok(FetchedToken {
-                value,
-                expires_at: None,
-            })
-        })
+        Box::pin(async move { Ok(FetchedToken { value, expires_at: None }) })
     }
 }
 
@@ -124,10 +119,10 @@ impl Session {
                 Err(error) => panic!("the in-memory MCP server failed to start: {error}"),
             }
         });
-        let client = ()
-            .serve(client_io)
-            .await
-            .expect("the in-memory MCP client completes the initialize handshake");
+        let client =
+            ().serve(client_io)
+                .await
+                .expect("the in-memory MCP client completes the initialize handshake");
         Self { client, server }
     }
 
@@ -154,8 +149,7 @@ impl Session {
 
     /// Invoke the two-tier `call` tool against a namespaced upstream tool.
     async fn dispatch(&self, target: &str, arguments: Value) -> CallToolResult {
-        self.call("call", json!({ "name": target, "arguments": arguments }))
-            .await
+        self.call("call", json!({ "name": target, "arguments": arguments })).await
     }
 
     /// Close the session and make sure no server task outlives the test.
@@ -186,10 +180,7 @@ async fn catalog_builds_with_no_credentials_in_the_environment() {
     )
     .await;
     let addr = upstream.server.addr();
-    let http = client_resolving(&[
-        ("run.googleapis.com", addr),
-        ("bigquery.googleapis.com", addr),
-    ]);
+    let http = client_resolving(&[("run.googleapis.com", addr), ("bigquery.googleapis.com", addr)]);
 
     let endpoints = vec![
         registry::find("run").expect("`run` is a registered endpoint"),
@@ -204,11 +195,7 @@ async fn catalog_builds_with_no_credentials_in_the_environment() {
         2,
         "both upstreams answered, so both services must be present (scrubbed env vars: {scrubbed:?}); \
          got services {:?}",
-        catalog
-            .services
-            .iter()
-            .map(|s| &s.service_id)
-            .collect::<Vec<_>>()
+        catalog.services.iter().map(|s| &s.service_id).collect::<Vec<_>>()
     );
     for service in &catalog.services {
         assert_eq!(
@@ -221,19 +208,13 @@ async fn catalog_builds_with_no_credentials_in_the_environment() {
     assert!(
         catalog.get(&format!("run__{TOOL_ECHO}")).is_some(),
         "the synthetic `{TOOL_ECHO}` tool must appear namespaced under `run`; catalog holds {:?}",
-        catalog
-            .tools()
-            .map(|t| &t.namespaced_name)
-            .collect::<Vec<_>>()
+        catalog.tools().map(|t| &t.namespaced_name).collect::<Vec<_>>()
     );
 
     // The strong form of "credential-free": nothing resembling a credential
     // was put on the wire during discovery.
     let requests = upstream.all_requests();
-    assert!(
-        !requests.is_empty(),
-        "the upstream must have observed the discovery requests"
-    );
+    assert!(!requests.is_empty(), "the upstream must have observed the discovery requests");
     for (index, headers) in requests.iter().enumerate() {
         assert!(
             !headers.contains_key("authorization"),
@@ -303,9 +284,8 @@ async fn dispatch_delivers_both_auth_headers_and_returns_the_result_unmodified()
     .await;
 
     let payload = "round-trip-payload";
-    let result = session
-        .dispatch(&format!("run__{TOOL_ECHO}"), json!({ "payload": payload }))
-        .await;
+    let result =
+        session.dispatch(&format!("run__{TOOL_ECHO}"), json!({ "payload": payload })).await;
 
     assert_ne!(
         result.is_error,
@@ -380,9 +360,7 @@ async fn dispatch_passes_an_upstream_error_result_through_unchanged() {
     ))
     .await;
 
-    let result = session
-        .dispatch(&format!("run__{TOOL_FAIL}"), json!({}))
-        .await;
+    let result = session.dispatch(&format!("run__{TOOL_FAIL}"), json!({})).await;
 
     assert_eq!(
         result.is_error,
@@ -414,11 +392,7 @@ async fn the_upstream_can_read_back_the_headers_the_proxy_attached() {
     let catalog = Catalog::build_live(vec![run], &http, None)
         .await
         .expect("the upstream tool list builds a catalog");
-    let proxy = Proxy::new(
-        fake_auth(TOKEN, TEST_PROJECT),
-        http,
-        vec![Route::from_endpoint(run)],
-    );
+    let proxy = Proxy::new(fake_auth(TOKEN, TEST_PROJECT), http, vec![Route::from_endpoint(run)]);
     let session = Session::connect(GoogleMcpServer::new(
         shared(catalog),
         Arc::new(proxy),
@@ -426,9 +400,7 @@ async fn the_upstream_can_read_back_the_headers_the_proxy_attached() {
     ))
     .await;
 
-    let result = session
-        .dispatch(&format!("run__{TOOL_SHOW_HEADERS}"), json!({}))
-        .await;
+    let result = session.dispatch(&format!("run__{TOOL_SHOW_HEADERS}"), json!({})).await;
     let text = result_text(&result);
     let reported: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("header readback must be JSON ({error}); got: {text}"));
@@ -535,9 +507,7 @@ async fn only_the_enabled_services_are_exposed() {
     );
 
     // Search must not reach a disabled service either.
-    let hits = session
-        .call("search_tools", json!({ "query": "synthetic", "limit": 50 }))
-        .await;
+    let hits = session.call("search_tools", json!({ "query": "synthetic", "limit": 50 })).await;
     let hits_json: Value =
         serde_json::from_str(&result_text(&hits)).expect("search_tools returns a JSON payload");
     let hit_names: Vec<&str> = hits_json["matches"]
@@ -546,10 +516,7 @@ async fn only_the_enabled_services_are_exposed() {
         .iter()
         .filter_map(|hit| hit["name"].as_str())
         .collect();
-    assert!(
-        !hit_names.is_empty(),
-        "the synthetic tools must be searchable; payload: {hits_json}"
-    );
+    assert!(!hit_names.is_empty(), "the synthetic tools must be searchable; payload: {hits_json}");
     for name in &hit_names {
         let service = name.split("__").next().unwrap_or_default();
         assert!(
@@ -576,9 +543,7 @@ fn synthetic_service(service_id: &str, source: CatalogSource) -> ServiceCatalog 
     ServiceCatalog {
         service_id: service_id.to_owned(),
         source,
-        tools: vec![mcp_google_service::catalog::NamespacedTool::new(
-            service_id, tool,
-        )],
+        tools: vec![mcp_google_service::catalog::NamespacedTool::new(service_id, tool)],
     }
 }
 
@@ -618,11 +583,7 @@ async fn a_downed_upstream_is_served_from_the_snapshot_until_refresh_succeeds() 
         "a service served from the snapshot must be labelled snapshot, so \
          `list_services` can tell the operator the data is stale"
     );
-    assert_eq!(
-        service.tools.len(),
-        1,
-        "the snapshot's tools must be carried over verbatim"
-    );
+    assert_eq!(service.tools.len(), 1, "the snapshot's tools must be carried over verbatim");
 
     // Phase 2: the upstream is back; a refresh must take over and relabel.
     let alive = spawn_mcp_upstream(&["run.googleapis.com"], "revived-run").await;
@@ -631,9 +592,7 @@ async fn a_downed_upstream_is_served_from_the_snapshot_until_refresh_succeeds() 
         .await
         .expect("the revived upstream answers discovery");
 
-    let service = refreshed
-        .service("run")
-        .expect("the revived upstream must be present");
+    let service = refreshed.service("run").expect("the revived upstream must be present");
     assert_eq!(
         service.source,
         CatalogSource::Live,
@@ -659,11 +618,7 @@ async fn a_disk_loaded_snapshot_never_reports_itself_as_live() {
     // The file records `live`, because that is what it was when captured.
     // This is precisely why the relabel below is load-bearing rather than
     // cosmetic: without it, a snapshot-served process reports fresh data.
-    let live_in_file = loaded
-        .services
-        .iter()
-        .filter(|s| s.source == CatalogSource::Live)
-        .count();
+    let live_in_file = loaded.services.iter().filter(|s| s.source == CatalogSource::Live).count();
     assert!(
         live_in_file > 0,
         "the committed snapshot is expected to record live provenance from \
@@ -700,10 +655,7 @@ async fn a_freshly_assembled_serve_catalog_reports_snapshot_provenance() {
     let catalog = mcp_google_service::catalog::embedded_catalog()
         .expect("the embedded archive must materialize");
     assert!(
-        catalog
-            .services
-            .iter()
-            .any(|service| service.source == CatalogSource::Live),
+        catalog.services.iter().any(|service| service.source == CatalogSource::Live),
         "the committed snapshot is expected to record live provenance from its \
          capture run; without that this test cannot distinguish a relabel from \
          a passthrough and must be revisited"
@@ -747,10 +699,7 @@ async fn a_freshly_assembled_serve_catalog_reports_snapshot_provenance() {
     let listed = session.call("list_services", json!({})).await;
     let payload: Value =
         serde_json::from_str(&result_text(&listed)).expect("list_services returns JSON");
-    for service in payload["services"]
-        .as_array()
-        .expect("list_services reports a services array")
-    {
+    for service in payload["services"].as_array().expect("list_services reports a services array") {
         assert_eq!(
             service["source"],
             json!("snapshot"),
@@ -818,11 +767,9 @@ async fn flat_mode_keeps_the_startup_tool_list_across_a_refresh() {
 /// endless request loop against Google, each iteration minting a fresh token.
 #[tokio::test]
 async fn a_pagination_token_that_repeats_ends_the_listing_with_an_error() {
-    let stub = spawn_service_usage_stub(vec![service_usage_page(
-        &["run.googleapis.com"],
-        Some("page-0"),
-    )])
-    .await;
+    let stub =
+        spawn_service_usage_stub(vec![service_usage_page(&["run.googleapis.com"], Some("page-0"))])
+            .await;
     let http = client_resolving(&[("serviceusage.googleapis.com", stub.addr())]);
     let auth = fake_auth("token-for-stalled-pagination", TEST_PROJECT);
 
@@ -868,28 +815,19 @@ async fn a_dispatch_attaches_only_the_two_auth_headers_despite_promotion_annotat
         .await
         .expect("the upstream tool list builds a catalog");
     assert!(
-        catalog
-            .get(&format!("run__{TOOL_PROMOTES_HEADERS}"))
-            .is_some(),
+        catalog.get(&format!("run__{TOOL_PROMOTES_HEADERS}")).is_some(),
         "the annotated tool must be in the catalog, or this test proves nothing"
     );
 
     let session = Session::connect(GoogleMcpServer::new(
         shared(catalog),
-        Arc::new(Proxy::new(
-            fake_auth(TOKEN, TEST_PROJECT),
-            http,
-            vec![Route::from_endpoint(run)],
-        )),
+        Arc::new(Proxy::new(fake_auth(TOKEN, TEST_PROJECT), http, vec![Route::from_endpoint(run)])),
         ExposeMode::TwoTier,
     ))
     .await;
 
     let result = session
-        .dispatch(
-            &format!("run__{TOOL_PROMOTES_HEADERS}"),
-            json!({ "region": SENTINEL }),
-        )
+        .dispatch(&format!("run__{TOOL_PROMOTES_HEADERS}"), json!({ "region": SENTINEL }))
         .await;
     let reported = result_text(&result);
     session.shutdown().await;
@@ -918,10 +856,7 @@ async fn a_dispatch_attaches_only_the_two_auth_headers_despite_promotion_annotat
              headers carrying our credentials. Headers: {headers:?}"
         );
         for (name, value) in headers {
-            assert!(
-                !value.contains(SENTINEL),
-                "argument data reached header `{name}`: {value}"
-            );
+            assert!(!value.contains(SENTINEL), "argument data reached header `{name}`: {value}");
         }
     }
 
@@ -938,10 +873,8 @@ async fn a_dispatch_attaches_only_the_two_auth_headers_despite_promotion_annotat
         "mcp-protocol-version",
     ];
 
-    let authenticated: Vec<_> = requests
-        .iter()
-        .filter(|headers| headers.contains_key("authorization"))
-        .collect();
+    let authenticated: Vec<_> =
+        requests.iter().filter(|headers| headers.contains_key("authorization")).collect();
     assert!(
         !authenticated.is_empty(),
         "no authenticated request reached the upstream: {requests:?}"
@@ -951,10 +884,7 @@ async fn a_dispatch_attaches_only_the_two_auth_headers_despite_promotion_annotat
             headers.get("authorization").map(String::as_str),
             Some(format!("Bearer {TOKEN}").as_str())
         );
-        assert_eq!(
-            headers.get("x-goog-user-project").map(String::as_str),
-            Some(TEST_PROJECT)
-        );
+        assert_eq!(headers.get("x-goog-user-project").map(String::as_str), Some(TEST_PROJECT));
 
         let ours: Vec<&str> = headers
             .keys()
@@ -1036,31 +966,19 @@ async fn no_log_line_at_any_level_contains_the_token() {
     // Exercise the paths that handle the token: discovery, a successful
     // dispatch, a routing failure, and an upstream failure whose error text is
     // rendered into a message.
-    let catalog = Catalog::build_live(vec![run], &http, None)
-        .await
-        .expect("discovery succeeds");
-    let proxy = Proxy::new(
-        fake_auth(SENTINEL, TEST_PROJECT),
-        http,
-        vec![Route::from_endpoint(run)],
-    );
-    let _ok = proxy
-        .dispatch(&format!("run__{TOOL_ECHO}"), Some(JsonObject::new()))
-        .await;
+    let catalog = Catalog::build_live(vec![run], &http, None).await.expect("discovery succeeds");
+    let proxy =
+        Proxy::new(fake_auth(SENTINEL, TEST_PROJECT), http, vec![Route::from_endpoint(run)]);
+    let _ok = proxy.dispatch(&format!("run__{TOOL_ECHO}"), Some(JsonObject::new())).await;
     let _unknown = proxy.dispatch("nosuchservice__tool", None).await;
     let _unnamespaced = proxy.dispatch("bare_name", None).await;
-    let _failing = proxy
-        .dispatch(&format!("run__{TOOL_FAIL}"), Some(JsonObject::new()))
-        .await;
+    let _failing = proxy.dispatch(&format!("run__{TOOL_FAIL}"), Some(JsonObject::new())).await;
     drop(catalog);
 
     upstream.server.shutdown().await;
 
     let logs = String::from_utf8(
-        captured
-            .lock()
-            .expect("the capture buffer is never held across a panic")
-            .clone(),
+        captured.lock().expect("the capture buffer is never held across a panic").clone(),
     )
     .expect("tracing output is valid UTF-8");
 
@@ -1073,19 +991,13 @@ async fn no_log_line_at_any_level_contains_the_token() {
     assert!(
         !logs.contains(SENTINEL),
         "the access token leaked into logs. Offending lines:\n{}",
-        logs.lines()
-            .filter(|line| line.contains(SENTINEL))
-            .collect::<Vec<_>>()
-            .join("\n")
+        logs.lines().filter(|line| line.contains(SENTINEL)).collect::<Vec<_>>().join("\n")
     );
     // The `Bearer ` prefix would be equally damaging on its own.
     assert!(
         !logs.contains("Bearer "),
         "a rendered Authorization header reached the logs:\n{}",
-        logs.lines()
-            .filter(|line| line.contains("Bearer "))
-            .collect::<Vec<_>>()
-            .join("\n")
+        logs.lines().filter(|line| line.contains("Bearer ")).collect::<Vec<_>>().join("\n")
     );
 }
 
@@ -1115,9 +1027,7 @@ async fn a_service_disabled_403_reaches_the_caller_as_an_enable_command() {
     // Straight through the real dispatch path: the status survives only inside
     // rmcp's rendered error text (T5 finding (a)), so this exercises the
     // text-parse fallback as well as the classifier.
-    let result = proxy
-        .dispatch(&format!("run__{TOOL_ECHO}"), Some(JsonObject::new()))
-        .await;
+    let result = proxy.dispatch(&format!("run__{TOOL_ECHO}"), Some(JsonObject::new())).await;
 
     assert_eq!(
         result.is_error,
@@ -1158,13 +1068,8 @@ impl TokenSource for GatedToken {
         let mut gate = self.gate.clone();
         let value = zeroize::Zeroizing::new(self.token.to_owned());
         Box::pin(async move {
-            gate.wait_for(|open| *open)
-                .await
-                .expect("the test keeps the gate's sender alive");
-            Ok(FetchedToken {
-                value,
-                expires_at: None,
-            })
+            gate.wait_for(|open| *open).await.expect("the test keeps the gate's sender alive");
+            Ok(FetchedToken { value, expires_at: None })
         })
     }
 }
@@ -1213,10 +1118,7 @@ async fn serve_answers_before_credentials_and_enablement_resolve_then_narrows() 
     let (open, gate) = tokio::sync::watch::channel(false);
     let auth = Arc::new(
         AuthContext::with_source(
-            Arc::new(GatedToken {
-                gate,
-                token: "token-after-the-gate",
-            }),
+            Arc::new(GatedToken { gate, token: "token-after-the-gate" }),
             TEST_PROJECT,
         )
         .expect("a literal project id is a valid header value"),
@@ -1240,12 +1142,9 @@ async fn serve_answers_before_credentials_and_enablement_resolve_then_narrows() 
         http.clone(),
         configured.iter().map(|e| Route::from_endpoint(e)).collect(),
     );
-    let session = Session::connect(GoogleMcpServer::new(
-        state.clone(),
-        Arc::new(proxy),
-        ExposeMode::TwoTier,
-    ))
-    .await;
+    let session =
+        Session::connect(GoogleMcpServer::new(state.clone(), Arc::new(proxy), ExposeMode::TwoTier))
+            .await;
 
     // The handshake completed and tools are listed with nothing resolved: no
     // token has been issued and Service Usage has not been asked.
@@ -1302,9 +1201,7 @@ async fn serve_answers_before_credentials_and_enablement_resolve_then_narrows() 
     assert_eq!(listed["startup"]["enablement"], json!("pruned"));
 
     // A pruned-away service is refused by the catalog before any dispatch.
-    let refused = session
-        .dispatch("bigquery__synthetic_probe", json!({}))
-        .await;
+    let refused = session.dispatch("bigquery__synthetic_probe", json!({})).await;
     assert_eq!(refused.is_error, Some(true));
     assert!(
         result_text(&refused).contains("is not an exposed tool"),
@@ -1370,23 +1267,14 @@ async fn a_credential_failure_is_reported_by_list_services_and_returned_by_call(
     );
     let session = Session::connect(GoogleMcpServer::new(
         state.clone(),
-        Arc::new(Proxy::new(
-            Arc::clone(&auth),
-            http.clone(),
-            vec![Route::from_endpoint(run)],
-        )),
+        Arc::new(Proxy::new(Arc::clone(&auth), http.clone(), vec![Route::from_endpoint(run)])),
         ExposeMode::TwoTier,
     ))
     .await;
 
-    BackgroundStartup {
-        state: state.clone(),
-        auth,
-        http,
-        config: lazy_config(&[]),
-    }
-    .resolve()
-    .await;
+    BackgroundStartup { state: state.clone(), auth, http, config: lazy_config(&[]) }
+        .resolve()
+        .await;
 
     let readiness = state.readiness();
     assert!(
@@ -1436,12 +1324,7 @@ async fn echo_ok(proxy: &Proxy, payload: &str) {
     let result = proxy
         .dispatch(
             &format!("run__{TOOL_ECHO}"),
-            Some(
-                json!({ "payload": payload })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
-            ),
+            Some(json!({ "payload": payload }).as_object().cloned().expect("object")),
         )
         .await;
     assert_ne!(
@@ -1459,11 +1342,8 @@ async fn a_second_dispatch_reuses_the_session_and_does_not_reinitialize() {
     let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
     let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
     let run = registry::find("run").expect("`run` is a registered endpoint");
-    let proxy = Proxy::new(
-        fake_auth("token-reuse", TEST_PROJECT),
-        http,
-        vec![Route::from_endpoint(run)],
-    );
+    let proxy =
+        Proxy::new(fake_auth("token-reuse", TEST_PROJECT), http, vec![Route::from_endpoint(run)]);
 
     echo_ok(&proxy, "first").await;
     echo_ok(&proxy, "second").await;
@@ -1492,20 +1372,14 @@ async fn a_rotated_token_forces_a_fresh_session() {
     // Hold the auth so its generation can be advanced from the test, standing
     // in for the hourly ADC refresh.
     let auth = fake_auth("token-rotation", TEST_PROJECT);
-    let generation = auth
-        .apply_tracked(&mut HeaderMap::new())
-        .await
-        .expect("the fake source yields a token");
+    let generation =
+        auth.apply_tracked(&mut HeaderMap::new()).await.expect("the fake source yields a token");
 
     let proxy = Proxy::new(Arc::clone(&auth), http, vec![Route::from_endpoint(run)]);
 
     echo_ok(&proxy, "before-rotation").await;
     echo_ok(&proxy, "still-before").await;
-    assert_eq!(
-        upstream.initialize_count(),
-        1,
-        "the token has not moved, so the session is reused"
-    );
+    assert_eq!(upstream.initialize_count(), 1, "the token has not moved, so the session is reused");
 
     // The token rotates: the cached session was built from the old generation
     // and must not be reused with the new one.
@@ -1570,9 +1444,7 @@ impl TokenSource for ExpiringToken {
     fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<FetchedToken, Error>> + Send + '_>> {
         let still_ok = self
             .ok_calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok();
         let value = zeroize::Zeroizing::new(self.token.to_owned());
         Box::pin(async move {
@@ -1632,12 +1504,7 @@ async fn a_credential_failure_drops_every_cached_session() {
     let refused = proxy
         .dispatch(
             &format!("run__{TOOL_ECHO}"),
-            Some(
-                json!({ "payload": "after-revocation" })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
-            ),
+            Some(json!({ "payload": "after-revocation" }).as_object().cloned().expect("object")),
         )
         .await;
     assert_eq!(refused.is_error, Some(true));
@@ -1658,12 +1525,7 @@ async fn a_credential_failure_drops_every_cached_session() {
     let again = proxy
         .dispatch(
             &format!("run__{TOOL_ECHO}"),
-            Some(
-                json!({ "payload": "still-refused" })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
-            ),
+            Some(json!({ "payload": "still-refused" }).as_object().cloned().expect("object")),
         )
         .await;
     assert_eq!(again.is_error, Some(true));
@@ -1702,14 +1564,7 @@ async fn strict_startup_refuses_to_serve_without_a_real_token() {
     let key = dir.join("key.pem");
 
     let generated = std::process::Command::new("openssl")
-        .args([
-            "genpkey",
-            "-algorithm",
-            "RSA",
-            "-pkeyopt",
-            "rsa_keygen_bits:2048",
-            "-out",
-        ])
+        .args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out"])
         .arg(&key)
         .output();
     match generated {
@@ -1889,12 +1744,9 @@ async fn an_idle_session_is_reopened_after_its_ttl() {
     let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
     let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
     let run = registry::find("run").expect("`run` is a registered endpoint");
-    let proxy = Proxy::new(
-        fake_auth("token-idle", TEST_PROJECT),
-        http,
-        vec![Route::from_endpoint(run)],
-    )
-    .with_session_limits(Duration::from_millis(20), 16);
+    let proxy =
+        Proxy::new(fake_auth("token-idle", TEST_PROJECT), http, vec![Route::from_endpoint(run)])
+            .with_session_limits(Duration::from_millis(20), 16);
 
     echo_ok(&proxy, "opens").await;
     assert_eq!(upstream.initialize_count(), 1);
@@ -1932,20 +1784,10 @@ async fn the_session_cache_is_bounded_and_evicts_least_recently_used() {
     let bq = proxy
         .dispatch(
             &format!("bigquery__{TOOL_ECHO}"),
-            Some(
-                json!({ "payload": "bq" })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
-            ),
+            Some(json!({ "payload": "bq" }).as_object().cloned().expect("object")),
         )
         .await;
-    assert_ne!(
-        bq.is_error,
-        Some(true),
-        "bigquery dispatch: {}",
-        result_text(&bq)
-    );
+    assert_ne!(bq.is_error, Some(true), "bigquery dispatch: {}", result_text(&bq));
 
     // With a bound of one, opening bigquery must have closed the run session.
     assert_eq!(proxy.cached_sessions().await, 1);

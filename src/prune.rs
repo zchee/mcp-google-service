@@ -48,15 +48,11 @@ pub async fn enabled_services(
             request = request.query(&[("pageToken", token.as_str())]);
         }
 
-        let response = request.send().await.map_err(|source| Error::Http {
-            url: url.clone(),
-            source,
-        })?;
+        let response =
+            request.send().await.map_err(|source| Error::Http { url: url.clone(), source })?;
         let status = response.status();
-        let body = response.text().await.map_err(|source| Error::Http {
-            url: url.clone(),
-            source,
-        })?;
+        let body =
+            response.text().await.map_err(|source| Error::Http { url: url.clone(), source })?;
         if !status.is_success() {
             return Err(Error::Upstream(classify_upstream(status.as_u16(), &body)));
         }
@@ -168,11 +164,8 @@ fn collect_page(page_json: &str, out: &mut HashSet<String>) -> Result<Option<Str
 mod tests {
     use super::*;
 
-    const RUN: Endpoint = Endpoint {
-        service_id: "run",
-        host: "run.googleapis.com",
-        api_name: "run.googleapis.com",
-    };
+    const RUN: Endpoint =
+        Endpoint { service_id: "run", host: "run.googleapis.com", api_name: "run.googleapis.com" };
     const LOGGING: Endpoint = Endpoint {
         service_id: "logging",
         host: "logging.googleapis.com",
@@ -363,10 +356,7 @@ mod tests {
             .map(|page| guard.advance(&format!("page-{page}")))
             .find_map(Result::err)
             .expect("an endless chain of fresh tokens must still terminate");
-        assert!(
-            matches!(error, Error::PaginationLimit { pages: MAX_PAGES }),
-            "got: {error}"
-        );
+        assert!(matches!(error, Error::PaginationLimit { pages: MAX_PAGES }), "got: {error}");
     }
 
     #[test]

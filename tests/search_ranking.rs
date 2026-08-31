@@ -25,13 +25,8 @@ const NO_HITS: &str = "(no hits)";
 
 /// Queries `benches/bench_search.rs` measures; each must be pinned here so
 /// the latency numbers and the ranking contract describe the same queries.
-const BENCHMARK_QUERIES: &[&str] = &[
-    "instances",
-    "cloud run",
-    "list cloud run",
-    "zzzznomatch",
-    "list cloud zzzznomatch",
-];
+const BENCHMARK_QUERIES: &[&str] =
+    &["instances", "cloud run", "list cloud run", "zzzznomatch", "list cloud zzzznomatch"];
 
 /// One `query:` block of the golden file.
 #[derive(Debug)]
@@ -50,11 +45,7 @@ fn committed_catalog() -> Catalog {
 
 /// Namespaced names in rank order for `query` over the whole catalog.
 fn ranking(catalog: &Catalog, query: &str) -> Vec<String> {
-    catalog
-        .search(query, None)
-        .into_iter()
-        .map(|tool| tool.namespaced_name.clone())
-        .collect()
+    catalog.search(query, None).into_iter().map(|tool| tool.namespaced_name.clone()).collect()
 }
 
 /// Parse `tests/golden/search-ranking.txt`.
@@ -71,11 +62,7 @@ fn golden_blocks() -> Vec<GoldenBlock> {
             continue;
         }
         if let Some(query) = content.strip_prefix("query:") {
-            blocks.push(GoldenBlock {
-                line,
-                query: query.trim().to_owned(),
-                expected: Vec::new(),
-            });
+            blocks.push(GoldenBlock { line, query: query.trim().to_owned(), expected: Vec::new() });
             continue;
         }
         let block = blocks
@@ -88,10 +75,7 @@ fn golden_blocks() -> Vec<GoldenBlock> {
             );
             continue;
         }
-        assert!(
-            content.contains("__"),
-            "line {line}: `{content}` is not a namespaced tool name"
-        );
+        assert!(content.contains("__"), "line {line}: `{content}` is not a namespaced tool name");
         block.expected.push(content.to_owned());
     }
 
@@ -127,11 +111,8 @@ fn golden_file_pins_the_head_of_every_ranking() {
             }
             continue;
         }
-        let head: Vec<&str> = actual
-            .iter()
-            .take(block.expected.len())
-            .map(String::as_str)
-            .collect();
+        let head: Vec<&str> =
+            actual.iter().take(block.expected.len()).map(String::as_str).collect();
         let expected: Vec<&str> = block.expected.iter().map(String::as_str).collect();
         if head != expected {
             let shown: Vec<&str> = actual.iter().take(10).map(String::as_str).collect();
@@ -192,29 +173,18 @@ fn cloud_run_ranks_every_cloud_run_tool_above_every_bigquery_tool() {
         .collect();
     assert!(!run_tools.is_empty());
 
-    let head: BTreeSet<&str> = ranked
-        .iter()
-        .take(run_tools.len())
-        .map(String::as_str)
-        .collect();
+    let head: BTreeSet<&str> = ranked.iter().take(run_tools.len()).map(String::as_str).collect();
     assert_eq!(
         head, run_tools,
         "the head of the `cloud run` ranking must be exactly Cloud Run's tools; got {ranked:?}"
     );
 
     let position = |name: &str| ranked.iter().position(|n| n == name);
-    let last_run = run_tools
-        .iter()
-        .filter_map(|n| position(n))
-        .max()
-        .expect("run tools are hits");
+    let last_run = run_tools.iter().filter_map(|n| position(n)).max().expect("run tools are hits");
     for offender in ["bigquery__execute_sql_readonly", "cloudcli__run_bq_command"] {
         let at = position(offender)
             .unwrap_or_else(|| panic!("`{offender}` matches `cloud run` (it mentions both words)"));
-        assert!(
-            at > last_run,
-            "`{offender}` at {at} ranks above a Cloud Run tool at {last_run}"
-        );
+        assert!(at > last_run, "`{offender}` at {at} ranks above a Cloud Run tool at {last_run}");
     }
 }
 
@@ -238,10 +208,7 @@ fn a_query_that_spells_a_service_id_puts_that_service_first() {
             .len();
         let head: Vec<&str> = ranked.iter().take(own.min(5)).map(String::as_str).collect();
         assert!(
-            !head.is_empty()
-                && head
-                    .iter()
-                    .all(|n| n.starts_with(&format!("{service_id}__"))),
+            !head.is_empty() && head.iter().all(|n| n.starts_with(&format!("{service_id}__"))),
             "`{query}` should lead with `{service_id}__*`; head is {head:?}"
         );
     }
@@ -255,17 +222,10 @@ fn every_execute_sql_tool_leads_the_execute_sql_ranking() {
         .filter(|t| t.upstream_name().starts_with("execute_sql"))
         .map(|t| t.namespaced_name.as_str())
         .collect();
-    assert!(
-        execute_sql.len() >= 4,
-        "sanity: several services expose execute_sql"
-    );
+    assert!(execute_sql.len() >= 4, "sanity: several services expose execute_sql");
 
     let ranked = ranking(&catalog, "execute sql");
-    let head: BTreeSet<&str> = ranked
-        .iter()
-        .take(execute_sql.len())
-        .map(String::as_str)
-        .collect();
+    let head: BTreeSet<&str> = ranked.iter().take(execute_sql.len()).map(String::as_str).collect();
     assert_eq!(head, execute_sql, "ranking was {ranked:?}");
 }
 
@@ -297,15 +257,9 @@ fn the_service_filter_restricts_without_changing_relative_order() {
     assert_eq!(filtered[0].namespaced_name, "run__list_services");
 
     let unfiltered = ranking(&catalog, "list");
-    let run_only: Vec<&str> = unfiltered
-        .iter()
-        .filter(|n| n.starts_with("run__"))
-        .map(String::as_str)
-        .collect();
-    let filtered_names: Vec<&str> = filtered
-        .iter()
-        .map(|t| t.namespaced_name.as_str())
-        .collect();
+    let run_only: Vec<&str> =
+        unfiltered.iter().filter(|n| n.starts_with("run__")).map(String::as_str).collect();
+    let filtered_names: Vec<&str> = filtered.iter().map(|t| t.namespaced_name.as_str()).collect();
     assert_eq!(filtered_names, run_only);
 }
 
@@ -316,8 +270,5 @@ fn an_empty_query_lists_everything_in_name_order() {
     assert_eq!(all.len(), catalog.tool_count());
     let mut sorted = all.clone();
     sorted.sort();
-    assert_eq!(
-        all, sorted,
-        "an empty query must be in namespaced-name order"
-    );
+    assert_eq!(all, sorted, "an empty query must be in namespaced-name order");
 }

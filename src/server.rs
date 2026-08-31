@@ -78,11 +78,7 @@ impl CatalogState {
     pub fn new(catalog: Catalog) -> Self {
         let startup = Arc::new(catalog);
         let (readiness, _) = watch::channel(Readiness::pending());
-        Self {
-            live: Arc::new(RwLock::new(Arc::clone(&startup))),
-            startup,
-            readiness,
-        }
+        Self { live: Arc::new(RwLock::new(Arc::clone(&startup))), startup, readiness }
     }
 
     /// Handle the background refresh writes its result into.
@@ -205,10 +201,7 @@ pub struct Readiness {
 impl Readiness {
     /// Nothing resolved yet.
     pub fn pending() -> Self {
-        Self {
-            credentials: CredentialState::Pending,
-            enablement: EnablementState::Pending,
-        }
+        Self { credentials: CredentialState::Pending, enablement: EnablementState::Pending }
     }
 
     /// Readiness of any one exposed service, as the label `list_services`
@@ -253,11 +246,7 @@ pub fn assemble_serve_catalog(
     catalog: Catalog,
     exposed: &[&Endpoint],
 ) -> Result<CatalogState, CatalogError> {
-    Ok(CatalogState::new(
-        catalog
-            .restricted_to(exposed)
-            .marked_as(CatalogSource::Snapshot),
-    ))
+    Ok(CatalogState::new(catalog.restricted_to(exposed).marked_as(CatalogSource::Snapshot)))
 }
 
 /// The endpoints the configuration admits before enablement is known:
@@ -295,10 +284,7 @@ pub async fn resolve_enablement(
             of = registry::ENDPOINTS.len(),
             "`--only` pins the exposed services; Service Usage not consulted"
         );
-        return Exposure {
-            endpoints,
-            enablement: EnablementState::Skipped,
-        };
+        return Exposure { endpoints, enablement: EnablementState::Skipped };
     }
 
     match prune::enabled_services(auth, &cfg.quota_project, http).await {
@@ -319,10 +305,7 @@ pub async fn resolve_enablement(
                 of = registry::ENDPOINTS.len(),
                 "services selected for exposure"
             );
-            Exposure {
-                endpoints,
-                enablement: EnablementState::Pruned,
-            }
+            Exposure { endpoints, enablement: EnablementState::Pruned }
         }
         Err(error) => {
             tracing::warn!(
@@ -398,11 +381,7 @@ impl BackgroundStartup {
     /// Never fails: every problem is published as readiness and logged, and
     /// the configured selection stays served.
     pub async fn resolve(&self) -> Vec<&'static Endpoint> {
-        let credentials = match self
-            .auth
-            .apply(&mut reqwest::header::HeaderMap::new())
-            .await
-        {
+        let credentials = match self.auth.apply(&mut reqwest::header::HeaderMap::new()).await {
             Ok(()) => CredentialState::Ready,
             Err(error) => {
                 tracing::warn!(
@@ -436,10 +415,7 @@ impl BackgroundStartup {
             );
             *self.state.live.write().await = Arc::new(narrowed);
         }
-        self.state.publish_readiness(Readiness {
-            credentials,
-            enablement: exposure.enablement,
-        });
+        self.state.publish_readiness(Readiness { credentials, enablement: exposure.enablement });
         exposure.endpoints
     }
 
@@ -469,11 +445,7 @@ pub struct GoogleMcpServer {
 impl GoogleMcpServer {
     /// Assemble the server over a catalog state and a dispatch proxy.
     pub fn new(catalog: CatalogState, proxy: Arc<Proxy>, expose: ExposeMode) -> Self {
-        Self {
-            catalog,
-            proxy,
-            expose,
-        }
+        Self { catalog, proxy, expose }
     }
 
     /// Catalog backing the surface this server exposes.
@@ -600,10 +572,7 @@ impl ServerHandler for GoogleMcpServer {
             ExposeMode::TwoTier => meta_tools(),
             ExposeMode::Flat => flat_tools(&catalog)?,
         };
-        Ok(ListToolsResult {
-            tools,
-            ..Default::default()
-        })
+        Ok(ListToolsResult { tools, ..Default::default() })
     }
 
     async fn call_tool(
@@ -614,8 +583,7 @@ impl ServerHandler for GoogleMcpServer {
         let catalog = self.catalog().await;
         let result = match self.expose {
             ExposeMode::TwoTier => {
-                self.call_meta_tool(&request.name, request.arguments, &catalog)
-                    .await
+                self.call_meta_tool(&request.name, request.arguments, &catalog).await
             }
             ExposeMode::Flat => {
                 if catalog.get(&request.name).is_none() {
@@ -875,11 +843,7 @@ fn first_line(text: &str) -> &str {
 
 /// Error text for a tool the pruned catalog does not expose.
 fn not_exposed_message(name: &str, catalog: &Catalog) -> String {
-    let mut services: Vec<&str> = catalog
-        .services
-        .iter()
-        .map(|s| s.service_id.as_str())
-        .collect();
+    let mut services: Vec<&str> = catalog.services.iter().map(|s| s.service_id.as_str()).collect();
     services.sort_unstable();
     format!(
         "`{name}` is not an exposed tool. Exposed services: {}. \
@@ -1003,24 +967,14 @@ mod tests {
     fn two_tier_surface_is_exactly_four_tools() {
         let tools = meta_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                TOOL_LIST_SERVICES,
-                TOOL_SEARCH_TOOLS,
-                TOOL_DESCRIBE_TOOLS,
-                TOOL_CALL
-            ]
-        );
+        assert_eq!(names, [TOOL_LIST_SERVICES, TOOL_SEARCH_TOOLS, TOOL_DESCRIBE_TOOLS, TOOL_CALL]);
     }
 
     #[test]
     fn two_tier_tool_schemas_serialize_as_json_objects() {
         for tool in meta_tools() {
             let encoded = serde_json::to_value(&tool).expect("tool serializes");
-            let schema = encoded
-                .get("inputSchema")
-                .expect("every tool carries an input schema");
+            let schema = encoded.get("inputSchema").expect("every tool carries an input schema");
             assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
             assert!(
                 tool.description.is_some_and(|d| !d.is_empty()),
@@ -1040,19 +994,12 @@ mod tests {
             .expect("the embedded archive materializes")
             .restricted_to(&[run]);
         let expected = catalog.tool_count();
-        assert!(
-            expected > 0,
-            "sanity: run has tools in the committed snapshot"
-        );
+        assert!(expected > 0, "sanity: run has tools in the committed snapshot");
 
         let tools = flat_tools(&catalog).expect("archived schemas inflate");
         assert_eq!(tools.len(), expected);
         for tool in &tools {
-            assert!(
-                tool.name.starts_with("run__"),
-                "{} is not namespaced",
-                tool.name
-            );
+            assert!(tool.name.starts_with("run__"), "{} is not namespaced", tool.name);
             assert!(
                 !tool.input_schema.is_empty(),
                 "{} materialized with an empty input schema",
@@ -1098,26 +1045,12 @@ mod tests {
         let tools = flat_tools(&catalog).expect("live schemas always materialize");
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "bigquery__list_datasets",
-                "run__get_service",
-                "run__list_services"
-            ]
-        );
+        assert_eq!(names, ["bigquery__list_datasets", "run__get_service", "run__list_services"]);
 
-        let original = catalog
-            .get("run__list_services")
-            .expect("present in the catalog");
-        let flat = tools
-            .iter()
-            .find(|t| t.name == "run__list_services")
-            .expect("present in flat mode");
-        assert_eq!(
-            flat.input_schema,
-            original.tool.input_schema().expect("live schemas")
-        );
+        let original = catalog.get("run__list_services").expect("present in the catalog");
+        let flat =
+            tools.iter().find(|t| t.name == "run__list_services").expect("present in flat mode");
+        assert_eq!(flat.input_schema, original.tool.input_schema().expect("live schemas"));
         assert_eq!(flat.description.as_deref(), original.tool.description());
     }
 
@@ -1154,17 +1087,11 @@ mod tests {
         assert_eq!(failed["startup"]["credentials"], json!("failed"));
         assert_eq!(failed["startup"]["credentials_error"], json!("no ADC file"));
         assert_eq!(failed["startup"]["enablement"], json!("unknown"));
-        assert_eq!(
-            failed["startup"]["enablement_error"],
-            json!("credentials unavailable")
-        );
+        assert_eq!(failed["startup"]["enablement_error"], json!("credentials unavailable"));
 
         let ready = list_services_payload(
             &catalog(),
-            &Readiness {
-                credentials: CredentialState::Ready,
-                enablement: EnablementState::Pruned,
-            },
+            &Readiness { credentials: CredentialState::Ready, enablement: EnablementState::Pruned },
         );
         assert_eq!(ready["services"][1]["readiness"], json!("ready"));
         assert_eq!(ready["startup"]["enablement_error"], Value::Null);
@@ -1176,34 +1103,18 @@ mod tests {
         // enablement says. With them, enablement decides between ready,
         // unverified and pending.
         let label = |credentials: CredentialState, enablement: EnablementState| {
-            Readiness {
-                credentials,
-                enablement,
-            }
-            .service_label()
+            Readiness { credentials, enablement }.service_label()
         };
         let failed = || CredentialState::Failed("x".to_owned());
         let unknown = || EnablementState::Unknown("y".to_owned());
 
         assert_eq!(label(failed(), EnablementState::Pruned), "failed");
         assert_eq!(label(failed(), EnablementState::Pending), "failed");
-        assert_eq!(
-            label(CredentialState::Pending, EnablementState::Pruned),
-            "pending"
-        );
-        assert_eq!(
-            label(CredentialState::Ready, EnablementState::Pending),
-            "pending"
-        );
+        assert_eq!(label(CredentialState::Pending, EnablementState::Pruned), "pending");
+        assert_eq!(label(CredentialState::Ready, EnablementState::Pending), "pending");
         assert_eq!(label(CredentialState::Ready, unknown()), "unverified");
-        assert_eq!(
-            label(CredentialState::Ready, EnablementState::Pruned),
-            "ready"
-        );
-        assert_eq!(
-            label(CredentialState::Ready, EnablementState::Skipped),
-            "ready"
-        );
+        assert_eq!(label(CredentialState::Ready, EnablementState::Pruned), "ready");
+        assert_eq!(label(CredentialState::Ready, EnablementState::Skipped), "ready");
     }
 
     #[test]
@@ -1294,10 +1205,7 @@ mod tests {
         let payload = search_payload(&catalog, "list", None, 20);
         assert_eq!(payload["match_count"], json!(2));
         assert_eq!(payload["total_matches"], json!(2));
-        assert_eq!(
-            payload["matches"][0]["description"],
-            json!("List BigQuery datasets.")
-        );
+        assert_eq!(payload["matches"][0]["description"], json!("List BigQuery datasets."));
 
         let limited = search_payload(&catalog, "list", None, 1);
         assert_eq!(limited["match_count"], json!(1));
@@ -1311,10 +1219,7 @@ mod tests {
         assert_eq!(filtered["match_count"], json!(1));
         assert_eq!(filtered["matches"][0]["name"], json!("run__list_services"));
         // Multi-line descriptions collapse to their first line.
-        assert_eq!(
-            filtered["matches"][0]["description"],
-            json!("List Cloud Run services.")
-        );
+        assert_eq!(filtered["matches"][0]["description"], json!("List Cloud Run services."));
     }
 
     #[test]
@@ -1418,10 +1323,7 @@ mod tests {
 
     /// `json!` object literal as the argument map a tool call carries.
     fn args(value: Value) -> JsonObject {
-        value
-            .as_object()
-            .cloned()
-            .expect("test argument literals are objects")
+        value.as_object().cloned().expect("test argument literals are objects")
     }
 
     /// Concatenated text of a result, for assertions.
@@ -1471,9 +1373,7 @@ mod tests {
             let result = server
                 .call_meta_tool(
                     TOOL_CALL,
-                    Some(args(
-                        json!({ "name": "run__list_services", "arguments": value }),
-                    )),
+                    Some(args(json!({ "name": "run__list_services", "arguments": value }))),
                     &catalog,
                 )
                 .await;
@@ -1508,9 +1408,7 @@ mod tests {
             json!({ "name": "run__list_services" }),
             json!({ "name": "run__list_services", "arguments": null }),
         ] {
-            let result = server
-                .call_meta_tool(TOOL_CALL, Some(args(arguments)), &catalog)
-                .await;
+            let result = server.call_meta_tool(TOOL_CALL, Some(args(arguments)), &catalog).await;
             let text = text_of(&result);
             assert!(
                 text.contains("unknown service"),
@@ -1609,10 +1507,7 @@ mod tests {
         // The file records `live`, because that is what its capture run saw.
         let snapshot = catalog().to_snapshot("2026-08-19T00:00:00Z".to_owned());
         assert!(
-            snapshot
-                .services
-                .iter()
-                .any(|s| s.source == CatalogSource::Live),
+            snapshot.services.iter().any(|s| s.source == CatalogSource::Live),
             "sanity: the fixture must carry the provenance the relabel has to \
              overwrite, or this test proves nothing"
         );

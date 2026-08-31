@@ -208,10 +208,7 @@ pub fn classify_upstream(status: u16, body_text: &str) -> UpstreamFailure {
             UpstreamFailure::ServiceDisabled { api, project }
         }
         403 => UpstreamFailure::PermissionDenied,
-        _ => UpstreamFailure::Other {
-            status,
-            body: sanitize_body(body_text),
-        },
+        _ => UpstreamFailure::Other { status, body: sanitize_body(body_text) },
     }
 }
 
@@ -223,10 +220,8 @@ pub fn classify_upstream(status: u16, body_text: &str) -> UpstreamFailure {
 /// read, and unbounded length, which lets a remote party flood a context
 /// window. Newline and tab survive because they carry real structure.
 pub fn sanitize_body(text: &str) -> String {
-    let cleaned: String = text
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect();
+    let cleaned: String =
+        text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
     if cleaned.len() <= MAX_BODY_LEN {
         return cleaned;
     }
@@ -273,9 +268,7 @@ fn accept_project_id(candidate: &str) -> Option<&str> {
     let well_formed = !candidate.is_empty()
         && candidate.len() <= MAX_PROJECT_ID_LEN
         && !candidate.starts_with('-')
-        && candidate
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        && candidate.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     well_formed.then_some(candidate)
 }
 
@@ -338,11 +331,7 @@ mod tests {
     fn classifies_missing_credential() {
         let failure = classify_upstream(401, MISSING_CREDENTIAL_BODY);
         assert_eq!(failure, UpstreamFailure::MissingCredential);
-        assert!(
-            failure
-                .to_string()
-                .contains("gcloud auth application-default login")
-        );
+        assert!(failure.to_string().contains("gcloud auth application-default login"));
     }
 
     #[test]
@@ -357,10 +346,7 @@ mod tests {
         assert_eq!(failure, UpstreamFailure::QuotaProjectMissing);
         let rendered = failure.to_string();
         assert!(rendered.contains("--project"), "rendered: {rendered}");
-        assert!(
-            rendered.contains("GOOGLE_MCP_QUOTA_PROJECT"),
-            "rendered: {rendered}"
-        );
+        assert!(rendered.contains("GOOGLE_MCP_QUOTA_PROJECT"), "rendered: {rendered}");
         assert!(
             rendered.contains("gcloud auth application-default set-quota-project"),
             "rendered: {rendered}"
@@ -418,15 +404,9 @@ mod tests {
         let failure = classify_upstream(403, "Permission denied on resource project x.");
         assert_eq!(failure, UpstreamFailure::PermissionDenied);
         let rendered = failure.to_string();
-        assert!(
-            rendered.contains("roles/mcp.toolUser"),
-            "rendered: {rendered}"
-        );
+        assert!(rendered.contains("roles/mcp.toolUser"), "rendered: {rendered}");
         assert!(rendered.contains("mcp.tools.call"), "rendered: {rendered}");
-        assert!(
-            rendered.contains("product's own IAM role"),
-            "rendered: {rendered}"
-        );
+        assert!(rendered.contains("product's own IAM role"), "rendered: {rendered}");
     }
 
     #[test]
@@ -434,10 +414,7 @@ mod tests {
         let failure = classify_upstream(401, "Unauthorized");
         assert_eq!(
             failure,
-            UpstreamFailure::Other {
-                status: 401,
-                body: "Unauthorized".to_owned(),
-            }
+            UpstreamFailure::Other { status: 401, body: "Unauthorized".to_owned() }
         );
     }
 
@@ -446,10 +423,7 @@ mod tests {
         let failure = classify_upstream(500, "Internal error encountered.");
         assert_eq!(
             failure,
-            UpstreamFailure::Other {
-                status: 500,
-                body: "Internal error encountered.".to_owned(),
-            }
+            UpstreamFailure::Other { status: 500, body: "Internal error encountered.".to_owned() }
         );
         assert!(failure.to_string().contains("500"));
         assert!(failure.to_string().contains("Internal error encountered."));
@@ -483,14 +457,7 @@ mod tests {
         // Only substrings unique to the payload: the remediation template has
         // punctuation of its own, and asserting on that would be a test of the
         // wording rather than of the sanitizing.
-        for payload in [
-            "${IFS}",
-            "curl",
-            "rm${IFS}",
-            "$HOME",
-            "victim",
-            "evil.example",
-        ] {
+        for payload in ["${IFS}", "curl", "rm${IFS}", "$HOME", "victim", "evil.example"] {
             assert!(
                 !rendered.contains(payload),
                 "`{payload}` from the upstream body reached the suggested \
@@ -559,10 +526,7 @@ mod tests {
             },
             "a project id over the {MAX_PROJECT_ID_LEN}-character maximum is not one"
         );
-        assert!(
-            !failure.to_string().contains(&padded),
-            "padding reached the rendered remediation"
-        );
+        assert!(!failure.to_string().contains(&padded), "padding reached the rendered remediation");
 
         // The boundary itself stays usable.
         let at_limit = "a".repeat(MAX_PROJECT_ID_LEN);
@@ -588,20 +552,15 @@ mod tests {
 
     #[test]
     fn other_bodies_lose_control_characters_and_are_capped() {
-        let hostile = format!(
-            "\u{1b}[31mred\u{7}\rrewritten\u{0}\n\tkept{}",
-            "A".repeat(MAX_BODY_LEN * 4)
-        );
+        let hostile =
+            format!("\u{1b}[31mred\u{7}\rrewritten\u{0}\n\tkept{}", "A".repeat(MAX_BODY_LEN * 4));
         let failure = classify_upstream(500, &hostile);
         let UpstreamFailure::Other { body, .. } = &failure else {
             panic!("a 500 must classify as Other; got {failure:?}");
         };
 
         for control in ['\u{1b}', '\u{7}', '\r', '\u{0}'] {
-            assert!(
-                !body.contains(control),
-                "control character {control:?} survived sanitizing"
-            );
+            assert!(!body.contains(control), "control character {control:?} survived sanitizing");
         }
         assert!(
             body.contains("\n\tkept"),
@@ -624,10 +583,7 @@ mod tests {
 
     #[test]
     fn short_clean_bodies_pass_through_untouched() {
-        assert_eq!(
-            sanitize_body("Internal error encountered."),
-            "Internal error encountered."
-        );
+        assert_eq!(sanitize_body("Internal error encountered."), "Internal error encountered.");
         assert_eq!(sanitize_body(""), "");
     }
 
@@ -635,17 +591,8 @@ mod tests {
     fn quota_project_error_names_all_four_mechanisms() {
         let rendered = Error::QuotaProjectUnresolved.to_string();
         assert!(rendered.contains("--project"), "rendered: {rendered}");
-        assert!(
-            rendered.contains("GOOGLE_MCP_QUOTA_PROJECT"),
-            "rendered: {rendered}"
-        );
-        assert!(
-            rendered.contains("GOOGLE_CLOUD_PROJECT"),
-            "rendered: {rendered}"
-        );
-        assert!(
-            rendered.contains("quota_project_id"),
-            "rendered: {rendered}"
-        );
+        assert!(rendered.contains("GOOGLE_MCP_QUOTA_PROJECT"), "rendered: {rendered}");
+        assert!(rendered.contains("GOOGLE_CLOUD_PROJECT"), "rendered: {rendered}");
+        assert!(rendered.contains("quota_project_id"), "rendered: {rendered}");
     }
 }

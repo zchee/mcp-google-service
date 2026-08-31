@@ -45,9 +45,7 @@ static SNAPSHOT_JSON: LazyLock<String> = LazyLock::new(|| {
 /// rather than trusts.
 static ARCHIVE_BYTES: LazyLock<&'static [u8]> = LazyLock::new(|| {
     Box::leak(
-        std::fs::read(ARCHIVE_FILE)
-            .expect("the committed archive file reads")
-            .into_boxed_slice(),
+        std::fs::read(ARCHIVE_FILE).expect("the committed archive file reads").into_boxed_slice(),
     )
 });
 
@@ -106,10 +104,7 @@ fn describe_first_touch_one_tool(bencher: Bencher) {
                 .get(black_box("run__list_services"))
                 .expect("present in the committed catalog");
             let input = entry.tool.input_schema().expect("archived schemas inflate");
-            let output = entry
-                .tool
-                .output_schema()
-                .expect("archived schemas inflate");
+            let output = entry.tool.output_schema().expect("archived schemas inflate");
             (input.len(), output.map(|schema| schema.len()))
         });
 }

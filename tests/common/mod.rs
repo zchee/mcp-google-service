@@ -211,9 +211,7 @@ where
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("binding an ephemeral loopback port");
-    let addr = listener
-        .local_addr()
-        .expect("a bound listener reports its address");
+    let addr = listener.local_addr().expect("a bound listener reports its address");
 
     let accept_loop = tokio::spawn(async move {
         loop {
@@ -317,9 +315,7 @@ where
         // `reject` requests are refused and the rest pass through.
         let reject = self
             .reject_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok();
         if reject {
             return Box::pin(async {
@@ -408,10 +404,7 @@ impl ServerHandler for SyntheticUpstream {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: Self::tools(),
-            ..Default::default()
-        })
+        Ok(ListToolsResult { tools: Self::tools(), ..Default::default() })
     }
 
     async fn call_tool(
@@ -476,10 +469,7 @@ impl McpUpstream {
 
     /// Every request's headers, in arrival order.
     pub fn all_requests(&self) -> Vec<HashMap<String, String>> {
-        self.observed
-            .lock()
-            .expect("observed-header mutex is never held across a panic")
-            .clone()
+        self.observed.lock().expect("observed-header mutex is never held across a panic").clone()
     }
 
     /// How many MCP `initialize` handshakes this upstream has served.
@@ -492,10 +482,7 @@ impl McpUpstream {
     /// id -- which is exactly what the dispatch-cache acceptance test asserts,
     /// and it needs no access to request bodies.
     pub fn initialize_count(&self) -> usize {
-        self.all_requests()
-            .iter()
-            .filter(|headers| !headers.contains_key("mcp-session-id"))
-            .count()
+        self.all_requests().iter().filter(|headers| !headers.contains_key("mcp-session-id")).count()
     }
 }
 
@@ -537,10 +524,7 @@ pub async fn spawn_mcp_upstream_rejecting(
 
     let service = StreamableHttpService::new(
         move || {
-            Ok(SyntheticUpstream {
-                observed: Arc::clone(&handler_observed),
-                label: label.clone(),
-            })
+            Ok(SyntheticUpstream { observed: Arc::clone(&handler_observed), label: label.clone() })
         },
         Arc::new(LocalSessionManager::default()),
         config,
@@ -553,11 +537,7 @@ pub async fn spawn_mcp_upstream_rejecting(
         },
         observed: Arc::clone(&observed),
     };
-    let server = spawn_tls(
-        hostnames.iter().map(|h| (*h).to_owned()).collect(),
-        recording,
-    )
-    .await;
+    let server = spawn_tls(hostnames.iter().map(|h| (*h).to_owned()).collect(), recording).await;
 
     McpUpstream { server, observed }
 }
@@ -618,10 +598,7 @@ pub async fn spawn_counting_service_usage_stub(
                 .and_then(|token| token.rsplit("page-").next().and_then(|n| n.parse().ok()))
                 .unwrap_or(0usize);
 
-            let body = pages
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| service_usage_page(&[], None));
+            let body = pages.get(index).cloned().unwrap_or_else(|| service_usage_page(&[], None));
             Ok::<_, Infallible>(json_response(StatusCode::OK, body))
         }
     });
@@ -667,7 +644,5 @@ pub fn client_resolving(entries: &[(&str, SocketAddr)]) -> reqwest::Client {
     for (host, addr) in entries {
         builder = builder.resolve(host, *addr);
     }
-    builder
-        .build()
-        .expect("the test client configuration is valid")
+    builder.build().expect("the test client configuration is valid")
 }

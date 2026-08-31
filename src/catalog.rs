@@ -405,25 +405,15 @@ impl ArchivedTool {
             return Ok(parsed);
         }
         let inflate = |frame: &[u8], len: u32| -> Result<Arc<JsonObject>, SchemaError> {
-            let raw = crate::archive::decompress_schema(frame, len).map_err(|source| {
-                SchemaError::Inflate {
-                    tool: self.name.clone(),
-                    source,
-                }
-            })?;
-            let object: JsonObject =
-                serde_json::from_slice(&raw).map_err(|source| SchemaError::Parse {
-                    tool: self.name.clone(),
-                    source,
-                })?;
+            let raw = crate::archive::decompress_schema(frame, len)
+                .map_err(|source| SchemaError::Inflate { tool: self.name.clone(), source })?;
+            let object: JsonObject = serde_json::from_slice(&raw)
+                .map_err(|source| SchemaError::Parse { tool: self.name.clone(), source })?;
             Ok(Arc::new(object))
         };
         let parsed = ParsedSchemas {
             input: inflate(self.input_frame, self.input_len)?,
-            output: self
-                .output_frame
-                .map(|frame| inflate(frame, self.output_len))
-                .transpose()?,
+            output: self.output_frame.map(|frame| inflate(frame, self.output_len)).transpose()?,
         };
         // A concurrent caller may have won; either value came from the same
         // frames, so whichever landed is served.
@@ -536,10 +526,7 @@ pub struct Catalog {
 
 impl Clone for Catalog {
     fn clone(&self) -> Self {
-        Self {
-            services: self.services.clone(),
-            index: OnceLock::new(),
-        }
+        Self { services: self.services.clone(), index: OnceLock::new() }
     }
 }
 
@@ -625,11 +612,7 @@ struct ServiceReference {
 
 impl ServiceReference {
     /// The query does not name this service.
-    const NONE: Self = Self {
-        score: 0,
-        start: 0,
-        end: 0,
-    };
+    const NONE: Self = Self { score: 0, start: 0, end: 0 };
 
     /// Whether the token at `position` is part of the reference.
     fn covers(&self, position: usize) -> bool {
@@ -738,23 +721,17 @@ impl Catalog {
     pub fn new(mut services: Vec<ServiceCatalog>) -> Result<Self, CatalogError> {
         services.sort_by(|a, b| a.service_id.cmp(&b.service_id));
         for service in &mut services {
-            service
-                .tools
-                .sort_by(|a, b| a.namespaced_name.cmp(&b.namespaced_name));
+            service.tools.sort_by(|a, b| a.namespaced_name.cmp(&b.namespaced_name));
         }
 
-        let catalog = Self {
-            services,
-            index: OnceLock::new(),
-        };
+        let catalog = Self { services, index: OnceLock::new() };
         catalog.validate()?;
         Ok(catalog)
     }
 
     /// The search index, built on first use.
     fn index(&self) -> &SearchIndex {
-        self.index
-            .get_or_init(|| SearchIndex::build(&self.services))
+        self.index.get_or_init(|| SearchIndex::build(&self.services))
     }
 
     /// Materialize a catalog from an archived snapshot.
@@ -791,11 +768,7 @@ impl Catalog {
             }
             services.push(ServiceCatalog {
                 service_id,
-                source: if service.live {
-                    CatalogSource::Live
-                } else {
-                    CatalogSource::Snapshot
-                },
+                source: if service.live { CatalogSource::Live } else { CatalogSource::Snapshot },
                 tools,
             });
         }
@@ -810,10 +783,7 @@ impl Catalog {
                 let name = tool.namespaced_name.as_str();
                 let len = name.chars().count();
                 if len > MAX_TOOL_NAME_LEN {
-                    return Err(CatalogError::ToolNameTooLong {
-                        name: name.to_owned(),
-                        len,
-                    });
+                    return Err(CatalogError::ToolNameTooLong { name: name.to_owned(), len });
                 }
                 if let Some(first) = seen.insert(name, service.service_id.as_str()) {
                     return Err(CatalogError::DuplicateToolName {
@@ -936,10 +906,7 @@ impl Catalog {
     /// Resolve a namespaced name to its tool.
     pub fn get(&self, namespaced_name: &str) -> Option<&NamespacedTool> {
         let service_id = split_namespaced(namespaced_name)?.0;
-        self.service(service_id)?
-            .tools
-            .iter()
-            .find(|t| t.namespaced_name == namespaced_name)
+        self.service(service_id)?.tools.iter().find(|t| t.namespaced_name == namespaced_name)
     }
 
     /// Resolve a namespaced name to the service that serves it.
@@ -1052,10 +1019,7 @@ impl Catalog {
         candidates.sort_unstable();
         for &(Reverse(score), tool_index) in &candidates {
             let entry = &index.tools[tool_index];
-            visit(SearchHit {
-                score,
-                tool: &self.services[entry.service].tools[entry.tool],
-            });
+            visit(SearchHit { score, tool: &self.services[entry.service].tools[entry.tool] });
         }
 
         candidates.clear();
@@ -1090,10 +1054,7 @@ impl Catalog {
             services: self
                 .services
                 .iter()
-                .map(|service| ServiceCatalog {
-                    source,
-                    ..service.clone()
-                })
+                .map(|service| ServiceCatalog { source, ..service.clone() })
                 .collect(),
             index: OnceLock::new(),
         }
@@ -1133,17 +1094,12 @@ impl Catalog {
 
     /// Index of every tool by namespaced name.
     fn by_name(&self) -> BTreeMap<&str, &NamespacedTool> {
-        self.tools()
-            .map(|tool| (tool.namespaced_name.as_str(), tool))
-            .collect()
+        self.tools().map(|tool| (tool.namespaced_name.as_str(), tool)).collect()
     }
 
     /// Pair this catalog with a timestamp for serialization.
     pub fn to_snapshot(&self, generated_at: String) -> Snapshot {
-        Snapshot {
-            generated_at,
-            services: self.services.clone(),
-        }
+        Snapshot { generated_at, services: self.services.clone() }
     }
 
     /// Render this catalog as newline-terminated snapshot JSON.
@@ -1221,17 +1177,10 @@ impl SearchIndex {
                     description,
                 });
             }
-            indexed_services.push(IndexedService {
-                id,
-                tools: first..tools.len(),
-            });
+            indexed_services.push(IndexedService { id, tools: first..tools.len() });
         }
 
-        Self {
-            text: text.into_boxed_str(),
-            services: indexed_services,
-            tools,
-        }
+        Self { text: text.into_boxed_str(), services: indexed_services, tools }
     }
 
     /// The text a span covers.
@@ -1253,10 +1202,7 @@ fn push_lowercase(out: &mut String, text: &str) -> Span {
     } else {
         out.extend(text.chars().flat_map(char::to_lowercase));
     }
-    Span {
-        start,
-        end: out.len(),
-    }
+    Span { start, end: out.len() }
 }
 
 /// Append `name` lowercased with CamelCase words broken apart by `_`.
@@ -1281,10 +1227,7 @@ fn push_name_words(out: &mut String, name: &str) -> Span {
         out.extend(current.to_lowercase());
         previous = Some(current);
     }
-    Span {
-        start,
-        end: out.len(),
-    }
+    Span { start, end: out.len() }
 }
 
 /// Lowercase `text` into `buf`, or `None` if it does not fit.
@@ -1335,9 +1278,7 @@ fn collect_tokens<'q>(query: &'q str, buf: &mut [&'q str]) -> Option<usize> {
 /// spelling, and among equals the longer run wins, so that more of the query
 /// is explained by the service reference.
 fn service_reference(service_id: &str, tokens: &[&str]) -> ServiceReference {
-    let core = service_id
-        .strip_prefix(SERVICE_BRAND_PREFIX)
-        .filter(|rest| !rest.is_empty());
+    let core = service_id.strip_prefix(SERVICE_BRAND_PREFIX).filter(|rest| !rest.is_empty());
 
     let mut best = ServiceReference::NONE;
     for start in 0..tokens.len() {
@@ -1379,11 +1320,7 @@ fn spells(target: &str, tokens: &[&str]) -> Spelling {
             None => return Spelling::No,
         }
     }
-    if rest.is_empty() {
-        Spelling::Whole
-    } else {
-        Spelling::Prefix
-    }
+    if rest.is_empty() { Spelling::Whole } else { Spelling::Prefix }
 }
 
 /// Score one indexed tool against the query tokens, or `None` if a token
@@ -1453,10 +1390,7 @@ fn contains_sequence(haystack: &str, tokens: &[&str], separator: char) -> bool {
     haystack.match_indices(first).any(|(at, _)| {
         let mut tail = &haystack[at + first.len()..];
         rest.iter().all(|token| {
-            match tail
-                .strip_prefix(separator)
-                .and_then(|after| after.strip_prefix(token))
-            {
+            match tail.strip_prefix(separator).and_then(|after| after.strip_prefix(token)) {
                 Some(after) => {
                     tail = after;
                     true
@@ -1527,11 +1461,9 @@ pub fn load_snapshot_file(path: &Path) -> Result<Snapshot, CatalogError> {
         path: path.display().to_string(),
         source,
     })?;
-    let snapshot =
-        serde_json::from_str::<Snapshot>(&raw).map_err(|source| CatalogError::SnapshotInvalid {
-            path: path.display().to_string(),
-            source,
-        })?;
+    let snapshot = serde_json::from_str::<Snapshot>(&raw).map_err(|source| {
+        CatalogError::SnapshotInvalid { path: path.display().to_string(), source }
+    })?;
     tracing::info!(path = %path.display(), "loaded catalog snapshot from an explicit path");
     Ok(snapshot)
 }
@@ -1629,10 +1561,7 @@ mod tests {
         ServiceCatalog {
             service_id: service_id.to_owned(),
             source: CatalogSource::Live,
-            tools: tools
-                .iter()
-                .map(|(n, d)| NamespacedTool::new(service_id, tool(n, d)))
-                .collect(),
+            tools: tools.iter().map(|(n, d)| NamespacedTool::new(service_id, tool(n, d))).collect(),
         }
     }
 
@@ -1645,10 +1574,7 @@ mod tests {
                     ("get_service", "Get one Cloud Run service"),
                 ],
             ),
-            service(
-                "bigquery",
-                &[("list_datasets", "List BigQuery datasets in a project")],
-            ),
+            service("bigquery", &[("list_datasets", "List BigQuery datasets in a project")]),
         ])
         .expect("sample catalog satisfies namespacing invariants")
     }
@@ -1747,10 +1673,7 @@ mod tests {
         let catalog = Catalog::new(vec![service("run", &[(name.as_str(), "d")])])
             .expect("a name of exactly the limit is valid");
         assert_eq!(
-            catalog
-                .tools()
-                .next()
-                .map(|t| t.namespaced_name.chars().count()),
+            catalog.tools().next().map(|t| t.namespaced_name.chars().count()),
             Some(MAX_TOOL_NAME_LEN)
         );
     }
@@ -1758,19 +1681,12 @@ mod tests {
     #[test]
     fn catalog_orders_services_and_tools_deterministically() {
         let catalog = sample_catalog();
-        let service_ids: Vec<&str> = catalog
-            .services
-            .iter()
-            .map(|s| s.service_id.as_str())
-            .collect();
+        let service_ids: Vec<&str> =
+            catalog.services.iter().map(|s| s.service_id.as_str()).collect();
         assert_eq!(service_ids, ["bigquery", "run"]);
 
         let run = catalog.service("run").expect("run is present");
-        let names: Vec<&str> = run
-            .tools
-            .iter()
-            .map(|t| t.namespaced_name.as_str())
-            .collect();
+        let names: Vec<&str> = run.tools.iter().map(|t| t.namespaced_name.as_str()).collect();
         assert_eq!(names, ["run__get_service", "run__list_services"]);
     }
 
@@ -1783,18 +1699,13 @@ mod tests {
             Some("list_services")
         );
         assert_eq!(
-            catalog
-                .service_of("run__list_services")
-                .map(|s| s.service_id.as_str()),
+            catalog.service_of("run__list_services").map(|s| s.service_id.as_str()),
             Some("run")
         );
 
         assert!(catalog.get("run__missing").is_none());
         assert!(catalog.get("unknown__tool").is_none());
-        assert!(
-            catalog.get("list_services").is_none(),
-            "unprefixed names must not resolve"
-        );
+        assert!(catalog.get("list_services").is_none(), "unprefixed names must not resolve");
         assert!(catalog.service_of("run__missing").is_none());
     }
 
@@ -1818,11 +1729,8 @@ mod tests {
         )])
         .expect("valid");
 
-        let names: Vec<&str> = catalog
-            .search("beta", None)
-            .iter()
-            .map(|t| t.namespaced_name.as_str())
-            .collect();
+        let names: Vec<&str> =
+            catalog.search("beta", None).iter().map(|t| t.namespaced_name.as_str()).collect();
         assert_eq!(names, ["run__beta_tool", "run__alpha"]);
     }
 
@@ -1830,11 +1738,8 @@ mod tests {
     fn search_matches_descriptions_when_names_do_not() {
         let catalog = sample_catalog();
         // "datasets" appears in one name; "cloud" only ever in descriptions.
-        let names: Vec<&str> = catalog
-            .search("cloud", None)
-            .iter()
-            .map(|t| t.namespaced_name.as_str())
-            .collect();
+        let names: Vec<&str> =
+            catalog.search("cloud", None).iter().map(|t| t.namespaced_name.as_str()).collect();
         assert_eq!(names, ["run__get_service", "run__list_services"]);
     }
 
@@ -1842,10 +1747,7 @@ mod tests {
     fn search_is_conjunctive_over_tokens() {
         let catalog = sample_catalog();
         assert_eq!(catalog.search("list datasets", None).len(), 1);
-        assert!(
-            catalog.search("list nonexistentterm", None).is_empty(),
-            "every token must match"
-        );
+        assert!(catalog.search("list nonexistentterm", None).is_empty(), "every token must match");
     }
 
     #[test]
@@ -1865,17 +1767,11 @@ mod tests {
     #[test]
     fn search_order_is_deterministic_across_repeated_calls() {
         let catalog = sample_catalog();
-        let first: Vec<&str> = catalog
-            .search("list", None)
-            .iter()
-            .map(|t| t.namespaced_name.as_str())
-            .collect();
+        let first: Vec<&str> =
+            catalog.search("list", None).iter().map(|t| t.namespaced_name.as_str()).collect();
         for _ in 0..8 {
-            let again: Vec<&str> = catalog
-                .search("list", None)
-                .iter()
-                .map(|t| t.namespaced_name.as_str())
-                .collect();
+            let again: Vec<&str> =
+                catalog.search("list", None).iter().map(|t| t.namespaced_name.as_str()).collect();
             assert_eq!(first, again);
         }
     }
@@ -1896,19 +1792,11 @@ mod tests {
         // The file records `live` because the tools were live when it was
         // generated; a process serving those bytes must not inherit that claim.
         let stored = sample_catalog();
-        assert!(
-            stored
-                .services
-                .iter()
-                .all(|s| s.source == CatalogSource::Live)
-        );
+        assert!(stored.services.iter().all(|s| s.source == CatalogSource::Live));
 
         let served = stored.marked_as(CatalogSource::Snapshot);
         assert!(
-            served
-                .services
-                .iter()
-                .all(|s| s.source == CatalogSource::Snapshot),
+            served.services.iter().all(|s| s.source == CatalogSource::Snapshot),
             "serving from disk must report snapshot provenance"
         );
         // Only the label changes.
@@ -1940,10 +1828,7 @@ mod tests {
             "run",
             // `stable` keeps its name and schema but changes description text;
             // this is the cloudcli replica-variance case and must NOT be drift.
-            &[
-                ("stable", "COMPLETELY DIFFERENT TEXT"),
-                ("added_later", "d"),
-            ],
+            &[("stable", "COMPLETELY DIFFERENT TEXT"), ("added_later", "d")],
         )])
         .expect("valid");
 
@@ -1989,10 +1874,8 @@ mod tests {
 
     /// Directory for this test process's snapshot fixtures.
     fn fixture_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mcp-google-service-catalog-tests-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("mcp-google-service-catalog-tests-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
     }
@@ -2029,9 +1912,7 @@ mod tests {
             "sanity: the embedded archive carries the real registry"
         );
         assert!(
-            served
-                .tools()
-                .all(|entry| matches!(entry.tool, ToolSpec::Archived(_))),
+            served.tools().all(|entry| matches!(entry.tool, ToolSpec::Archived(_))),
             "the default serve path must materialize from the archive, not parse a file"
         );
     }
@@ -2131,43 +2012,21 @@ mod tests {
     fn a_service_reference_is_spelled_by_token_runs() {
         let tests = [
             ("exact: bare id", ("run", "run", SCORE_SERVICE, (0, 1))),
-            (
-                "exact: brand dropped from the query",
-                ("run", "cloud run", SCORE_SERVICE, (0, 2)),
-            ),
+            ("exact: brand dropped from the query", ("run", "cloud run", SCORE_SERVICE, (0, 2))),
             (
                 "exact: id inside a longer query",
                 ("run", "list cloud run services", SCORE_SERVICE, (1, 3)),
             ),
-            (
-                "exact: brand dropped from the id",
-                ("cloudasset", "asset", SCORE_SERVICE, (0, 1)),
-            ),
-            (
-                "exact: brand on both sides",
-                ("cloudasset", "cloud asset", SCORE_SERVICE, (0, 2)),
-            ),
+            ("exact: brand dropped from the id", ("cloudasset", "asset", SCORE_SERVICE, (0, 1))),
+            ("exact: brand on both sides", ("cloudasset", "cloud asset", SCORE_SERVICE, (0, 2))),
             (
                 "exact: multi-token spelling",
-                (
-                    "bigquerydatatransfer",
-                    "bigquery data transfer",
-                    SCORE_SERVICE,
-                    (0, 3),
-                ),
+                ("bigquerydatatransfer", "bigquery data transfer", SCORE_SERVICE, (0, 3)),
             ),
-            (
-                "exact: split product name",
-                ("bigquery", "big query", SCORE_SERVICE, (0, 2)),
-            ),
+            ("exact: split product name", ("bigquery", "big query", SCORE_SERVICE, (0, 2))),
             (
                 "exact: brand inside the id",
-                (
-                    "geminicloudassist",
-                    "gemini cloud assist",
-                    SCORE_SERVICE,
-                    (0, 3),
-                ),
+                ("geminicloudassist", "gemini cloud assist", SCORE_SERVICE, (0, 3)),
             ),
             (
                 "prefix: product name shorter than the id",
@@ -2175,26 +2034,15 @@ mod tests {
             ),
             (
                 "prefix: single token",
-                (
-                    "bigquerydatatransfer",
-                    "bigquery",
-                    SCORE_SERVICE_PREFIX,
-                    (0, 1),
-                ),
+                ("bigquerydatatransfer", "bigquery", SCORE_SERVICE_PREFIX, (0, 1)),
             ),
             (
                 "prefix: a lone token can still start the id",
                 ("bigquery", "query big", SCORE_SERVICE_PREFIX, (1, 2)),
             ),
-            (
-                "none: brand alone names nothing",
-                ("cloudcli", "cloud", 0, (0, 0)),
-            ),
+            ("none: brand alone names nothing", ("cloudcli", "cloud", 0, (0, 0))),
             ("none: unrelated token", ("run", "bigquery", 0, (0, 0))),
-            (
-                "none: no run starts the id",
-                ("bigquery", "data warehouse", 0, (0, 0)),
-            ),
+            ("none: no run starts the id", ("bigquery", "data warehouse", 0, (0, 0))),
         ];
         for (name, (service_id, query, score, (start, end))) in tests {
             let tokens: Vec<&str> = query.split_whitespace().collect();
@@ -2210,23 +2058,11 @@ mod tests {
     #[test]
     fn camelcase_names_index_as_snake_words() {
         let tests: HashMap<&str, (&str, &str)> = HashMap::from([
-            (
-                "snake case is untouched",
-                ("list_services", "list_services"),
-            ),
-            (
-                "camel words split",
-                ("CreateBackupPlan", "create_backup_plan"),
-            ),
-            (
-                "acronym ends before a word",
-                ("GetIAMPolicy", "get_iam_policy"),
-            ),
+            ("snake case is untouched", ("list_services", "list_services")),
+            ("camel words split", ("CreateBackupPlan", "create_backup_plan")),
+            ("acronym ends before a word", ("GetIAMPolicy", "get_iam_policy")),
             ("digit ends a word", ("Http2Server", "http2_server")),
-            (
-                "existing separator is not doubled",
-                ("Create_Backup", "create_backup"),
-            ),
+            ("existing separator is not doubled", ("Create_Backup", "create_backup")),
         ]);
         for (name, (input, expected)) in tests {
             let mut text = String::new();
@@ -2237,22 +2073,13 @@ mod tests {
 
     #[test]
     fn query_lowercasing_agrees_between_stack_and_heap() {
-        let samples = [
-            "Cloud RUN",
-            "  List   Cloud\tRun  ",
-            "İstanbul",
-            "ΣΊΣΥΦΟΣ",
-            "mixed 🚀 Emoji X",
-        ];
+        let samples =
+            ["Cloud RUN", "  List   Cloud\tRun  ", "İstanbul", "ΣΊΣΥΦΟΣ", "mixed 🚀 Emoji X"];
         for sample in samples {
             let mut buf = [0u8; QUERY_INLINE_BYTES];
             let inline = lowercase_into(sample, &mut buf)
                 .unwrap_or_else(|| panic!("`{sample}` fits the inline buffer"));
-            assert_eq!(
-                inline,
-                lowercase(sample),
-                "stack and heap lowering diverge on `{sample}`"
-            );
+            assert_eq!(inline, lowercase(sample), "stack and heap lowering diverge on `{sample}`");
         }
 
         let oversized = "x".repeat(QUERY_INLINE_BYTES + 1);
@@ -2286,23 +2113,14 @@ mod tests {
         // service reference existed, the name word won — this is the
         // real-model E2E defect in miniature.
         let catalog = Catalog::new(vec![
-            service(
-                "run",
-                &[("get_service", "Get info about a Cloud Run service")],
-            ),
-            service(
-                "bigquery",
-                &[("run_query", "Run a SQL query in Google Cloud")],
-            ),
+            service("run", &[("get_service", "Get info about a Cloud Run service")]),
+            service("bigquery", &[("run_query", "Run a SQL query in Google Cloud")]),
         ])
         .expect("valid");
 
         for query in ["run", "cloud run"] {
-            let names: Vec<&str> = catalog
-                .search(query, None)
-                .iter()
-                .map(|t| t.namespaced_name.as_str())
-                .collect();
+            let names: Vec<&str> =
+                catalog.search(query, None).iter().map(|t| t.namespaced_name.as_str()).collect();
             assert_eq!(
                 names,
                 ["run__get_service", "bigquery__run_query"],
@@ -2337,37 +2155,25 @@ mod tests {
         // exact-name bonus on the camel tool's raw spelling reorders them.
         let catalog = Catalog::new(vec![service(
             "backupdr",
-            &[
-                ("BackupPlan", "d"),
-                ("aaa_first", "mentions backupplan verbatim"),
-            ],
+            &[("BackupPlan", "d"), ("aaa_first", "mentions backupplan verbatim")],
         )])
         .expect("valid");
 
-        let names: Vec<&str> = catalog
-            .search("backupplan", None)
-            .iter()
-            .map(|t| t.upstream_name())
-            .collect();
+        let names: Vec<&str> =
+            catalog.search("backupplan", None).iter().map(|t| t.upstream_name()).collect();
         assert_eq!(names, ["BackupPlan", "aaa_first"]);
     }
 
     #[test]
     fn a_clone_drops_the_index_and_still_searches_identically() {
         let original = sample_catalog();
-        let before: Vec<&str> = original
-            .search("cloud", None)
-            .iter()
-            .map(|t| t.namespaced_name.as_str())
-            .collect();
+        let before: Vec<&str> =
+            original.search("cloud", None).iter().map(|t| t.namespaced_name.as_str()).collect();
 
         let cloned = original.clone();
         assert_eq!(original, cloned, "equality ignores the derived index");
-        let after: Vec<&str> = cloned
-            .search("cloud", None)
-            .iter()
-            .map(|t| t.namespaced_name.as_str())
-            .collect();
+        let after: Vec<&str> =
+            cloned.search("cloud", None).iter().map(|t| t.namespaced_name.as_str()).collect();
         assert_eq!(before, after, "a rebuilt index must rank identically");
     }
 
@@ -2432,25 +2238,13 @@ mod tests {
 
         assert_eq!(archived.tool_count(), parsed.tool_count());
         let drift = archived.drift_from(&parsed);
-        assert!(
-            drift.is_empty(),
-            "archived vs parsed catalogs report drift: {drift:?}"
-        );
+        assert!(drift.is_empty(), "archived vs parsed catalogs report drift: {drift:?}");
 
         // Spot-check one full rmcp materialization against the parsed truth.
         let name = "run__list_services";
-        let from_archive = archived
-            .get(name)
-            .expect("present")
-            .tool
-            .to_rmcp()
-            .expect("archived schemas inflate");
-        let from_json = parsed
-            .get(name)
-            .expect("present")
-            .tool
-            .to_rmcp()
-            .expect("live");
+        let from_archive =
+            archived.get(name).expect("present").tool.to_rmcp().expect("archived schemas inflate");
+        let from_json = parsed.get(name).expect("present").tool.to_rmcp().expect("live");
         assert_eq!(from_archive, from_json);
     }
 
@@ -2460,14 +2254,8 @@ mod tests {
     fn a_broken_frame_is_a_clean_schema_error() {
         let broken = ToolSpec::broken_for_tests("list_services");
         assert_eq!(broken.name(), "list_services");
-        assert!(matches!(
-            broken.input_schema(),
-            Err(SchemaError::Inflate { .. })
-        ));
-        assert!(matches!(
-            broken.output_schema(),
-            Err(SchemaError::Inflate { .. })
-        ));
+        assert!(matches!(broken.input_schema(), Err(SchemaError::Inflate { .. })));
+        assert!(matches!(broken.output_schema(), Err(SchemaError::Inflate { .. })));
         assert!(matches!(broken.to_rmcp(), Err(SchemaError::Inflate { .. })));
         let error = broken.input_schema().expect_err("still broken");
         assert!(error.to_string().contains("list_services"));
@@ -2488,16 +2276,10 @@ mod tests {
         let parsed = parsed.into_catalog().expect("valid");
 
         for query in ["cloud run", "instances", "execute sql", ""] {
-            let a: Vec<&str> = archived
-                .search(query, None)
-                .iter()
-                .map(|t| t.namespaced_name.as_str())
-                .collect();
-            let b: Vec<&str> = parsed
-                .search(query, None)
-                .iter()
-                .map(|t| t.namespaced_name.as_str())
-                .collect();
+            let a: Vec<&str> =
+                archived.search(query, None).iter().map(|t| t.namespaced_name.as_str()).collect();
+            let b: Vec<&str> =
+                parsed.search(query, None).iter().map(|t| t.namespaced_name.as_str()).collect();
             assert_eq!(a, b, "ranking diverged for `{query}`");
         }
     }

@@ -146,10 +146,7 @@ fn validate_quota_project(value: &str) -> Result<(), Error> {
             PROJECT_ID_LEN.end()
         ));
     }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if !value.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
         return invalid(
             "it contains characters outside lowercase letters, digits and hyphens".to_owned(),
         );
@@ -282,13 +279,9 @@ mod tests {
     fn valid_project_ids_are_accepted() {
         // Real shapes plus both length boundaries, so the range is exercised
         // from inside rather than only from outside.
-        for id in [
-            "my-project",
-            "gwskey-6",
-            "test-project",
-            "abcdef",
-            "a23456789012345678901234567890",
-        ] {
+        for id in
+            ["my-project", "gwskey-6", "test-project", "abcdef", "a23456789012345678901234567890"]
+        {
             assert!(
                 validate_quota_project(id).is_ok(),
                 "`{id}` is a well-formed project id and must be accepted"
@@ -366,10 +359,8 @@ mod tests {
 
     #[test]
     fn adc_file_without_quota_project_id() {
-        let path = write_temp(
-            "adc-without-quota.json",
-            r#"{"client_id":"x","type":"authorized_user"}"#,
-        );
+        let path =
+            write_temp("adc-without-quota.json", r#"{"client_id":"x","type":"authorized_user"}"#);
         assert_eq!(quota_project_from_adc(&path), None);
     }
 
