@@ -289,7 +289,8 @@ impl Proxy {
         generation: TokenGeneration,
         headers: HashMap<HeaderName, HeaderValue>,
         tool_name: &str,
-    ) -> Result<Arc<RunningService<RoleClient, ()>>, rmcp::service::ClientInitializeError> {
+    ) -> Result<Arc<RunningService<RoleClient, ()>>, Box<rmcp::service::ClientInitializeError>>
+    {
         {
             let mut sessions = self.sessions.lock().await;
             self.evict_idle(&mut sessions);
