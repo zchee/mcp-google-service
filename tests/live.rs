@@ -182,6 +182,93 @@ async fn live_developerknowledge_search_documents_dispatches_without_error() {
     session.shutdown().await;
 }
 
+/// Every endpoint added on 2026-08-31 (UTC) must still answer live discovery.
+///
+/// Discovery is credential-free, so a failure here means the endpoint itself
+/// regressed (or the registry entry rotted), not that the operator's project
+/// lacks an enablement.
+#[tokio::test]
+async fn live_2026_08_endpoints_answer_discovery() {
+    if live_project().is_none() {
+        return;
+    }
+
+    const NEW_IDS: &[&str] = &[
+        "cloudbilling",
+        "datalineage",
+        "androidmanagement",
+        "design",
+        "homedevelopers",
+        "mapscodeassist",
+        "paydeveloper",
+        "stitch",
+        "ces",
+        "vertex-endpoints",
+        "vertex-evaluation",
+        "vertex-generate",
+        "vertex-models",
+        "vtx-notebook",
+        "vertex-predict",
+        "vertex-prompts",
+        "vertex-retrieval",
+        "vertex-tuning",
+    ];
+
+    let http = shared_http_client().expect("the shared HTTP client builds");
+    let new_endpoints = registry::ENDPOINTS.iter().filter(|e| NEW_IDS.contains(&e.service_id));
+    // No fallback on purpose: a host that stops answering must fail loudly
+    // here instead of being papered over by the snapshot.
+    let fresh = catalog::Catalog::build_live(new_endpoints, &http, None)
+        .await
+        .expect("a live fan-out degrades per host rather than failing outright");
+
+    let mut live_ids: Vec<&str> = fresh
+        .services
+        .iter()
+        .filter(|s| s.source == catalog::CatalogSource::Live)
+        .map(|s| s.service_id.as_str())
+        .collect();
+    live_ids.sort_unstable();
+    let mut expected = NEW_IDS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        live_ids, expected,
+        "every 2026-08-31 endpoint must answer discovery live; anything \
+         missing regressed upstream or rotted in the registry"
+    );
+}
+
+/// `vertex-generate__generate_content` must round-trip with credentials.
+///
+/// This is the pre-mortem check for the global-host decision: discovery is
+/// credential-free, but only an authenticated call proves dispatch attaches
+/// a token the global `aiplatform.googleapis.com` front end accepts.
+#[tokio::test]
+async fn live_vertex_generate_content_dispatches_without_error() {
+    let Some(project) = live_project() else {
+        return;
+    };
+    let session = LiveSession::start(&project).await;
+
+    let result = session
+        .dispatch(
+            "vertex-generate__generate_content",
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{ "role": "user", "parts": [{ "text": "Reply with the single word: ok" }] }],
+                "generationConfig": { "maxOutputTokens": 16 }
+            }),
+        )
+        .await;
+    assert_live_dispatch_ok("vertex-generate__generate_content", &result);
+    eprintln!(
+        "live vertex-generate__generate_content returned {} content block(s)",
+        result.content.len()
+    );
+
+    session.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Section 5.7 / ledger #5a -- latency targets
 // ---------------------------------------------------------------------------

@@ -530,6 +530,39 @@ async fn only_the_enabled_services_are_exposed() {
     stub.shutdown().await;
 }
 
+/// The irregular registry entries prune like any other: `ces` rides its own
+/// API name, and one `aiplatform.googleapis.com` toggle fans out to every
+/// Vertex suite while everything else stays pruned.
+#[test]
+fn enablement_fans_out_to_the_vertex_suites_and_reaches_ces() {
+    let enabled: std::collections::HashSet<String> =
+        ["aiplatform.googleapis.com", "ces.googleapis.com"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+    let exposed = prune::select_services(registry::ENDPOINTS, Some(&enabled), &[], &[]);
+    let exposed_ids: Vec<&str> = exposed.iter().map(|e| e.service_id).collect();
+
+    assert_eq!(
+        exposed_ids,
+        vec![
+            "ces",
+            "vertex-endpoints",
+            "vertex-evaluation",
+            "vertex-generate",
+            "vertex-models",
+            "vtx-notebook",
+            "vertex-predict",
+            "vertex-prompts",
+            "vertex-retrieval",
+            "vertex-tuning",
+        ],
+        "two enabled APIs must select ces plus all nine Vertex suites, in \
+         registry order, and nothing else"
+    );
+}
+
 /// A service catalog with one recognisable tool, for pruning assertions.
 fn synthetic_service(service_id: &str, source: CatalogSource) -> ServiceCatalog {
     use rmcp::model::Tool;

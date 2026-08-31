@@ -41,7 +41,7 @@ pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 /// closed first.
 ///
 /// A typical project enables a handful of the registered APIs, so this is
-/// headroom, not a working limit; it exists so that 47 idle sessions cannot
+/// headroom, not a working limit; it exists so that 65 idle sessions cannot
 /// accumulate on a server that touched every service once.
 pub const MAX_SESSIONS: usize = 16;
 
@@ -536,8 +536,7 @@ mod tests {
                 route.host
             );
             assert!(
-                route.mcp_url.starts_with("https://")
-                    && route.mcp_url.ends_with(".googleapis.com/mcp"),
+                route.mcp_url.starts_with(&format!("https://{}/mcp", route.host)),
                 "route `{}` has a URL dispatch should never post a token to: {}",
                 route.service_id,
                 route.mcp_url
