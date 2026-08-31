@@ -1,1 +1,28 @@
+# rustfmt configuration for a stable toolchain: every option below is stable,
+# so a toolchain bump cannot silently change what this file emits the way a
+# floating nightly with unstable options can. The nightly variant
+# (rustfmt.nightly.toml) layers the unstable options on top of these same
+# choices.
+
+# Match the workspace edition so rustfmt parses 2024 syntax.
+edition = "2024"
+
+# Pin the formatting style itself, separately from the parse edition, so a
+# future toolchain moving the default style cannot reformat the tree
+# overnight.
 style_edition = "2024"
+
+# rustfmt's own default, restated so the width every option below leans on is
+# stated here rather than remembered.
+max_width = 100
+
+# Every width heuristic (fn_call_width, chain_width, struct_lit_width, …)
+# follows max_width: whatever fits in 100 columns stays on one line. The
+# accepted cost is layout flips at the threshold — adding one argument can
+# re-flow a whole call between one line and many — so diffs run larger than
+# the edits that caused them.
+use_small_heuristics = "Max"
+
+# Always emit LF line endings regardless of platform or checkout state, so a
+# Windows checkout (or a stray CRLF file) cannot leak CRLF into the tree.
+newline_style = "Unix"
