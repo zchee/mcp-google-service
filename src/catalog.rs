@@ -106,6 +106,14 @@ const SCORE_EXACT_NAME: u32 = 32;
 /// reference by itself, and is dropped when the rest of the run spells one.
 const SERVICE_BRAND_PREFIX: &str = "cloud";
 
+/// Characters that join words inside a service id (`vertex-generate`).
+///
+/// They are word boundaries, not letters: a query spells the id word by
+/// word, so `vertex generate` names `vertex-generate` the way `cloud asset`
+/// names `cloudasset`. Only the manual registry entries carry one; every
+/// derived id is a single unbroken word.
+const SERVICE_ID_SEPARATORS: [char; 2] = ['-', '_'];
+
 /// Query bytes lowercased on the stack before the heap is involved.
 const QUERY_INLINE_BYTES: usize = 512;
 
@@ -937,9 +945,12 @@ impl Catalog {
     /// than widens the result. A token matches a tool when it
     ///
     /// * is part of a run of tokens that spells the tool's service id
-    ///   (`cloud run`, `run`, `big query`, `resource manager`, `cloud asset`),
-    ///   a leading `cloud` being brand rather than id; a run that spells only
-    ///   the start of an id (`cloud sql` for `sqladmin`) also counts, for less;
+    ///   (`cloud run`, `run`, `big query`, `resource manager`, `cloud asset`,
+    ///   `vertex generate` for `vertex-generate`), a leading `cloud` being
+    ///   brand rather than id and a `-` or `_` in the id being a word
+    ///   boundary; a run that spells only the start of an id (`cloud sql` for
+    ///   `sqladmin`, `vertex` for every `vertex-*` suite) also counts, for
+    ///   less;
     /// * equals, starts, or occurs inside a word of the tool's upstream name
     ///   (`_`-separated; CamelCase names are split the same way); or
     /// * occurs anywhere in the description.
@@ -1274,9 +1285,11 @@ fn collect_tokens<'q>(query: &'q str, buf: &mut [&'q str]) -> Option<usize> {
 /// that is only that word names nothing. The run is compared with the id and,
 /// when the id itself starts with the brand word, with the id minus that
 /// prefix, so `cloud asset`, `asset` and `cloudasset` all name `cloudasset`
-/// while `cloud run` names `run`. A whole-id spelling beats a prefix
-/// spelling, and among equals the longer run wins, so that more of the query
-/// is explained by the service reference.
+/// while `cloud run` names `run`. A [`SERVICE_ID_SEPARATORS`] character in
+/// the id is skipped between tokens, so `vertex generate` names
+/// `vertex-generate` and `vertex` alone is a prefix of every `vertex-*` id.
+/// A whole-id spelling beats a prefix spelling, and among equals the longer
+/// run wins, so that more of the query is explained by the service reference.
 fn service_reference(service_id: &str, tokens: &[&str]) -> ServiceReference {
     let core = service_id.strip_prefix(SERVICE_BRAND_PREFIX).filter(|rest| !rest.is_empty());
 
@@ -1312,9 +1325,17 @@ fn service_reference(service_id: &str, tokens: &[&str]) -> ServiceReference {
 }
 
 /// Whether `tokens`, concatenated, spell all or the start of `target`.
+///
+/// A [`SERVICE_ID_SEPARATORS`] character in `target` is a word boundary and
+/// is skipped before each token, so `vertex generate` spells
+/// `vertex-generate` exactly as `cloud asset` spells `cloudasset`. A token
+/// that carries the separator itself (`vertex-generate` typed whole) still
+/// matches: the trim only removes separators standing between the previous
+/// token's end and this token, and an id never starts with one.
 fn spells(target: &str, tokens: &[&str]) -> Spelling {
     let mut rest = target;
     for token in tokens {
+        rest = rest.trim_start_matches(SERVICE_ID_SEPARATORS);
         match rest.strip_prefix(token) {
             Some(after) => rest = after,
             None => return Spelling::No,
@@ -2029,6 +2050,26 @@ mod tests {
                 ("geminicloudassist", "gemini cloud assist", SCORE_SERVICE, (0, 3)),
             ),
             (
+                "exact: hyphenated id spelled word by word",
+                ("vertex-generate", "vertex generate", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "exact: hyphenated id typed as one token",
+                ("vertex-generate", "vertex-generate", SCORE_SERVICE, (0, 1)),
+            ),
+            (
+                "exact: hyphenated id inside a longer query",
+                ("vtx-notebook", "list vtx notebook runtimes", SCORE_SERVICE, (1, 3)),
+            ),
+            (
+                "exact: underscore is a word boundary too",
+                ("foo_bar", "foo bar", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "prefix: first word of a hyphenated id",
+                ("vertex-generate", "vertex", SCORE_SERVICE_PREFIX, (0, 1)),
+            ),
+            (
                 "prefix: product name shorter than the id",
                 ("sqladmin", "cloud sql", SCORE_SERVICE_PREFIX, (0, 2)),
             ),
@@ -2043,6 +2084,14 @@ mod tests {
             ("none: brand alone names nothing", ("cloudcli", "cloud", 0, (0, 0))),
             ("none: unrelated token", ("run", "bigquery", 0, (0, 0))),
             ("none: no run starts the id", ("bigquery", "data warehouse", 0, (0, 0))),
+            (
+                "none: the second word of a hyphenated id does not start it",
+                ("vertex-generate", "generate", 0, (0, 0)),
+            ),
+            (
+                "prefix: a separator token spells nothing, the word before it still does",
+                ("vertex-generate", "vertex - generate", SCORE_SERVICE_PREFIX, (0, 1)),
+            ),
         ];
         for (name, (service_id, query, score, (start, end))) in tests {
             let tokens: Vec<&str> = query.split_whitespace().collect();

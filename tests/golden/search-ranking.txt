@@ -81,6 +81,14 @@ cloudresourcemanager__search_projects
 query: bigquery data transfer
 bigquerydatatransfer__create_transfer_config
 
+# -- a `-` in a service id is a word boundary: the two words name the whole
+#    Vertex suite, not just the tool whose name repeats `generate`
+#    (2026-09-01 review; before the fix only `generate_content` was a hit)
+query: vertex generate
+vertex-generate__generate_content
+vertex-generate__count_tokens
+vertex-generate__embed_content
+
 # -- both words are name words of one tool; the `run` service must not win
 #    just because its id appears in the query
 query: run gcloud

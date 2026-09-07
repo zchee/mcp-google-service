@@ -48,6 +48,17 @@ fn ranking(catalog: &Catalog, query: &str) -> Vec<String> {
     catalog.search(query, None).into_iter().map(|tool| tool.namespaced_name.clone()).collect()
 }
 
+/// Every namespaced name a service exposes.
+fn tools_of(catalog: &Catalog, service_id: &str) -> BTreeSet<String> {
+    catalog
+        .service(service_id)
+        .unwrap_or_else(|| panic!("{service_id} is in the snapshot"))
+        .tools
+        .iter()
+        .map(|t| t.namespaced_name.clone())
+        .collect()
+}
+
 /// Parse `tests/golden/search-ranking.txt`.
 fn golden_blocks() -> Vec<GoldenBlock> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/search-ranking.txt");
@@ -199,17 +210,75 @@ fn a_query_that_spells_a_service_id_puts_that_service_first() {
         ("resource manager", "cloudresourcemanager"),
         ("bigquery data transfer", "bigquerydatatransfer"),
         ("error reporting", "clouderrorreporting"),
+        ("vertex generate", "vertex-generate"),
+        ("vtx notebook", "vtx-notebook"),
     ] {
         let ranked = ranking(&catalog, query);
-        let own = catalog
-            .service(service_id)
-            .unwrap_or_else(|| panic!("{service_id} is in the snapshot"))
-            .tools
-            .len();
+        let own = tools_of(&catalog, service_id).len();
         let head: Vec<&str> = ranked.iter().take(own.min(5)).map(String::as_str).collect();
         assert!(
             !head.is_empty() && head.iter().all(|n| n.starts_with(&format!("{service_id}__"))),
             "`{query}` should lead with `{service_id}__*`; head is {head:?}"
+        );
+    }
+}
+
+/// The 2026-09-01 review finding: a `-` in a service id is a word boundary,
+/// so `vertex generate` names `vertex-generate` and every tool of that suite
+/// is a hit, exactly as `cloud asset` names `cloudasset`. Before the fix the
+/// tokens were concatenated against the raw id, `vertexgenerate` never
+/// matched `vertex-generate`, and the whole suite fell to a prefix credit
+/// that a single unrelated description hit could outrank.
+#[test]
+fn a_hyphenated_service_id_is_spelled_word_by_word() {
+    let catalog = committed_catalog();
+    for (query, service_id) in
+        [("vertex generate", "vertex-generate"), ("vtx notebook", "vtx-notebook")]
+    {
+        let own = tools_of(&catalog, service_id);
+        assert!(!own.is_empty(), "{service_id} is in the snapshot");
+        let ranked = ranking(&catalog, query);
+        let head: BTreeSet<String> = ranked.iter().take(own.len()).cloned().collect();
+        assert_eq!(
+            head, own,
+            "`{query}` must lead with every `{service_id}` tool; ranking was {ranked:?}"
+        );
+        // The credit is the whole-id one: a tool whose name says nothing about
+        // the query still scores what `cloud asset` gives `cloudasset`'s tools.
+        let literal = ranking(&catalog, service_id);
+        assert_eq!(
+            literal.iter().take(own.len()).cloned().collect::<BTreeSet<_>>(),
+            own,
+            "the id typed literally (`{service_id}`) names the same suite"
+        );
+    }
+
+    // The single-word spelling that only *starts* the id is still a prefix
+    // credit, so `vertex` alone reaches every `vertex-*` suite ...
+    let vertex: BTreeSet<String> = catalog
+        .tools()
+        .filter(|t| t.service_id.starts_with("vertex-"))
+        .map(|t| t.namespaced_name.clone())
+        .collect();
+    let hits: BTreeSet<String> = ranking(&catalog, "vertex").into_iter().collect();
+    assert!(
+        vertex.is_subset(&hits),
+        "`vertex` should reach every `vertex-*` tool; missing {:?}",
+        vertex.difference(&hits).collect::<Vec<_>>()
+    );
+    // ... but not the notebook suite, whose id had to drop the `vertex-`
+    // prefix for the 64-char name limit. The README says it is reached
+    // through `notebook` and `colab`: each leads with the suite's own tools,
+    // every other hit trailing behind them.
+    let suite = |name: &String| name.starts_with("vtx-notebook__");
+    for query in ["notebook", "colab"] {
+        let hits = ranking(&catalog, query);
+        let last_own = hits.iter().rposition(suite);
+        let first_other = hits.iter().position(|n| !suite(n));
+        assert!(last_own.is_some(), "`{query}` reaches the notebook suite");
+        assert!(
+            first_other.is_none_or(|other| last_own.is_some_and(|own| own < other)),
+            "`{query}` must lead with the notebook suite; ranking was {hits:?}"
         );
     }
 }
