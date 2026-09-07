@@ -42,7 +42,12 @@ pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 ///
 /// A typical project enables a handful of the registered APIs, so this is
 /// headroom, not a working limit; it exists so that 65 idle sessions cannot
-/// accumulate on a server that touched every service once.
+/// accumulate on a server that touched every service once. One enabled API
+/// can stand behind ten of them: the nine Vertex AI suites and the notebook
+/// suite are separate MCP servers on `aiplatform.googleapis.com`, keyed here
+/// by service id, so a project with Vertex AI alone can fill most of this
+/// budget. Reaching it costs the least recently used session a fresh
+/// `initialize` on its next call, never a failure.
 pub const MAX_SESSIONS: usize = 16;
 
 /// Where one service's MCP endpoint lives.
