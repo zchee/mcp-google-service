@@ -48,6 +48,17 @@ fn ranking(catalog: &Catalog, query: &str) -> Vec<String> {
     catalog.search(query, None).into_iter().map(|tool| tool.namespaced_name.clone()).collect()
 }
 
+/// The score `query` gives `name`, or `None` when the tool is not a hit.
+fn score_of(catalog: &Catalog, query: &str, name: &str) -> Option<u32> {
+    let mut found = None;
+    catalog.search_with(query, None, usize::MAX, |hit| {
+        if hit.tool.namespaced_name == name {
+            found = Some(hit.score);
+        }
+    });
+    found
+}
+
 /// Every namespaced name a service exposes.
 fn tools_of(catalog: &Catalog, service_id: &str) -> BTreeSet<String> {
     catalog
@@ -281,6 +292,61 @@ fn a_hyphenated_service_id_is_spelled_word_by_word() {
             "`{query}` must lead with the notebook suite; ranking was {hits:?}"
         );
     }
+}
+
+/// The `list cloud run` golden block puts a Colab Enterprise tool above the
+/// gcloud escape hatch. The mechanism, so the block can be judged on it: the
+/// notebook tool has `list` as a name word, `run` as the start of its name
+/// word `runtime`, and all three tokens in its description, while
+/// `run_gcloud_command` has `run` as a name word but `cloud` only inside
+/// `gcloud`. A name word and a word prefix outweigh a substring, so the
+/// notebook tool scores higher. Neither tool's service is named by the
+/// query: `cloud run` names `run`, whose `list_services` leads.
+#[test]
+fn list_cloud_run_credits_name_words_and_word_prefixes_over_substrings() {
+    let catalog = committed_catalog();
+    const QUERY: &str = "list cloud run";
+    const NOTEBOOK: &str = "vtx-notebook__colab_enterprise_list_notebook_runtime_templates";
+    const GCLOUD: &str = "cloudcli__run_gcloud_command";
+
+    let ranked = ranking(&catalog, QUERY);
+    assert_eq!(ranked.first().map(String::as_str), Some("run__list_services"));
+    let position = |name: &str| {
+        ranked
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("`{name}` matches `{QUERY}`"))
+    };
+    assert!(position(NOTEBOOK) < position(GCLOUD), "ranking was {ranked:?}");
+    let score = |name: &str| score_of(&catalog, QUERY, name).expect("both are hits");
+    assert!(score(NOTEBOOK) > score(GCLOUD), "{} vs {}", score(NOTEBOOK), score(GCLOUD));
+
+    let tool =
+        |name: &str| catalog.get(name).unwrap_or_else(|| panic!("`{name}` is in the snapshot"));
+    let words = |name: &str| -> Vec<&str> { tool(name).upstream_name().split('_').collect() };
+    let description = |name: &str| tool(name).tool.description().unwrap_or("").to_lowercase();
+
+    let notebook_words = words(NOTEBOOK);
+    assert!(notebook_words.contains(&"list"), "`list` is a name word: {notebook_words:?}");
+    assert!(
+        notebook_words.iter().any(|w| w.starts_with("run") && *w != "run"),
+        "`run` only starts a name word (`runtime`): {notebook_words:?}"
+    );
+    assert!(
+        !notebook_words.iter().any(|w| w.contains("cloud")),
+        "`cloud` is not in the name, so it can only be a description hit: {notebook_words:?}"
+    );
+    let notebook_description = description(NOTEBOOK);
+    for token in ["list", "cloud", "run"] {
+        assert!(notebook_description.contains(token), "`{token}` is in the description");
+    }
+
+    let gcloud_words = words(GCLOUD);
+    assert!(gcloud_words.contains(&"run"), "`run` is a name word: {gcloud_words:?}");
+    assert!(
+        !gcloud_words.contains(&"cloud") && gcloud_words.iter().any(|w| w.contains("cloud")),
+        "`cloud` is only a substring of `gcloud`: {gcloud_words:?}"
+    );
 }
 
 #[test]

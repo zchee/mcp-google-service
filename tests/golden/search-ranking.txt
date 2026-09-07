@@ -24,9 +24,15 @@ cloudcli__run_gcloud_command
 query: list cloud run
 run__list_services
 # 2026-08-31 registry growth: the Colab Enterprise runtime-template tool
-# matches all three tokens in its name and outranks the gcloud escape hatch.
-# Pinned as observed; if ranking ever demotes name-substring matches, move
-# the cloudcli pair back up on purpose.
+# outranks the gcloud escape hatch. `list` is one of its name words, `run`
+# starts its name word `runtime`, and all three tokens occur in its
+# description (`cloud` reaches it only there: nothing in the name says
+# cloud); the gcloud tool has `run` as a name word but `cloud` only inside
+# `gcloud`, a substring. Neither service is named by the query. A name word
+# plus a word prefix outweigh a substring, 34 to 26. Pinned as observed;
+# `tests/search_ranking.rs` states the mechanism. A ranking change that
+# stops crediting word prefixes or description text would move the
+# cloudcli pair back up, and that would be the moment to re-pin on purpose.
 vtx-notebook__colab_enterprise_list_notebook_runtime_templates
 cloudcli__run_gcloud_command
 cloudcli__run_bq_command
