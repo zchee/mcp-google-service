@@ -1707,6 +1707,57 @@ mod tests {
         }
     }
 
+    /// The README's "Supported endpoints" table is the registry and the
+    /// embedded snapshot written out by hand, so it is held to both: one row
+    /// per endpoint, in id order, with the served URL, the Service Usage name
+    /// and the snapshot's tool count. A registry change or a snapshot refresh
+    /// that leaves the table behind fails here rather than going stale.
+    #[test]
+    fn readme_endpoint_table_mirrors_the_registry_and_snapshot() {
+        const README: &str = include_str!("../README.md");
+        let unquote = |cell: &str| cell.trim_matches('`').to_owned();
+        // A table row `| id | endpoint | api | tools |` splits into six cells,
+        // the outer two empty; the numeric last cell tells it apart from every
+        // other table in the file.
+        let rows: Vec<(String, String, String, usize)> = README
+            .lines()
+            .filter_map(|line| {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                match cells.as_slice() {
+                    ["", id, endpoint, api, tools, ""] if id.starts_with('`') => tools
+                        .parse()
+                        .ok()
+                        .map(|tools| (unquote(id), unquote(endpoint), unquote(api), tools)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let catalog = committed_catalog();
+        let mut expected: Vec<(String, String, String, usize)> = registry::ENDPOINTS
+            .iter()
+            .map(|e| {
+                (
+                    e.service_id.to_owned(),
+                    format!("{}{}", e.host, e.mcp_path),
+                    e.api_name.to_owned(),
+                    catalog.service(e.service_id).map_or(0, |s| s.tools.len()),
+                )
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "README lists {} endpoint rows, the registry has {}",
+            rows.len(),
+            expected.len()
+        );
+        for (row, want) in rows.iter().zip(&expected) {
+            assert_eq!(row, want, "README endpoint row diverges from the registry or snapshot");
+        }
+    }
+
     #[test]
     fn duplicate_namespaced_names_are_rejected() {
         let error = Catalog::new(vec![

@@ -111,6 +111,121 @@ Use an absolute path: Claude Code does not resolve the binary against your
 shell's `PATH` in every launch context. The server speaks MCP on stdout and
 writes logs to stderr, so log output never corrupts the protocol stream.
 
+## The endpoint registry
+
+`src/registry.rs` pins 65 endpoints. The table lists them all; the
+subsections after it explain the ten that do not follow the derived naming
+rule, how a query spells an id, and why no regional host is pinned.
+
+### Supported endpoints
+
+All 65, in the order [`list_services`](#the-tool-surface) and
+[`print-catalog`](#command-line-interface) report them. The tool prefix is the
+service id (`{prefix}__{tool}`); the Service Usage name is
+what `gcloud services enable` takes and what pruning matches on; the tool
+counts are those of the snapshot pinned 2026-08-31. A test holds this table
+to the registry and the embedded snapshot, so a registry change or a
+snapshot refresh that is not reflected here fails the build.
+
+| Tool prefix | MCP endpoint | Service Usage API | Tools |
+|---|---|---|---|
+| `agentregistry` | `agentregistry.googleapis.com/mcp` | `agentregistry.googleapis.com` | 20 |
+| `alloydb` | `alloydb.googleapis.com/mcp` | `alloydb.googleapis.com` | 17 |
+| `androidmanagement` | `androidmanagement.googleapis.com/mcp` | `androidmanagement.googleapis.com` | 9 |
+| `apihub` | `apihub.googleapis.com/mcp` | `apihub.googleapis.com` | 46 |
+| `backupdr` | `backupdr.googleapis.com/mcp` | `backupdr.googleapis.com` | 23 |
+| `bigquery` | `bigquery.googleapis.com/mcp` | `bigquery.googleapis.com` | 6 |
+| `bigquerydatatransfer` | `bigquerydatatransfer.googleapis.com/mcp` | `bigquerydatatransfer.googleapis.com` | 13 |
+| `bigquerymigration` | `bigquerymigration.googleapis.com/mcp` | `bigquerymigration.googleapis.com` | 10 |
+| `bigtableadmin` | `bigtableadmin.googleapis.com/mcp` | `bigtableadmin.googleapis.com` | 14 |
+| `ces` | `ces.us.rep.googleapis.com/mcp` | `ces.googleapis.com` | 60 |
+| `cloudasset` | `cloudasset.googleapis.com/mcp` | `cloudasset.googleapis.com` | 4 |
+| `cloudbilling` | `cloudbilling.googleapis.com/mcp` | `cloudbilling.googleapis.com` | 29 |
+| `cloudcli` | `cloudcli.googleapis.com/mcp` | `cloudcli.googleapis.com` | 2 |
+| `clouderrorreporting` | `clouderrorreporting.googleapis.com/mcp` | `clouderrorreporting.googleapis.com` | 1 |
+| `cloudlocationfinder` | `cloudlocationfinder.googleapis.com/mcp` | `cloudlocationfinder.googleapis.com` | 2 |
+| `cloudproductregistry` | `cloudproductregistry.googleapis.com/mcp` | `cloudproductregistry.googleapis.com` | 7 |
+| `cloudquotas` | `cloudquotas.googleapis.com/mcp` | `cloudquotas.googleapis.com` | 5 |
+| `cloudresourcemanager` | `cloudresourcemanager.googleapis.com/mcp` | `cloudresourcemanager.googleapis.com` | 1 |
+| `cloudsupport` | `cloudsupport.googleapis.com/mcp` | `cloudsupport.googleapis.com` | 6 |
+| `cloudtrace` | `cloudtrace.googleapis.com/mcp` | `cloudtrace.googleapis.com` | 2 |
+| `compute` | `compute.googleapis.com/mcp` | `compute.googleapis.com` | 29 |
+| `container` | `container.googleapis.com/mcp` | `container.googleapis.com` | 23 |
+| `databasecenter` | `databasecenter.googleapis.com/mcp` | `databasecenter.googleapis.com` | 6 |
+| `databaseinsights` | `databaseinsights.googleapis.com/mcp` | `databaseinsights.googleapis.com` | 7 |
+| `dataform` | `dataform.googleapis.com/mcp` | `dataform.googleapis.com` | 21 |
+| `datalineage` | `datalineage.googleapis.com/mcp` | `datalineage.googleapis.com` | 1 |
+| `datamigration` | `datamigration.googleapis.com/mcp` | `datamigration.googleapis.com` | 8 |
+| `dataplex` | `dataplex.googleapis.com/mcp` | `dataplex.googleapis.com` | 3 |
+| `dataproc` | `dataproc.googleapis.com/mcp` | `dataproc.googleapis.com` | 16 |
+| `datastream` | `datastream.googleapis.com/mcp` | `datastream.googleapis.com` | 10 |
+| `design` | `design.googleapis.com/mcp` | `design.googleapis.com` | 5 |
+| `developerknowledge` | `developerknowledge.googleapis.com/mcp` | `developerknowledge.googleapis.com` | 3 |
+| `discoveryengine` | `discoveryengine.googleapis.com/mcp` | `discoveryengine.googleapis.com` | 3 |
+| `file` | `file.googleapis.com/mcp` | `file.googleapis.com` | 8 |
+| `firestore` | `firestore.googleapis.com/mcp` | `firestore.googleapis.com` | 25 |
+| `geminicloudassist` | `geminicloudassist.googleapis.com/mcp` | `geminicloudassist.googleapis.com` | 5 |
+| `homedevelopers` | `homedevelopers.googleapis.com/mcp` | `homedevelopers.googleapis.com` | 1 |
+| `logging` | `logging.googleapis.com/mcp` | `logging.googleapis.com` | 6 |
+| `mapscodeassist` | `mapscodeassist.googleapis.com/mcp` | `mapscodeassist.googleapis.com` | 2 |
+| `mapstools` | `mapstools.googleapis.com/mcp` | `mapstools.googleapis.com` | 5 |
+| `memorystore` | `memorystore.googleapis.com/mcp` | `memorystore.googleapis.com` | 14 |
+| `monitoring` | `monitoring.googleapis.com/mcp` | `monitoring.googleapis.com` | 9 |
+| `netapp` | `netapp.googleapis.com/mcp` | `netapp.googleapis.com` | 14 |
+| `networkmanagement` | `networkmanagement.googleapis.com/mcp` | `networkmanagement.googleapis.com` | 4 |
+| `oracledatabase` | `oracledatabase.googleapis.com/mcp` | `oracledatabase.googleapis.com` | 39 |
+| `paydeveloper` | `paydeveloper.googleapis.com/mcp` | `paydeveloper.googleapis.com` | 13 |
+| `policytroubleshooter` | `policytroubleshooter.googleapis.com/mcp` | `policytroubleshooter.googleapis.com` | 2 |
+| `pubsub` | `pubsub.googleapis.com/mcp` | `pubsub.googleapis.com` | 15 |
+| `recommender` | `recommender.googleapis.com/mcp` | `recommender.googleapis.com` | 4 |
+| `redis` | `redis.googleapis.com/mcp` | `redis.googleapis.com` | 25 |
+| `run` | `run.googleapis.com/mcp` | `run.googleapis.com` | 5 |
+| `saasservicemgmt` | `saasservicemgmt.googleapis.com/mcp` | `saasservicemgmt.googleapis.com` | 35 |
+| `servicehealth` | `servicehealth.googleapis.com/mcp` | `servicehealth.googleapis.com` | 2 |
+| `spanner` | `spanner.googleapis.com/mcp` | `spanner.googleapis.com` | 15 |
+| `sqladmin` | `sqladmin.googleapis.com/mcp` | `sqladmin.googleapis.com` | 15 |
+| `stitch` | `stitch.googleapis.com/mcp` | `stitch.googleapis.com` | 15 |
+| `vertex-endpoints` | `aiplatform.googleapis.com/mcp/endpoints` | `aiplatform.googleapis.com` | 6 |
+| `vertex-evaluation` | `aiplatform.googleapis.com/mcp/evaluation` | `aiplatform.googleapis.com` | 1 |
+| `vertex-generate` | `aiplatform.googleapis.com/mcp/generate` | `aiplatform.googleapis.com` | 3 |
+| `vertex-models` | `aiplatform.googleapis.com/mcp/models` | `aiplatform.googleapis.com` | 11 |
+| `vertex-predict` | `aiplatform.googleapis.com/mcp/predict` | `aiplatform.googleapis.com` | 2 |
+| `vertex-prompts` | `aiplatform.googleapis.com/mcp/prompts` | `aiplatform.googleapis.com` | 11 |
+| `vertex-retrieval` | `aiplatform.googleapis.com/mcp/retrieval` | `aiplatform.googleapis.com` | 4 |
+| `vertex-tuning` | `aiplatform.googleapis.com/mcp/tuning` | `aiplatform.googleapis.com` | 4 |
+| `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | `aiplatform.googleapis.com` | 24 |
+
+### The derived rule and its ten exceptions
+
+65 of them follow one derived rule, host `{service}.googleapis.com`,
+path `/mcp`, Service Usage API name equal to the host, and are written as bare
+ids. Ten do not, and each exception records a fact about Google's layout
+rather than a choice made here:
+
+| Tool prefix | Served from | Why it is manual |
+|---|---|---|
+| `vertex-endpoints`, `vertex-evaluation`, `vertex-generate`, `vertex-models`, `vertex-predict`, `vertex-prompts`, `vertex-retrieval`, `vertex-tuning` | `aiplatform.googleapis.com/mcp/{suite}` | Vertex AI publishes nine tool suites as paths on one shared host rather than one host per service, and Service Usage knows them all as `aiplatform.googleapis.com`. The registry pins the **global** host. The documentation also lists 46 regional hosts and 2 continental `rep` ones (`us`, `eu`); the global host answers discovery (probed 2026-08-31) and tool metadata does not vary by host, so the catalog needs no region. |
+| `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | The ninth Vertex suite. Its Colab Enterprise tool names run to 49 characters, and `vertex-notebook__` in front of one makes 66, over the 64-character limit MCP clients enforce on tool names; 13 id characters is the budget, so this one suite breaks the `vertex-` pattern. |
+| `ces` | `ces.us.rep.googleapis.com/mcp` | Customer Experience Agent Studio is served only from continental `rep` hosts; there is no `ces.googleapis.com/mcp`. The US host is pinned, as the documentation page shows. The EU variant, `ces.eu.rep.googleapis.com/mcp`, answers discovery too (probed 2026-09-01) and is deliberately not a second entry; see [Regional and EU routing](#regional-and-eu-routing). |
+
+### Spelling a service id in a query
+
+A `-` in a service id is a word boundary, so `vertex generate` names the
+`vertex-generate` suite the way `cloud asset` names `cloudasset`, and `vertex`
+alone reaches every `vertex-*` suite. The notebook suite's short id means
+`vertex notebook` does not name it: reach it with `notebook` or `colab`, each
+of which leads with the suite's own tools, or with `vtx notebook`.
+
+### Regional and EU routing
+
+This is a follow-up, not a registry entry. Discovery is host-invariant, but
+every `call` goes to the pinned host: Vertex calls go to
+the global endpoint and Agent Studio calls to the US one. A deployment that
+must keep its data in a region, or in the EU, has no way to say so yet. That
+is a serving-configuration concern (a per-service host override), tracked as
+the data-residency follow-up; adding EU or regional rows to the registry would
+only duplicate tool names without giving the operator the choice.
+
 ## The tool surface
 
 By default the server exposes four meta-tools rather than 756 real ones.
@@ -310,34 +425,6 @@ startup; the rest are reported and survivable.
 | `acquiring a Google access token timed out after 30s` | The credential source (ADC, metadata server, `gcloud`) did not answer. | Check `gcloud auth application-default print-access-token`, or the metadata server's reachability. |
 | `Service Usage returned a pagination token it had already served` / `Service Usage listing did not terminate within 50 pages` | The enabled-API listing stopped making progress and was abandoned. Pruning degrades: the configured selection is exposed unpruned, with a `WARN`. | None required. If it persists, `--only` pins the services to expose without consulting Service Usage. |
 | `` `call` requires `arguments` to be a JSON object `` | `call` was given `arguments` as an array, string, number or boolean. | Read the schema with `describe_tools` and pass an object. Omitting `arguments` (or passing `null`) is valid for a tool that takes none. |
-
-## The endpoint registry
-
-`src/registry.rs` pins the 65 endpoints. Fifty-five follow one derived rule,
-host `{service}.googleapis.com`, path `/mcp`, Service Usage API name equal to
-the host, and are written as bare ids. Ten do not, and each exception records
-a fact about Google's layout rather than a choice made here:
-
-| Entry | Served from | Why it is manual |
-|---|---|---|
-| `vertex-endpoints`, `vertex-evaluation`, `vertex-generate`, `vertex-models`, `vertex-predict`, `vertex-prompts`, `vertex-retrieval`, `vertex-tuning` | `aiplatform.googleapis.com/mcp/{suite}` | Vertex AI publishes nine tool suites as paths on one shared host rather than one host per service, and Service Usage knows them all as `aiplatform.googleapis.com`. The registry pins the **global** host. The documentation also lists 46 regional hosts and 2 continental `rep` ones (`us`, `eu`); the global host answers discovery (probed 2026-08-31) and tool metadata does not vary by host, so the catalog needs no region. |
-| `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | The ninth Vertex suite. Its Colab Enterprise tool names run to 49 characters, and `vertex-notebook__` in front of one makes 66, over the 64-character limit MCP clients enforce on tool names; 13 id characters is the budget, so this one suite breaks the `vertex-` pattern. |
-| `ces` | `ces.us.rep.googleapis.com/mcp` | Customer Experience Agent Studio is served only from continental `rep` hosts; there is no `ces.googleapis.com/mcp`. The US host is pinned, as the documentation page shows. The EU variant, `ces.eu.rep.googleapis.com/mcp`, answers discovery too (probed 2026-09-01) and is deliberately not a second entry, for the reason below. |
-
-**Search spells an id word by word.** A `-` in a service id is a word
-boundary, so `vertex generate` names the `vertex-generate` suite the way
-`cloud asset` names `cloudasset`, and `vertex` alone reaches every `vertex-*`
-suite. The notebook suite's short id means `vertex notebook` does not name it:
-reach it with `notebook` or `colab`, each of which leads with the suite's own
-tools, or with `vtx notebook`.
-
-**Regional and EU routing is a follow-up, not a registry entry.** Discovery is
-host-invariant, but every `call` goes to the pinned host: Vertex calls go to
-the global endpoint and Agent Studio calls to the US one. A deployment that
-must keep its data in a region, or in the EU, has no way to say so yet. That
-is a serving-configuration concern (a per-service host override), tracked as
-the data-residency follow-up; adding EU or regional rows to the registry would
-only duplicate tool names without giving the operator the choice.
 
 ## The catalog snapshot
 
