@@ -127,6 +127,10 @@ counts are those of the snapshot pinned 2026-08-31. A test holds this table
 to the registry and the embedded snapshot, so a registry change or a
 snapshot refresh that is not reflected here fails the build.
 
+Every row is reachable once its API is enabled, with one exception: `design`
+needs `--only design`, per [the note
+below](#the-design-endpoint-and-enablement-pruning).
+
 | Tool prefix | MCP endpoint | Service Usage API | Tools |
 |---|---|---|---|
 | `agentregistry` | `agentregistry.googleapis.com/mcp` | `agentregistry.googleapis.com` | 20 |
@@ -225,6 +229,22 @@ must keep its data in a region, or in the EU, has no way to say so yet. That
 is a serving-configuration concern (a per-service host override), tracked as
 the data-residency follow-up; adding EU or regional rows to the registry would
 only duplicate tool names without giving the operator the choice.
+
+### The design endpoint and enablement pruning
+
+`design.googleapis.com` answers discovery and its five tools are in the
+snapshot, but Service Usage knows no API by that name: it is absent both from
+a project's enabled services and from the services available to be enabled
+(checked 2026-09-08 against a real project). Pruning matches an endpoint's
+Service Usage name exactly, so the entry is dropped on every project and its
+tools never reach the model. Pass `--only design` to skip pruning; discovery
+and dispatch themselves work.
+
+The name that does gate it, if there is one, is unknown.
+`designcenter.googleapis.com` is a different MCP server serving different
+tools, not this one under another name. Recovering the right name needs an
+authenticated call whose `SERVICE_DISABLED` error names the API, so the entry
+keeps its derived name rather than a guess.
 
 ## The tool surface
 
