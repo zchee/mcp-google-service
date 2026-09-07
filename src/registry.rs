@@ -65,9 +65,9 @@ macro_rules! vertex_suite {
 ///
 /// Every entry answered MCP `initialize` plus `tools/list` at its
 /// [`Endpoint::mcp_url`] without credentials when probed live: the original
-/// 47 derived hosts on 2026-08-19, and the 8 newer derived hosts plus the 10
+/// 47 derived hosts on 2026-08-19, the 8 newer derived hosts plus the 10
 /// manual entries (Customer Experience Agent Studio and the 9 Vertex AI
-/// suites) on 2026-08-31.
+/// suites) on 2026-08-31, and `designcenter` on 2026-09-07.
 pub static ENDPOINTS: &[Endpoint] = endpoints![
     derived: [
         "run",
@@ -125,6 +125,11 @@ pub static ENDPOINTS: &[Endpoint] = endpoints![
         "mapscodeassist",
         "paydeveloper",
         "stitch",
+        // Design Center, distinct from `design`: it serves application and
+        // catalog management rather than fonts and icons, and unlike `design`
+        // its host is a Service Usage API name, so enablement pruning can
+        // reach it.
+        "designcenter",
     ],
     manual: [
         // Customer Experience Agent Studio is served only from continental
@@ -189,7 +194,7 @@ mod tests {
 
     #[test]
     fn registry_holds_every_probed_endpoint() {
-        assert_eq!(ENDPOINTS.len(), 65, "registry must pin all 65 probed endpoints");
+        assert_eq!(ENDPOINTS.len(), 66, "registry must pin all 66 probed endpoints");
         assert_eq!(MANUAL_IDS.len(), 10, "manual entries: ces plus 9 Vertex suites");
     }
 

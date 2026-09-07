@@ -1480,7 +1480,7 @@ async fn fetch_tools(
     endpoint: &'static Endpoint,
     http: &reqwest::Client,
 ) -> Result<Vec<Tool>, FetchError> {
-    // `from_uri` would build a fresh client per host, paying TLS setup 65 times
+    // `from_uri` would build a fresh client per host, paying TLS setup 66 times
     // per refresh; `with_client` reuses the process-wide pool instead.
     let transport = StreamableHttpClientTransport::with_client(
         http.clone(),

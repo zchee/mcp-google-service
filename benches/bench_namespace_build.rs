@@ -1,10 +1,10 @@
-//! Namespacing the 756 upstream tools and validating the catalog invariants.
+//! Namespacing the 762 upstream tools and validating the catalog invariants.
 //!
 //! Two steps, measured separately because they run at different times:
 //!
 //! * `namespace_tools` -- `NamespacedTool::new` over every upstream tool, the
 //!   `{service}__{tool}` naming the live fan-out performs per fetched tool.
-//! * `catalog_new` -- `Catalog::new` over the 65 per-service catalogs: sort
+//! * `catalog_new` -- `Catalog::new` over the 66 per-service catalogs: sort
 //!   services and tools, then enforce global uniqueness and the 64-char name
 //!   limit. The snapshot stores its services already sorted, so this is the
 //!   input shape `Snapshot::into_catalog` sees.

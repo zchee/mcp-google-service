@@ -41,7 +41,7 @@ pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 /// closed first.
 ///
 /// A typical project enables a handful of the registered APIs, so this is
-/// headroom, not a working limit; it exists so that 65 idle sessions cannot
+/// headroom, not a working limit; it exists so that 66 idle sessions cannot
 /// accumulate on a server that touched every service once. One enabled API
 /// can stand behind ten of them: the nine Vertex AI suites and the notebook
 /// suite are separate MCP servers on `aiplatform.googleapis.com`, keyed here

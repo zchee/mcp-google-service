@@ -145,7 +145,7 @@ rpath = false
 incremental = false
 strip = "none"
 
-# Micro-benchmarks over the committed 65-service / 756-tool snapshot. Each is a
+# Micro-benchmarks over the committed 66-service / 762-tool snapshot. Each is a
 # divan binary (`harness = false`), so `cargo bench` runs them one after
 # another; they must never be run concurrently with each other or with
 # `scripts/bench-startup.sh`, and never with `RUSTFLAGS` set, or the numbers

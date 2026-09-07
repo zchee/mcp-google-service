@@ -655,7 +655,7 @@ static OVERLONG_ENDPOINT: registry::Endpoint = registry::Endpoint {
 /// The 2026-09-01 review finding: the committed catalog sits one char under
 /// the 64-char name limit, and `Catalog::new` rejects a whole catalog for one
 /// overlong name. Without containment a single upstream rename would fail
-/// every live refresh and freeze all 65 services on snapshot data behind one
+/// every live refresh and freeze all 66 services on snapshot data behind one
 /// WARN. The live fan-out must instead degrade the one service that cannot be
 /// namespaced -- to its snapshot entry, or to absence -- and leave the others
 /// live.

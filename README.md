@@ -7,10 +7,10 @@ Google publishes MCP endpoints per service at
 `https://{service}.googleapis.com/mcp` (with ten exceptions, listed under
 [The endpoint registry](#the-endpoint-registry)). Registering them
 individually in an MCP client runs into three problems, all measured against
-the live endpoints (2026-08-19, re-measured 2026-08-31 after the registry grew
-to 65):
+the live endpoints (2026-08-19, re-measured 2026-09-07 after the registry grew
+to 66):
 
-- **756 tools across 65 endpoints**, which is far more than a model can be
+- **762 tools across 66 endpoints**, which is far more than a model can be
   offered at once.
 - **46 tool-name collisions** between services (several services publish a tool
   called `list_services`, for example).
@@ -31,10 +31,10 @@ endpoints rather than assumed.
 | Design point | Evidence |
 |---|---|
 | One auth shape for every endpoint: `Authorization: Bearer <ADC token, scope cloud-platform>` plus `x-goog-user-project: <quota project>` | Verified against `run`, `bigquery`, `logging`, and `developerknowledge`; no per-endpoint branching was needed. |
-| Tool discovery needs no credentials | `initialize` and `tools/list` answered unauthenticated on all 65 endpoints (47 probed 2026-08-19, 18 more 2026-08-31), which is what makes the bundled snapshot and the credential-free startup path possible. |
+| Tool discovery needs no credentials | `initialize` and `tools/list` answered unauthenticated on all 66 endpoints (47 probed 2026-08-19, 18 more 2026-08-31, `designcenter` 2026-09-07), which is what makes the bundled snapshot and the credential-free startup path possible. |
 | Prune to enabled APIs | Service Usage reports roughly 5 of the registered APIs enabled on a typical project, so pruning removes the `SERVICE_DISABLED` failure mode before the model ever sees the tool. |
 | Namespace with `{service}__{tool}` | Eliminates all 46 collisions by construction, and the prefix is what dispatch routes on. |
-| Serve from a snapshot, refresh in the background | A full 65-endpoint fan-out takes 7.7-7.9s (measured 2026-08-31; concurrency 16 keeps it flat as the registry grows). Doing it on the startup path would delay the first tool response by that much, so startup serves the bundled snapshot and swaps in live data when it arrives. |
+| Serve from a snapshot, refresh in the background | A full 66-endpoint fan-out takes 7.7-7.9s (measured 2026-08-31 over 65 endpoints; concurrency 16 keeps it flat as the registry grows). Doing it on the startup path would delay the first tool response by that much, so startup serves the bundled snapshot and swaps in live data when it arrives. |
 
 Because the two-tier surface exposes a fixed set of four tools, swapping the
 catalog underneath the server needs no `listChanged` notification.
@@ -113,17 +113,17 @@ writes logs to stderr, so log output never corrupts the protocol stream.
 
 ## The endpoint registry
 
-`src/registry.rs` pins 65 endpoints. The table lists them all; the
+`src/registry.rs` pins 66 endpoints. The table lists them all; the
 subsections after it explain the ten that do not follow the derived naming
 rule, how a query spells an id, and why no regional host is pinned.
 
 ### Supported endpoints
 
-All 65, in the order [`list_services`](#the-tool-surface) and
+All 66, in the order [`list_services`](#the-tool-surface) and
 [`print-catalog`](#command-line-interface) report them. The tool prefix is the
 service id (`{prefix}__{tool}`); the Service Usage name is
 what `gcloud services enable` takes and what pruning matches on; the tool
-counts are those of the snapshot pinned 2026-08-31. A test holds this table
+counts are those of the snapshot pinned 2026-09-07. A test holds this table
 to the registry and the embedded snapshot, so a registry change or a
 snapshot refresh that is not reflected here fails the build.
 
@@ -164,6 +164,7 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `dataproc` | `dataproc.googleapis.com/mcp` | `dataproc.googleapis.com` | 16 |
 | `datastream` | `datastream.googleapis.com/mcp` | `datastream.googleapis.com` | 10 |
 | `design` | `design.googleapis.com/mcp` | `design.googleapis.com` | 5 |
+| `designcenter` | `designcenter.googleapis.com/mcp` | `designcenter.googleapis.com` | 6 |
 | `developerknowledge` | `developerknowledge.googleapis.com/mcp` | `developerknowledge.googleapis.com` | 3 |
 | `discoveryengine` | `discoveryengine.googleapis.com/mcp` | `discoveryengine.googleapis.com` | 3 |
 | `file` | `file.googleapis.com/mcp` | `file.googleapis.com` | 8 |
@@ -201,7 +202,7 @@ below](#the-design-endpoint-and-enablement-pruning).
 
 ### The derived rule and its ten exceptions
 
-Fifty-five of them follow one derived rule, host `{service}.googleapis.com`,
+Fifty-six of them follow one derived rule, host `{service}.googleapis.com`,
 path `/mcp`, Service Usage API name equal to the host, and are written as bare
 ids. Ten do not, and each exception records a fact about Google's layout
 rather than a choice made here:
@@ -235,7 +236,7 @@ only duplicate tool names without giving the operator the choice.
 `design.googleapis.com` answers discovery and its five tools are in the
 snapshot, but Service Usage knows no API by that name: it is absent both from
 a project's enabled services and from the services available to be enabled
-(checked 2026-09-08 against a real project). Pruning matches an endpoint's
+(checked 2026-09-07 against a real project). Pruning matches an endpoint's
 Service Usage name exactly, so the entry is dropped on every project and its
 tools never reach the model. Pass `--only design` to skip pruning; discovery
 and dispatch themselves work.
@@ -248,7 +249,7 @@ keeps its derived name rather than a guess.
 
 ## The tool surface
 
-By default the server exposes four meta-tools rather than 756 real ones.
+By default the server exposes four meta-tools rather than 762 real ones.
 Schemas load on demand, so the model gets exact argument shapes without paying
 for them up front.
 
@@ -381,13 +382,13 @@ mcp-google-service print-catalog
 ```
 
 ```
-generated_at: 2026-08-31T18:56:55Z
+generated_at: 2026-09-07T15:25:33Z
 
 SERVICE               TOOLS  SOURCE
 agentregistry            20  live
 alloydb                  17  live
 ...
-65 services             756
+66 services             762
 ```
 
 ### A note on `>` under zsh
@@ -448,8 +449,8 @@ startup; the rest are reported and survivable.
 
 ## The catalog snapshot
 
-`data/catalog-snapshot.json` is a committed, evidence-dated capture of all 65
-endpoints (756 tools, pinned 2026-08-31). It is embedded into the binary at
+`data/catalog-snapshot.json` is a committed, evidence-dated capture of all 66
+endpoints (762 tools, pinned 2026-09-07). It is embedded into the binary at
 compile time and serves three purposes: it makes startup fast, it lets a
 binary run without its repository, and it provides per-host fallback when a
 live fetch fails.
@@ -511,7 +512,8 @@ writes nothing: a snapshot missing services becomes a binary that silently
 cannot offer their tools. Pass `--allow-partial` to record a partial capture
 deliberately.
 
-The snapshot is pretty-printed rather than compact (11.6MB versus 7.4MB) so
+The snapshot is pretty-printed rather than compact (20.6MB against roughly
+12.9MB) so
 that `git diff` produces reviewable line-level changes.
 
 On startup, drift between the snapshot and the live catalog is logged as a
