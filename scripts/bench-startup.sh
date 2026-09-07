@@ -195,7 +195,7 @@ PY
         export GOOGLE_APPLICATION_CREDENTIALS="$WORK/service-account.json"
         export GOOGLE_MCP_QUOTA_PROJECT="bench-offline"
         # Every https:// request the shared reqwest client makes (Service Usage
-        # pruning, the 66-endpoint refresh fan-out) goes to a proxy at a closed
+        # pruning, the 79-endpoint refresh fan-out) goes to a proxy at a closed
         # loopback port and fails with ECONNREFUSED in microseconds. gcp_auth
         # uses its own client with no proxy support, so the token stub is
         # still reached directly.

@@ -43,7 +43,7 @@ macro_rules! endpoints {
     };
 }
 
-/// One Vertex AI suite, mounted at `/mcp/{suite}` on the global
+/// One of the ten Vertex AI suites, mounted at `/mcp/{suite}` on the global
 /// `aiplatform.googleapis.com` host, exposed under a `vertex-` id.
 ///
 /// The docs also list 46 regional and 2 continental (`{us,eu}.rep`) hosts;
@@ -66,8 +66,11 @@ macro_rules! vertex_suite {
 /// Every entry answered MCP `initialize` plus `tools/list` at its
 /// [`Endpoint::mcp_url`] without credentials when probed live: the original
 /// 47 derived hosts on 2026-08-19, the 8 newer derived hosts plus the 10
-/// manual entries (Customer Experience Agent Studio and the 9 Vertex AI
-/// suites) on 2026-08-31, and `designcenter` on 2026-09-07.
+/// manual entries then needed on 2026-08-31, `designcenter` on 2026-09-07,
+/// and the 13 found by sweeping every host in Google's public API discovery
+/// document on 2026-09-07: 11 derived, the Cloud Storage mount and a tenth
+/// Vertex suite. `ces` moved from its US `rep` host to the global one in the
+/// same sweep, which is what made it derived.
 pub static ENDPOINTS: &[Endpoint] = endpoints![
     derived: [
         "run",
@@ -130,22 +133,36 @@ pub static ENDPOINTS: &[Endpoint] = endpoints![
         // its host is a Service Usage API name, so enablement pruning can
         // reach it.
         "designcenter",
+        // Found by the 2026-09-07 discovery-document sweep. Every one answers
+        // `initialize` plus `tools/list` on the derived host and path.
+        "accessapproval",
+        "apigee",
+        "billingbudgets",
+        // Customer Experience Agent Studio. It was pinned to `ces.us.rep`
+        // because no global host answered on 2026-08-31; one does now, and
+        // it serves the same 60 tool names, so the entry is derived like the
+        // rest and calls no longer single out one continent.
+        "ces",
+        "contactcenterinsights",
+        "developerconnect",
+        "dialogflow",
+        "firebasedataconnect",
+        "geminidataanalytics",
+        "iam",
+        "maintenance",
+        "managedkafka",
     ],
     manual: [
-        // Customer Experience Agent Studio is served only from continental
-        // `rep` hosts; there is no `ces.googleapis.com/mcp`. The US one is
-        // pinned, matching the docs page. The EU variant,
-        // `ces.eu.rep.googleapis.com/mcp`, answers discovery as well (probed
-        // 2026-09-01) and is deliberately not a second entry: tool metadata
-        // is host-invariant, but every call goes to the pinned host, so an
-        // EU data-residency deployment needs the regional/rep routing
-        // follow-up (a per-service host override), not a registry row.
+        // Cloud Storage mounts MCP under the service's own URL prefix rather
+        // than at the host root, so this is the one entry whose path is
+        // neither `/mcp` nor `/mcp/{suite}`.
         Endpoint {
-            service_id: "ces",
-            host: "ces.us.rep.googleapis.com",
-            api_name: "ces.googleapis.com",
-            mcp_path: "/mcp",
+            service_id: "storage",
+            host: "storage.googleapis.com",
+            api_name: "storage.googleapis.com",
+            mcp_path: "/storage/mcp",
         },
+        vertex_suite!("agents"),
         vertex_suite!("endpoints"),
         vertex_suite!("evaluation"),
         vertex_suite!("generate"),
@@ -180,7 +197,8 @@ mod tests {
 
     /// Entries whose host or path is not derived from the service id.
     const MANUAL_IDS: &[&str] = &[
-        "ces",
+        "storage",
+        "vertex-agents",
         "vertex-endpoints",
         "vertex-evaluation",
         "vertex-generate",
@@ -194,8 +212,12 @@ mod tests {
 
     #[test]
     fn registry_holds_every_probed_endpoint() {
-        assert_eq!(ENDPOINTS.len(), 66, "registry must pin all 66 probed endpoints");
-        assert_eq!(MANUAL_IDS.len(), 10, "manual entries: ces plus 9 Vertex suites");
+        assert_eq!(ENDPOINTS.len(), 79, "registry must pin all 79 probed endpoints");
+        assert_eq!(
+            MANUAL_IDS.len(),
+            11,
+            "manual entries: the Cloud Storage mount plus 10 Vertex suites"
+        );
     }
 
     #[test]
@@ -203,7 +225,7 @@ mod tests {
         let ids: HashSet<_> = ENDPOINTS.iter().map(|e| e.service_id).collect();
         assert_eq!(ids.len(), ENDPOINTS.len(), "duplicate service_id in registry");
 
-        // The 9 Vertex suites share one host, so hosts alone are not unique;
+        // The 10 Vertex suites share one host, so hosts alone are not unique;
         // the served URL (host + path) must be.
         let urls: HashSet<_> = ENDPOINTS.iter().map(|e| (e.host, e.mcp_path)).collect();
         assert_eq!(urls.len(), ENDPOINTS.len(), "duplicate host+path in registry");
@@ -225,11 +247,16 @@ mod tests {
             let endpoint = find(id).unwrap_or_else(|| panic!("manual entry `{id}` missing"));
             assert!(endpoint.host.ends_with(".googleapis.com"), "host leaves Google: {id}");
             assert!(endpoint.api_name.ends_with(".googleapis.com"), "api_name shape: {id}");
-            assert!(endpoint.mcp_path.starts_with("/mcp"), "path off the MCP mount: {id}");
+            // Cloud Storage mounts at `/storage/mcp`, the Vertex suites at
+            // `/mcp/{suite}`, so the shared shape is the trailing segment.
+            assert!(
+                endpoint.mcp_path.starts_with("/mcp") || endpoint.mcp_path.ends_with("/mcp"),
+                "path off the MCP mount: {id}"
+            );
         }
         assert_eq!(
-            find("ces").map(|e| e.mcp_url()),
-            Some("https://ces.us.rep.googleapis.com/mcp".to_owned())
+            find("storage").map(|e| e.mcp_url()),
+            Some("https://storage.googleapis.com/storage/mcp".to_owned())
         );
         assert_eq!(
             find("vertex-generate").map(|e| e.mcp_url()),
@@ -256,7 +283,7 @@ mod tests {
             Some("developerknowledge.googleapis.com")
         );
         assert_eq!(find("stitch").map(|e| e.host), Some("stitch.googleapis.com"));
-        assert_eq!(find("ces").map(|e| e.host), Some("ces.us.rep.googleapis.com"));
+        assert_eq!(find("ces").map(|e| e.host), Some("ces.googleapis.com"));
         assert_eq!(find("vertex-generate").map(|e| e.mcp_path), Some("/mcp/generate"));
         assert!(find("nonexistent").is_none());
         assert!(find("").is_none());

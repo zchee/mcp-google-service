@@ -110,8 +110,14 @@ container__list_clusters
 query: pubsub topics
 pubsub__list_topics
 
-# -- an exact bare tool name; two services expose it, ties break on name
+# -- an exact bare tool name; four services expose it, ties break on name
+# 2026-09-07 registry growth: Firebase Data Connect leads, and not through a
+# tie-break. All four get the exact-name bonus plus the name-substring credit
+# for 36; its description is the only one that spells `list_services`, which
+# is a description hit worth 2 more. Pinned as observed, with the pair below
+# it in catalog order.
 query: list_services
+firebasedataconnect__list_services
 agentregistry__list_services
 # 2026-08-31 registry growth: Cloud Billing publishes an exact-name match.
 cloudbilling__list_services

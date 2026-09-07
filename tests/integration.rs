@@ -530,13 +530,16 @@ async fn only_the_enabled_services_are_exposed() {
     stub.shutdown().await;
 }
 
-/// The irregular registry entries prune like any other: `ces` rides its own
-/// API name, and one `aiplatform.googleapis.com` toggle fans out to every
-/// Vertex suite while everything else stays pruned.
+/// The irregular registry entries prune like any other: the Cloud Storage
+/// mount rides its own API name despite its `/storage/mcp` path, and one
+/// `aiplatform.googleapis.com` toggle fans out to every Vertex suite while
+/// everything else stays pruned. `ces` is here because it used to be the
+/// irregular one, pinned to a `rep` host; it is derived now and must still
+/// prune on the same API name.
 #[test]
 fn enablement_fans_out_to_the_vertex_suites_and_reaches_ces() {
     let enabled: std::collections::HashSet<String> =
-        ["aiplatform.googleapis.com", "ces.googleapis.com"]
+        ["aiplatform.googleapis.com", "ces.googleapis.com", "storage.googleapis.com"]
             .into_iter()
             .map(str::to_owned)
             .collect();
@@ -548,6 +551,8 @@ fn enablement_fans_out_to_the_vertex_suites_and_reaches_ces() {
         exposed_ids,
         vec![
             "ces",
+            "storage",
+            "vertex-agents",
             "vertex-endpoints",
             "vertex-evaluation",
             "vertex-generate",
@@ -558,8 +563,8 @@ fn enablement_fans_out_to_the_vertex_suites_and_reaches_ces() {
             "vertex-retrieval",
             "vertex-tuning",
         ],
-        "two enabled APIs must select ces plus all nine Vertex suites, in \
-         registry order, and nothing else"
+        "three enabled APIs must select ces, the Cloud Storage mount and all \
+         ten Vertex suites, in registry order, and nothing else"
     );
 }
 
@@ -655,7 +660,7 @@ static OVERLONG_ENDPOINT: registry::Endpoint = registry::Endpoint {
 /// The 2026-09-01 review finding: the committed catalog sits one char under
 /// the 64-char name limit, and `Catalog::new` rejects a whole catalog for one
 /// overlong name. Without containment a single upstream rename would fail
-/// every live refresh and freeze all 66 services on snapshot data behind one
+/// every live refresh and freeze all 79 services on snapshot data behind one
 /// WARN. The live fan-out must instead degrade the one service that cannot be
 /// namespaced -- to its snapshot entry, or to absence -- and leave the others
 /// live.

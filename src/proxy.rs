@@ -41,7 +41,7 @@ pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 /// closed first.
 ///
 /// A typical project enables a handful of the registered APIs, so this is
-/// headroom, not a working limit; it exists so that 66 idle sessions cannot
+/// headroom, not a working limit; it exists so that 79 idle sessions cannot
 /// accumulate on a server that touched every service once. One enabled API
 /// can stand behind ten of them: the nine Vertex AI suites and the notebook
 /// suite are separate MCP servers on `aiplatform.googleapis.com`, keyed here
@@ -540,8 +540,16 @@ mod tests {
                 route.service_id,
                 route.host
             );
+            // The path must be an MCP mount on that host and nothing else.
+            // Most are `/mcp`, the Vertex suites `/mcp/{suite}`, and Cloud
+            // Storage `/storage/mcp`, so the shared shape is a `mcp` segment
+            // rather than a `/mcp` prefix. Checking the remainder after the
+            // host, rather than searching the whole URL, is what keeps a host
+            // like `evil.googleapis.com/x?y=/mcp` from satisfying this.
+            let path =
+                route.mcp_url.strip_prefix(&format!("https://{}", route.host)).unwrap_or_default();
             assert!(
-                route.mcp_url.starts_with(&format!("https://{}/mcp", route.host)),
+                path == "/mcp" || path.starts_with("/mcp/") || path.ends_with("/mcp"),
                 "route `{}` has a URL dispatch should never post a token to: {}",
                 route.service_id,
                 route.mcp_url

@@ -4,15 +4,15 @@ A single MCP server that aggregates Google Cloud's remote MCP endpoints behind
 one process, one authentication model, and one namespaced tool surface.
 
 Google publishes MCP endpoints per service at
-`https://{service}.googleapis.com/mcp` (with ten exceptions, listed under
+`https://{service}.googleapis.com/mcp` (with eleven exceptions, listed under
 [The endpoint registry](#the-endpoint-registry)). Registering them
 individually in an MCP client runs into three problems, all measured against
 the live endpoints (2026-08-19, re-measured 2026-09-07 after the registry grew
-to 66):
+to 79):
 
-- **762 tools across 66 endpoints**, which is far more than a model can be
+- **985 tools across 79 endpoints**, which is far more than a model can be
   offered at once.
-- **46 tool-name collisions** between services (several services publish a tool
+- **61 tool-name collisions** between services (several services publish a tool
   called `list_services`, for example).
 - **Hourly credential expiry.** Application Default Credentials access tokens
   expire after roughly an hour, so a client config holding a static
@@ -31,10 +31,10 @@ endpoints rather than assumed.
 | Design point | Evidence |
 |---|---|
 | One auth shape for every endpoint: `Authorization: Bearer <ADC token, scope cloud-platform>` plus `x-goog-user-project: <quota project>` | Verified against `run`, `bigquery`, `logging`, and `developerknowledge`; no per-endpoint branching was needed. |
-| Tool discovery needs no credentials | `initialize` and `tools/list` answered unauthenticated on all 66 endpoints (47 probed 2026-08-19, 18 more 2026-08-31, `designcenter` 2026-09-07), which is what makes the bundled snapshot and the credential-free startup path possible. |
+| Tool discovery needs no credentials | `initialize` and `tools/list` answered unauthenticated on all 79 endpoints (47 probed 2026-08-19, 18 more 2026-08-31, 14 more 2026-09-07), which is what makes the bundled snapshot and the credential-free startup path possible. |
 | Prune to enabled APIs | Service Usage reports roughly 5 of the registered APIs enabled on a typical project, so pruning removes the `SERVICE_DISABLED` failure mode before the model ever sees the tool. |
-| Namespace with `{service}__{tool}` | Eliminates all 46 collisions by construction, and the prefix is what dispatch routes on. |
-| Serve from a snapshot, refresh in the background | A full 66-endpoint fan-out takes 7.7-7.9s (measured 2026-08-31 over 65 endpoints; concurrency 16 keeps it flat as the registry grows). Doing it on the startup path would delay the first tool response by that much, so startup serves the bundled snapshot and swaps in live data when it arrives. |
+| Namespace with `{service}__{tool}` | Eliminates all 61 collisions by construction, and the prefix is what dispatch routes on. |
+| Serve from a snapshot, refresh in the background | A full 79-endpoint fan-out takes 8-9s (measured 2026-09-07; it was 7.7-7.9s over 65 endpoints on 2026-08-31, so concurrency 16 keeps it near-flat as the registry grows). Doing it on the startup path would delay the first tool response by that much, so startup serves the bundled snapshot and swaps in live data when it arrives. |
 
 Because the two-tier surface exposes a fixed set of four tools, swapping the
 catalog underneath the server needs no `listChanged` notification.
@@ -113,13 +113,13 @@ writes logs to stderr, so log output never corrupts the protocol stream.
 
 ## The endpoint registry
 
-`src/registry.rs` pins 66 endpoints. The table lists them all; the
+`src/registry.rs` pins 79 endpoints. The table lists them all; the
 subsections after it explain the ten that do not follow the derived naming
 rule, how a query spells an id, and why no regional host is pinned.
 
 ### Supported endpoints
 
-All 66, in the order [`list_services`](#the-tool-surface) and
+All 79, in the order [`list_services`](#the-tool-surface) and
 [`print-catalog`](#command-line-interface) report them. The tool prefix is the
 service id (`{prefix}__{tool}`); the Service Usage name is
 what `gcloud services enable` takes and what pruning matches on; the tool
@@ -133,16 +133,19 @@ below](#the-design-endpoint-and-enablement-pruning).
 
 | Tool prefix | MCP endpoint | Service Usage API | Tools |
 |---|---|---|---|
+| `accessapproval` | `accessapproval.googleapis.com/mcp` | `accessapproval.googleapis.com` | 5 |
 | `agentregistry` | `agentregistry.googleapis.com/mcp` | `agentregistry.googleapis.com` | 20 |
 | `alloydb` | `alloydb.googleapis.com/mcp` | `alloydb.googleapis.com` | 17 |
 | `androidmanagement` | `androidmanagement.googleapis.com/mcp` | `androidmanagement.googleapis.com` | 9 |
+| `apigee` | `apigee.googleapis.com/mcp` | `apigee.googleapis.com` | 39 |
 | `apihub` | `apihub.googleapis.com/mcp` | `apihub.googleapis.com` | 46 |
 | `backupdr` | `backupdr.googleapis.com/mcp` | `backupdr.googleapis.com` | 23 |
 | `bigquery` | `bigquery.googleapis.com/mcp` | `bigquery.googleapis.com` | 6 |
 | `bigquerydatatransfer` | `bigquerydatatransfer.googleapis.com/mcp` | `bigquerydatatransfer.googleapis.com` | 13 |
 | `bigquerymigration` | `bigquerymigration.googleapis.com/mcp` | `bigquerymigration.googleapis.com` | 10 |
 | `bigtableadmin` | `bigtableadmin.googleapis.com/mcp` | `bigtableadmin.googleapis.com` | 14 |
-| `ces` | `ces.us.rep.googleapis.com/mcp` | `ces.googleapis.com` | 60 |
+| `billingbudgets` | `billingbudgets.googleapis.com/mcp` | `billingbudgets.googleapis.com` | 5 |
+| `ces` | `ces.googleapis.com/mcp` | `ces.googleapis.com` | 60 |
 | `cloudasset` | `cloudasset.googleapis.com/mcp` | `cloudasset.googleapis.com` | 4 |
 | `cloudbilling` | `cloudbilling.googleapis.com/mcp` | `cloudbilling.googleapis.com` | 29 |
 | `cloudcli` | `cloudcli.googleapis.com/mcp` | `cloudcli.googleapis.com` | 2 |
@@ -154,6 +157,7 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `cloudsupport` | `cloudsupport.googleapis.com/mcp` | `cloudsupport.googleapis.com` | 6 |
 | `cloudtrace` | `cloudtrace.googleapis.com/mcp` | `cloudtrace.googleapis.com` | 2 |
 | `compute` | `compute.googleapis.com/mcp` | `compute.googleapis.com` | 29 |
+| `contactcenterinsights` | `contactcenterinsights.googleapis.com/mcp` | `contactcenterinsights.googleapis.com` | 82 |
 | `container` | `container.googleapis.com/mcp` | `container.googleapis.com` | 23 |
 | `databasecenter` | `databasecenter.googleapis.com/mcp` | `databasecenter.googleapis.com` | 6 |
 | `databaseinsights` | `databaseinsights.googleapis.com/mcp` | `databaseinsights.googleapis.com` | 7 |
@@ -165,13 +169,20 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `datastream` | `datastream.googleapis.com/mcp` | `datastream.googleapis.com` | 10 |
 | `design` | `design.googleapis.com/mcp` | `design.googleapis.com` | 5 |
 | `designcenter` | `designcenter.googleapis.com/mcp` | `designcenter.googleapis.com` | 6 |
+| `developerconnect` | `developerconnect.googleapis.com/mcp` | `developerconnect.googleapis.com` | 2 |
 | `developerknowledge` | `developerknowledge.googleapis.com/mcp` | `developerknowledge.googleapis.com` | 3 |
+| `dialogflow` | `dialogflow.googleapis.com/mcp` | `dialogflow.googleapis.com` | 1 |
 | `discoveryengine` | `discoveryengine.googleapis.com/mcp` | `discoveryengine.googleapis.com` | 3 |
 | `file` | `file.googleapis.com/mcp` | `file.googleapis.com` | 8 |
+| `firebasedataconnect` | `firebasedataconnect.googleapis.com/mcp` | `firebasedataconnect.googleapis.com` | 11 |
 | `firestore` | `firestore.googleapis.com/mcp` | `firestore.googleapis.com` | 25 |
 | `geminicloudassist` | `geminicloudassist.googleapis.com/mcp` | `geminicloudassist.googleapis.com` | 5 |
+| `geminidataanalytics` | `geminidataanalytics.googleapis.com/mcp` | `geminidataanalytics.googleapis.com` | 15 |
 | `homedevelopers` | `homedevelopers.googleapis.com/mcp` | `homedevelopers.googleapis.com` | 1 |
+| `iam` | `iam.googleapis.com/mcp` | `iam.googleapis.com` | 12 |
 | `logging` | `logging.googleapis.com/mcp` | `logging.googleapis.com` | 6 |
+| `maintenance` | `maintenance.googleapis.com/mcp` | `maintenance.googleapis.com` | 3 |
+| `managedkafka` | `managedkafka.googleapis.com/mcp` | `managedkafka.googleapis.com` | 33 |
 | `mapscodeassist` | `mapscodeassist.googleapis.com/mcp` | `mapscodeassist.googleapis.com` | 2 |
 | `mapstools` | `mapstools.googleapis.com/mcp` | `mapstools.googleapis.com` | 5 |
 | `memorystore` | `memorystore.googleapis.com/mcp` | `memorystore.googleapis.com` | 14 |
@@ -190,6 +201,8 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `spanner` | `spanner.googleapis.com/mcp` | `spanner.googleapis.com` | 15 |
 | `sqladmin` | `sqladmin.googleapis.com/mcp` | `sqladmin.googleapis.com` | 15 |
 | `stitch` | `stitch.googleapis.com/mcp` | `stitch.googleapis.com` | 15 |
+| `storage` | `storage.googleapis.com/storage/mcp` | `storage.googleapis.com` | 9 |
+| `vertex-agents` | `aiplatform.googleapis.com/mcp/agents` | `aiplatform.googleapis.com` | 6 |
 | `vertex-endpoints` | `aiplatform.googleapis.com/mcp/endpoints` | `aiplatform.googleapis.com` | 6 |
 | `vertex-evaluation` | `aiplatform.googleapis.com/mcp/evaluation` | `aiplatform.googleapis.com` | 1 |
 | `vertex-generate` | `aiplatform.googleapis.com/mcp/generate` | `aiplatform.googleapis.com` | 3 |
@@ -200,18 +213,18 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `vertex-tuning` | `aiplatform.googleapis.com/mcp/tuning` | `aiplatform.googleapis.com` | 4 |
 | `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | `aiplatform.googleapis.com` | 24 |
 
-### The derived rule and its ten exceptions
+### The derived rule and its eleven exceptions
 
-Fifty-six of them follow one derived rule, host `{service}.googleapis.com`,
+Sixty-eight of them follow one derived rule, host `{service}.googleapis.com`,
 path `/mcp`, Service Usage API name equal to the host, and are written as bare
-ids. Ten do not, and each exception records a fact about Google's layout
+ids. Eleven do not, and each exception records a fact about Google's layout
 rather than a choice made here:
 
 | Tool prefix | Served from | Why it is manual |
 |---|---|---|
-| `vertex-endpoints`, `vertex-evaluation`, `vertex-generate`, `vertex-models`, `vertex-predict`, `vertex-prompts`, `vertex-retrieval`, `vertex-tuning` | `aiplatform.googleapis.com/mcp/{suite}` | Vertex AI publishes nine tool suites as paths on one shared host rather than one host per service, and Service Usage knows them all as `aiplatform.googleapis.com`. The registry pins the **global** host. The documentation also lists 46 regional hosts and 2 continental `rep` ones (`us`, `eu`); the global host answers discovery (probed 2026-08-31) and tool metadata does not vary by host, so the catalog needs no region. |
-| `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | The ninth Vertex suite. Its Colab Enterprise tool names run to 49 characters, and `vertex-notebook__` in front of one makes 66, over the 64-character limit MCP clients enforce on tool names; 13 id characters is the budget, so this one suite breaks the `vertex-` pattern. |
-| `ces` | `ces.us.rep.googleapis.com/mcp` | Customer Experience Agent Studio is served only from continental `rep` hosts; there is no `ces.googleapis.com/mcp`. The US host is pinned, as the documentation page shows. The EU variant, `ces.eu.rep.googleapis.com/mcp`, answers discovery too (probed 2026-09-01) and is deliberately not a second entry; see [Regional and EU routing](#regional-and-eu-routing). |
+| `vertex-agents`, `vertex-endpoints`, `vertex-evaluation`, `vertex-generate`, `vertex-models`, `vertex-predict`, `vertex-prompts`, `vertex-retrieval`, `vertex-tuning` | `aiplatform.googleapis.com/mcp/{suite}` | Vertex AI publishes ten tool suites as paths on one shared host rather than one host per service, and Service Usage knows them all as `aiplatform.googleapis.com`. The registry pins the **global** host; the documentation also lists 46 regional hosts and 2 continental `rep` ones, and tool metadata does not vary by host, so the catalog needs no region. A path that names no suite is a 404, which is what makes a suite list verifiable rather than guessed. |
+| `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | The tenth Vertex suite. Its Colab Enterprise tool names run to 49 characters, and `vertex-notebook__` in front of one makes 66, over the 64-character limit MCP clients enforce on tool names; 13 id characters is the budget, so this one suite breaks the `vertex-` pattern. |
+| `storage` | `storage.googleapis.com/storage/mcp` | Cloud Storage mounts MCP under the service's own URL prefix instead of at the host root, so this is the only entry whose path is neither `/mcp` nor `/mcp/{suite}`. |
 
 ### Spelling a service id in a query
 
@@ -224,12 +237,21 @@ of which leads with the suite's own tools, or with `vtx notebook`.
 ### Regional and EU routing
 
 This is a follow-up, not a registry entry. Discovery is host-invariant, but
-every `call` goes to the pinned host: Vertex calls go to
-the global endpoint and Agent Studio calls to the US one. A deployment that
-must keep its data in a region, or in the EU, has no way to say so yet. That
-is a serving-configuration concern (a per-service host override), tracked as
-the data-residency follow-up; adding EU or regional rows to the registry would
-only duplicate tool names without giving the operator the choice.
+every `call` goes to the pinned host, and every pinned host here is global. A
+deployment that must keep its data in a region, or in the EU, has no way to
+say so yet. That is a serving-configuration concern, a per-service host
+override, tracked as the data-residency follow-up; adding regional rows to the
+registry would only duplicate tool names without giving the operator the
+choice.
+
+Two products are reachable **only** regionally and are therefore absent from
+the registry rather than pinned to one region on the operator's behalf:
+Audit Manager, which answered at `auditmanager.us-central1.rep.googleapis.com`
+but has no continental or global host, and Google SecOps, which answered at
+`chronicle.us.rep.googleapis.com` but not at a regional or global one (both
+probed 2026-09-07). Customer Experience Agent Studio was in this position on
+2026-08-31 and is not any more: `ces.googleapis.com` now answers with the same
+60 tool names its US `rep` host serves, so the entry is derived like the rest.
 
 ### The design endpoint and enablement pruning
 
@@ -249,7 +271,7 @@ keeps its derived name rather than a guess.
 
 ## The tool surface
 
-By default the server exposes four meta-tools rather than 762 real ones.
+By default the server exposes four meta-tools rather than 985 real ones.
 Schemas load on demand, so the model gets exact argument shapes without paying
 for them up front.
 
@@ -382,13 +404,13 @@ mcp-google-service print-catalog
 ```
 
 ```
-generated_at: 2026-09-07T15:25:33Z
+generated_at: 2026-09-07T18:42:33Z
 
 SERVICE               TOOLS  SOURCE
 agentregistry            20  live
 alloydb                  17  live
 ...
-66 services             762
+79 services             985
 ```
 
 ### A note on `>` under zsh
@@ -449,8 +471,8 @@ startup; the rest are reported and survivable.
 
 ## The catalog snapshot
 
-`data/catalog-snapshot.json` is a committed, evidence-dated capture of all 66
-endpoints (762 tools, pinned 2026-09-07). It is embedded into the binary at
+`data/catalog-snapshot.json` is a committed, evidence-dated capture of all 79
+endpoints (985 tools, pinned 2026-09-07). It is embedded into the binary at
 compile time and serves three purposes: it makes startup fast, it lets a
 binary run without its repository, and it provides per-host fallback when a
 live fetch fails.
@@ -512,8 +534,8 @@ writes nothing: a snapshot missing services becomes a binary that silently
 cannot offer their tools. Pass `--allow-partial` to record a partial capture
 deliberately.
 
-The snapshot is pretty-printed rather than compact (20.6MB against roughly
-12.9MB) so
+The snapshot is pretty-printed rather than compact (23.4MB against roughly
+14.6MB) so
 that `git diff` produces reviewable line-level changes.
 
 On startup, drift between the snapshot and the live catalog is logged as a
@@ -598,18 +620,23 @@ from a real client. Run this once per release:
 
 Supported: Cloud endpoints at `https://{service}.googleapis.com/mcp` over
 stdio, with ADC credentials, plus the manual entries in
-[The endpoint registry](#the-endpoint-registry): the nine Vertex AI suites at
-`aiplatform.googleapis.com/mcp/{suite}` on the global host, and Customer
-Experience Agent Studio at its US `rep` host.
+[The endpoint registry](#the-endpoint-registry): the ten Vertex AI suites at
+`aiplatform.googleapis.com/mcp/{suite}` on the global host, and Cloud Storage
+at `storage.googleapis.com/storage/mcp`.
 
 Not supported in v1, each for a specific reason:
 
 - Google Workspace `/mcp/v1` endpoints, which need consumer OAuth scopes that
   ADC is not known to satisfy.
-- Choosing a regional Vertex host or the EU `rep` host for Agent Studio: the
-  data-residency follow-up described in the registry section. Both answer
-  discovery; neither is selectable for calls yet.
-- `storage.googleapis.com/storage/mcp`, which was not probed.
+- Regional and continental `rep` hosts, the data-residency follow-up described
+  in the registry section. This is what keeps Audit Manager and Google SecOps
+  out: both answer discovery, but only at a `rep` host, and pinning one region
+  for every operator is not a choice this registry should make.
+- MCP endpoints outside the Cloud plane, which answer discovery but were left
+  out because they are not covered by the one-auth-shape evidence above:
+  Google Analytics Admin, Merchant, Places, Search Console and Travel Impact
+  Model all answered on 2026-09-07 and would each need their own OAuth scope
+  checked before a `call` could be claimed to work.
 - API-key authentication. Cloud endpoints reject it outright: "API keys are
   not supported by this API."
 - An HTTP-facing server mode. stdio covers Claude Code.
