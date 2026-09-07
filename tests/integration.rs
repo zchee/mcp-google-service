@@ -641,6 +641,79 @@ async fn a_downed_upstream_is_served_from_the_snapshot_until_refresh_succeeds() 
     alive.server.shutdown().await;
 }
 
+/// An endpoint whose 59-char id makes every tool the synthetic upstream
+/// serves overrun the 64-char namespaced-name limit once prefixed
+/// (`{id}__echo_arguments` is 75 chars), while a one-letter snapshot tool
+/// still fits. It resolves to the same in-process upstream as `bigquery`.
+static OVERLONG_ENDPOINT: registry::Endpoint = registry::Endpoint {
+    service_id: "a-service-id-so-long-that-its-namespaced-tool-names-overrun",
+    host: "bigquery.googleapis.com",
+    api_name: "bigquery.googleapis.com",
+    mcp_path: "/mcp",
+};
+
+/// The 2026-09-01 review finding: the committed catalog sits one char under
+/// the 64-char name limit, and `Catalog::new` rejects a whole catalog for one
+/// overlong name. Without containment a single upstream rename would fail
+/// every live refresh and freeze all 65 services on snapshot data behind one
+/// WARN. The live fan-out must instead degrade the one service that cannot be
+/// namespaced -- to its snapshot entry, or to absence -- and leave the others
+/// live.
+#[tokio::test]
+async fn an_overlong_namespaced_name_degrades_only_its_own_service() {
+    let overlong = &OVERLONG_ENDPOINT;
+    assert!(
+        overlong.service_id.len() + 2 + TOOL_ECHO.len() > 64,
+        "the fixture must overrun the limit for the test to mean anything"
+    );
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+
+    let upstream =
+        spawn_mcp_upstream(&["run.googleapis.com", "bigquery.googleapis.com"], "overlong").await;
+    let addr = upstream.server.addr();
+    let http = client_resolving(&[("run.googleapis.com", addr), ("bigquery.googleapis.com", addr)]);
+
+    // No snapshot entry: the unnamespaceable service is omitted, `run` is live.
+    let catalog = Catalog::build_live(vec![run, overlong], &http, None)
+        .await
+        .expect("one unnamespaceable listing must not fail the catalog");
+    let ids: Vec<&str> = catalog.services.iter().map(|s| s.service_id.as_str()).collect();
+    assert_eq!(ids, ["run"], "the overlong service is omitted, the healthy one kept");
+    assert_eq!(catalog.service("run").map(|s| s.source), Some(CatalogSource::Live));
+
+    // A snapshot entry with a name that fits (the pre-rename tool, as it
+    // were): the service is served from it, labelled as such, and `run` is
+    // still live.
+    let short_named = ServiceCatalog {
+        service_id: overlong.service_id.to_owned(),
+        source: CatalogSource::Snapshot,
+        tools: vec![mcp_google_service::catalog::NamespacedTool::new(
+            overlong.service_id,
+            rmcp::model::Tool::new(
+                "t",
+                "The tool before the upstream renamed it.",
+                Arc::new(JsonObject::new()),
+            ),
+        )],
+    };
+    let snapshot = Catalog::new(vec![short_named]).expect("a snapshot whose names fit is valid");
+    let degraded = Catalog::build_live(vec![run, overlong], &http, Some(&snapshot))
+        .await
+        .expect("degrading to the snapshot keeps the catalog valid");
+    let stale = degraded
+        .service(overlong.service_id)
+        .expect("the snapshot entry keeps the service present");
+    assert_eq!(stale.source, CatalogSource::Snapshot, "served from the snapshot, and says so");
+    assert_eq!(stale.tools.len(), 1, "the snapshot's tools are carried over verbatim");
+    assert_eq!(degraded.service("run").map(|s| s.source), Some(CatalogSource::Live));
+    assert!(
+        degraded.tools().all(|t| t.namespaced_name.chars().count() <= 64),
+        "nothing served may exceed the limit"
+    );
+
+    upstream.server.shutdown().await;
+}
+
 /// Regression for T5 finding (b): a catalog restored from disk must never
 /// claim to be live, whatever provenance the file recorded when written.
 #[tokio::test]

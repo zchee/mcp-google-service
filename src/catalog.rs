@@ -713,6 +713,48 @@ enum FetchError {
     /// The bounded-concurrency permit could not be acquired.
     #[error("fan-out semaphore closed before this host was contacted")]
     Cancelled,
+
+    /// The listing answered, but namespacing it breaks [`MAX_TOOL_NAME_LEN`].
+    ///
+    /// Raised per service so that one upstream rename degrades one service,
+    /// exactly as an unreachable host does, instead of failing the whole
+    /// catalog through [`Catalog::new`] and freezing every service on
+    /// snapshot data. The cause names each overlong tool; for `snapshot` the
+    /// service then counts as unreached, which is the signal to shorten its
+    /// id (as `vtx-notebook` did).
+    #[error("{count} tool name(s) exceed {MAX_TOOL_NAME_LEN} chars once namespaced: {names}")]
+    ToolNamesTooLong {
+        /// How many tools overran the limit.
+        count: usize,
+        /// Each overlong namespaced name with its length, comma-separated.
+        names: String,
+    },
+}
+
+/// Namespace `tools` under `service_id`, refusing the whole listing when any
+/// resulting name would exceed [`MAX_TOOL_NAME_LEN`].
+///
+/// This is the live fan-out's containment boundary: [`Catalog::new`] is
+/// all-or-nothing, which is right for a snapshot but would let a single
+/// renamed upstream tool fail every refresh. Refusing the one listing keeps
+/// the failure the size of the service that caused it.
+fn namespace_within_limit(
+    service_id: &str,
+    tools: Vec<Tool>,
+) -> Result<Vec<NamespacedTool>, FetchError> {
+    let namespaced: Vec<NamespacedTool> =
+        tools.into_iter().map(|tool| NamespacedTool::new(service_id, tool)).collect();
+    let overlong: Vec<String> = namespaced
+        .iter()
+        .map(|tool| (tool.namespaced_name.as_str(), tool.namespaced_name.chars().count()))
+        .filter(|&(_, len)| len > MAX_TOOL_NAME_LEN)
+        .map(|(name, len)| format!("`{name}` ({len} chars)"))
+        .collect();
+    if overlong.is_empty() {
+        Ok(namespaced)
+    } else {
+        Err(FetchError::ToolNamesTooLong { count: overlong.len(), names: overlong.join(", ") })
+    }
 }
 
 impl Catalog {
@@ -808,13 +850,17 @@ impl Catalog {
     /// Fetch the catalog from the given endpoints without credentials.
     ///
     /// Hosts are contacted at [`FETCH_CONCURRENCY`] at a time with a
-    /// [`FETCH_TIMEOUT`] budget each. A host that fails degrades to its
-    /// `fallback` entry with a `WARN` naming the host and the cause; it is
-    /// never fatal. With no fallback entry the service is simply absent.
+    /// [`FETCH_TIMEOUT`] budget each. A host that fails, or that answers a
+    /// listing whose namespaced names would overrun [`MAX_TOOL_NAME_LEN`],
+    /// degrades to its `fallback` entry with a `WARN` naming the service,
+    /// the host and path, and the cause; it is never fatal, and it never
+    /// touches another service. With no fallback entry the service is simply
+    /// absent.
     ///
     /// # Errors
     ///
-    /// Only namespacing-invariant violations, per [`Catalog::new`].
+    /// Only a namespaced name claimed by two of the given endpoints, per
+    /// [`Catalog::new`]; an overlong name is contained per service instead.
     pub async fn build_live(
         endpoints: impl IntoIterator<Item = &'static Endpoint>,
         http: &reqwest::Client,
@@ -851,27 +897,32 @@ impl Catalog {
                 }
             };
 
+            let outcome =
+                outcome.and_then(|tools| namespace_within_limit(endpoint.service_id, tools));
             match outcome {
                 Ok(tools) => {
                     tracing::debug!(
                         service = endpoint.service_id,
                         host = endpoint.host,
+                        path = endpoint.mcp_path,
                         tools = tools.len(),
                         "fetched upstream tool list"
                     );
                     services.push(ServiceCatalog {
                         service_id: endpoint.service_id.to_owned(),
                         source: CatalogSource::Live,
-                        tools: tools
-                            .into_iter()
-                            .map(|tool| NamespacedTool::new(endpoint.service_id, tool))
-                            .collect(),
+                        tools,
                     });
                 }
+                // `service` and `path` alongside `host`: ten suites share
+                // `aiplatform.googleapis.com`, so the host alone would not say
+                // which one degraded.
                 Err(error) => match fallback.and_then(|c| c.service(endpoint.service_id)) {
                     Some(stale) => {
                         tracing::warn!(
+                            service = endpoint.service_id,
                             host = endpoint.host,
+                            path = endpoint.mcp_path,
                             cause = %error,
                             tools = stale.tools.len(),
                             "live discovery failed; serving this service from the snapshot"
@@ -884,7 +935,9 @@ impl Catalog {
                     }
                     None => {
                         tracing::warn!(
+                            service = endpoint.service_id,
                             host = endpoint.host,
+                            path = endpoint.mcp_path,
                             cause = %error,
                             "live discovery failed and no snapshot entry exists; service omitted"
                         );

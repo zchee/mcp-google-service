@@ -175,8 +175,11 @@ call { "name": "run__list_services", "arguments": { "project": "PROJECT_ID", "re
 ```
 
 A `source` of `snapshot` means that service's tools came from the bundled
-catalog because its live fetch failed. The data may be stale; the accompanying
-`WARN` log names the host and the cause.
+catalog because its live fetch failed, or because the fetched tool names could
+not be namespaced within the 64-character limit MCP clients enforce (one
+upstream rename degrades that one service, never the whole catalog). The data
+may be stale; the accompanying `WARN` log names the service, the host and
+path, and the cause.
 
 ### Flat mode
 
