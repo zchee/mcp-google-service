@@ -197,7 +197,7 @@ snapshot refresh that is not reflected here fails the build.
 
 ### The derived rule and its ten exceptions
 
-65 of them follow one derived rule, host `{service}.googleapis.com`,
+Fifty-five of them follow one derived rule, host `{service}.googleapis.com`,
 path `/mcp`, Service Usage API name equal to the host, and are written as bare
 ids. Ten do not, and each exception records a fact about Google's layout
 rather than a choice made here:
