@@ -164,17 +164,37 @@ fn collect_page(page_json: &str, out: &mut HashSet<String>) -> Result<Option<Str
 mod tests {
     use super::*;
 
-    const RUN: Endpoint =
-        Endpoint { service_id: "run", host: "run.googleapis.com", api_name: "run.googleapis.com" };
+    const RUN: Endpoint = Endpoint {
+        service_id: "run",
+        host: "run.googleapis.com",
+        api_name: "run.googleapis.com",
+        mcp_path: "/mcp",
+    };
     const LOGGING: Endpoint = Endpoint {
         service_id: "logging",
         host: "logging.googleapis.com",
         api_name: "logging.googleapis.com",
+        mcp_path: "/mcp",
     };
     const BIGQUERY: Endpoint = Endpoint {
         service_id: "bigquery",
         host: "bigquery.googleapis.com",
         api_name: "bigquery.googleapis.com",
+        mcp_path: "/mcp",
+    };
+    // Two suites of one API, the Vertex shape: distinct service ids and
+    // paths, one shared `api_name` toggled by a single Service Usage entry.
+    const VERTEX_GENERATE: Endpoint = Endpoint {
+        service_id: "vertex-generate",
+        host: "aiplatform.googleapis.com",
+        api_name: "aiplatform.googleapis.com",
+        mcp_path: "/mcp/generate",
+    };
+    const VERTEX_MODELS: Endpoint = Endpoint {
+        service_id: "vertex-models",
+        host: "aiplatform.googleapis.com",
+        api_name: "aiplatform.googleapis.com",
+        mcp_path: "/mcp/models",
     };
 
     fn endpoints() -> [Endpoint; 3] {
@@ -238,6 +258,22 @@ mod tests {
         let enabled = set(&["run.googleapis.com", "bigquery.googleapis.com"]);
         let selected = select_services(&eps, Some(&enabled), &[], &[]);
         assert_eq!(ids(&selected), ["run", "bigquery"]);
+    }
+
+    #[test]
+    fn one_enabled_api_selects_every_suite_sharing_it() {
+        let eps = [RUN, VERTEX_GENERATE, VERTEX_MODELS];
+        let enabled = set(&["aiplatform.googleapis.com"]);
+        let selected = select_services(&eps, Some(&enabled), &[], &[]);
+        assert_eq!(
+            ids(&selected),
+            ["vertex-generate", "vertex-models"],
+            "both suites ride the one Service Usage toggle; `run` stays pruned"
+        );
+
+        // `exclude` still bites per service id, not per API.
+        let selected = select_services(&eps, Some(&enabled), &[], &owned(&["vertex-models"]));
+        assert_eq!(ids(&selected), ["vertex-generate"]);
     }
 
     #[test]

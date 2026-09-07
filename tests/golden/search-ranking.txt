@@ -23,6 +23,17 @@ cloudcli__run_gcloud_command
 
 query: list cloud run
 run__list_services
+# 2026-08-31 registry growth: the Colab Enterprise runtime-template tool
+# outranks the gcloud escape hatch. `list` is one of its name words, `run`
+# starts its name word `runtime`, and all three tokens occur in its
+# description (`cloud` reaches it only there: nothing in the name says
+# cloud); the gcloud tool has `run` as a name word but `cloud` only inside
+# `gcloud`, a substring. Neither service is named by the query. A name word
+# plus a word prefix outweigh a substring, 34 to 26. Pinned as observed;
+# `tests/search_ranking.rs` states the mechanism. A ranking change that
+# stops crediting word prefixes or description text would move the
+# cloudcli pair back up, and that would be the moment to re-pin on purpose.
+vtx-notebook__colab_enterprise_list_notebook_runtime_templates
 cloudcli__run_gcloud_command
 cloudcli__run_bq_command
 
@@ -76,6 +87,14 @@ cloudresourcemanager__search_projects
 query: bigquery data transfer
 bigquerydatatransfer__create_transfer_config
 
+# -- a `-` in a service id is a word boundary: the two words name the whole
+#    Vertex suite, not just the tool whose name repeats `generate`
+#    (2026-09-01 review; before the fix only `generate_content` was a hit)
+query: vertex generate
+vertex-generate__generate_content
+vertex-generate__count_tokens
+vertex-generate__embed_content
+
 # -- both words are name words of one tool; the `run` service must not win
 #    just because its id appears in the query
 query: run gcloud
@@ -91,7 +110,15 @@ container__list_clusters
 query: pubsub topics
 pubsub__list_topics
 
-# -- an exact bare tool name; two services expose it, ties break on name
+# -- an exact bare tool name; four services expose it, ties break on name
+# 2026-09-07 registry growth: Firebase Data Connect leads, and not through a
+# tie-break. All four get the exact-name bonus plus the name-substring credit
+# for 36; its description is the only one that spells `list_services`, which
+# is a description hit worth 2 more. Pinned as observed, with the pair below
+# it in catalog order.
 query: list_services
+firebasedataconnect__list_services
 agentregistry__list_services
+# 2026-08-31 registry growth: Cloud Billing publishes an exact-name match.
+cloudbilling__list_services
 run__list_services

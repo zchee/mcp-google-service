@@ -106,6 +106,14 @@ const SCORE_EXACT_NAME: u32 = 32;
 /// reference by itself, and is dropped when the rest of the run spells one.
 const SERVICE_BRAND_PREFIX: &str = "cloud";
 
+/// Characters that join words inside a service id (`vertex-generate`).
+///
+/// They are word boundaries, not letters: a query spells the id word by
+/// word, so `vertex generate` names `vertex-generate` the way `cloud asset`
+/// names `cloudasset`. Only the manual registry entries carry one; every
+/// derived id is a single unbroken word.
+const SERVICE_ID_SEPARATORS: [char; 2] = ['-', '_'];
+
 /// Query bytes lowercased on the stack before the heap is involved.
 const QUERY_INLINE_BYTES: usize = 512;
 
@@ -705,6 +713,48 @@ enum FetchError {
     /// The bounded-concurrency permit could not be acquired.
     #[error("fan-out semaphore closed before this host was contacted")]
     Cancelled,
+
+    /// The listing answered, but namespacing it breaks [`MAX_TOOL_NAME_LEN`].
+    ///
+    /// Raised per service so that one upstream rename degrades one service,
+    /// exactly as an unreachable host does, instead of failing the whole
+    /// catalog through [`Catalog::new`] and freezing every service on
+    /// snapshot data. The cause names each overlong tool; for `snapshot` the
+    /// service then counts as unreached, which is the signal to shorten its
+    /// id (as `vtx-notebook` did).
+    #[error("{count} tool name(s) exceed {MAX_TOOL_NAME_LEN} chars once namespaced: {names}")]
+    ToolNamesTooLong {
+        /// How many tools overran the limit.
+        count: usize,
+        /// Each overlong namespaced name with its length, comma-separated.
+        names: String,
+    },
+}
+
+/// Namespace `tools` under `service_id`, refusing the whole listing when any
+/// resulting name would exceed [`MAX_TOOL_NAME_LEN`].
+///
+/// This is the live fan-out's containment boundary: [`Catalog::new`] is
+/// all-or-nothing, which is right for a snapshot but would let a single
+/// renamed upstream tool fail every refresh. Refusing the one listing keeps
+/// the failure the size of the service that caused it.
+fn namespace_within_limit(
+    service_id: &str,
+    tools: Vec<Tool>,
+) -> Result<Vec<NamespacedTool>, FetchError> {
+    let namespaced: Vec<NamespacedTool> =
+        tools.into_iter().map(|tool| NamespacedTool::new(service_id, tool)).collect();
+    let overlong: Vec<String> = namespaced
+        .iter()
+        .map(|tool| (tool.namespaced_name.as_str(), tool.namespaced_name.chars().count()))
+        .filter(|&(_, len)| len > MAX_TOOL_NAME_LEN)
+        .map(|(name, len)| format!("`{name}` ({len} chars)"))
+        .collect();
+    if overlong.is_empty() {
+        Ok(namespaced)
+    } else {
+        Err(FetchError::ToolNamesTooLong { count: overlong.len(), names: overlong.join(", ") })
+    }
 }
 
 impl Catalog {
@@ -800,13 +850,17 @@ impl Catalog {
     /// Fetch the catalog from the given endpoints without credentials.
     ///
     /// Hosts are contacted at [`FETCH_CONCURRENCY`] at a time with a
-    /// [`FETCH_TIMEOUT`] budget each. A host that fails degrades to its
-    /// `fallback` entry with a `WARN` naming the host and the cause; it is
-    /// never fatal. With no fallback entry the service is simply absent.
+    /// [`FETCH_TIMEOUT`] budget each. A host that fails, or that answers a
+    /// listing whose namespaced names would overrun [`MAX_TOOL_NAME_LEN`],
+    /// degrades to its `fallback` entry with a `WARN` naming the service,
+    /// the host and path, and the cause; it is never fatal, and it never
+    /// touches another service. With no fallback entry the service is simply
+    /// absent.
     ///
     /// # Errors
     ///
-    /// Only namespacing-invariant violations, per [`Catalog::new`].
+    /// Only a namespaced name claimed by two of the given endpoints, per
+    /// [`Catalog::new`]; an overlong name is contained per service instead.
     pub async fn build_live(
         endpoints: impl IntoIterator<Item = &'static Endpoint>,
         http: &reqwest::Client,
@@ -843,27 +897,32 @@ impl Catalog {
                 }
             };
 
+            let outcome =
+                outcome.and_then(|tools| namespace_within_limit(endpoint.service_id, tools));
             match outcome {
                 Ok(tools) => {
                     tracing::debug!(
                         service = endpoint.service_id,
                         host = endpoint.host,
+                        path = endpoint.mcp_path,
                         tools = tools.len(),
                         "fetched upstream tool list"
                     );
                     services.push(ServiceCatalog {
                         service_id: endpoint.service_id.to_owned(),
                         source: CatalogSource::Live,
-                        tools: tools
-                            .into_iter()
-                            .map(|tool| NamespacedTool::new(endpoint.service_id, tool))
-                            .collect(),
+                        tools,
                     });
                 }
+                // `service` and `path` alongside `host`: ten suites share
+                // `aiplatform.googleapis.com`, so the host alone would not say
+                // which one degraded.
                 Err(error) => match fallback.and_then(|c| c.service(endpoint.service_id)) {
                     Some(stale) => {
                         tracing::warn!(
+                            service = endpoint.service_id,
                             host = endpoint.host,
+                            path = endpoint.mcp_path,
                             cause = %error,
                             tools = stale.tools.len(),
                             "live discovery failed; serving this service from the snapshot"
@@ -876,7 +935,9 @@ impl Catalog {
                     }
                     None => {
                         tracing::warn!(
+                            service = endpoint.service_id,
                             host = endpoint.host,
+                            path = endpoint.mcp_path,
                             cause = %error,
                             "live discovery failed and no snapshot entry exists; service omitted"
                         );
@@ -937,9 +998,12 @@ impl Catalog {
     /// than widens the result. A token matches a tool when it
     ///
     /// * is part of a run of tokens that spells the tool's service id
-    ///   (`cloud run`, `run`, `big query`, `resource manager`, `cloud asset`),
-    ///   a leading `cloud` being brand rather than id; a run that spells only
-    ///   the start of an id (`cloud sql` for `sqladmin`) also counts, for less;
+    ///   (`cloud run`, `run`, `big query`, `resource manager`, `cloud asset`,
+    ///   `vertex generate` for `vertex-generate`), a leading `cloud` being
+    ///   brand rather than id and a `-` or `_` in the id being a word
+    ///   boundary; a run that spells only the start of an id (`cloud sql` for
+    ///   `sqladmin`, `vertex` for every `vertex-*` suite) also counts, for
+    ///   less;
     /// * equals, starts, or occurs inside a word of the tool's upstream name
     ///   (`_`-separated; CamelCase names are split the same way); or
     /// * occurs anywhere in the description.
@@ -1274,9 +1338,11 @@ fn collect_tokens<'q>(query: &'q str, buf: &mut [&'q str]) -> Option<usize> {
 /// that is only that word names nothing. The run is compared with the id and,
 /// when the id itself starts with the brand word, with the id minus that
 /// prefix, so `cloud asset`, `asset` and `cloudasset` all name `cloudasset`
-/// while `cloud run` names `run`. A whole-id spelling beats a prefix
-/// spelling, and among equals the longer run wins, so that more of the query
-/// is explained by the service reference.
+/// while `cloud run` names `run`. A [`SERVICE_ID_SEPARATORS`] character in
+/// the id is skipped between tokens, so `vertex generate` names
+/// `vertex-generate` and `vertex` alone is a prefix of every `vertex-*` id.
+/// A whole-id spelling beats a prefix spelling, and among equals the longer
+/// run wins, so that more of the query is explained by the service reference.
 fn service_reference(service_id: &str, tokens: &[&str]) -> ServiceReference {
     let core = service_id.strip_prefix(SERVICE_BRAND_PREFIX).filter(|rest| !rest.is_empty());
 
@@ -1312,9 +1378,17 @@ fn service_reference(service_id: &str, tokens: &[&str]) -> ServiceReference {
 }
 
 /// Whether `tokens`, concatenated, spell all or the start of `target`.
+///
+/// A [`SERVICE_ID_SEPARATORS`] character in `target` is a word boundary and
+/// is skipped before each token, so `vertex generate` spells
+/// `vertex-generate` exactly as `cloud asset` spells `cloudasset`. A token
+/// that carries the separator itself (`vertex-generate` typed whole) still
+/// matches: the trim only removes separators standing between the previous
+/// token's end and this token, and an id never starts with one.
 fn spells(target: &str, tokens: &[&str]) -> Spelling {
     let mut rest = target;
     for token in tokens {
+        rest = rest.trim_start_matches(SERVICE_ID_SEPARATORS);
         match rest.strip_prefix(token) {
             Some(after) => rest = after,
             None => return Spelling::No,
@@ -1406,7 +1480,7 @@ async fn fetch_tools(
     endpoint: &'static Endpoint,
     http: &reqwest::Client,
 ) -> Result<Vec<Tool>, FetchError> {
-    // `from_uri` would build a fresh client per host, paying TLS setup 47 times
+    // `from_uri` would build a fresh client per host, paying TLS setup 79 times
     // per refresh; `with_client` reuses the process-wide pool instead.
     let transport = StreamableHttpClientTransport::with_client(
         http.clone(),
@@ -1630,6 +1704,57 @@ mod tests {
                 "snapshot service `{}` is not in the endpoint registry",
                 service.service_id
             );
+        }
+    }
+
+    /// The README's "Supported endpoints" table is the registry and the
+    /// embedded snapshot written out by hand, so it is held to both: one row
+    /// per endpoint, in id order, with the served URL, the Service Usage name
+    /// and the snapshot's tool count. A registry change or a snapshot refresh
+    /// that leaves the table behind fails here rather than going stale.
+    #[test]
+    fn readme_endpoint_table_mirrors_the_registry_and_snapshot() {
+        const README: &str = include_str!("../README.md");
+        let unquote = |cell: &str| cell.trim_matches('`').to_owned();
+        // A table row `| id | endpoint | api | tools |` splits into six cells,
+        // the outer two empty; the numeric last cell tells it apart from every
+        // other table in the file.
+        let rows: Vec<(String, String, String, usize)> = README
+            .lines()
+            .filter_map(|line| {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                match cells.as_slice() {
+                    ["", id, endpoint, api, tools, ""] if id.starts_with('`') => tools
+                        .parse()
+                        .ok()
+                        .map(|tools| (unquote(id), unquote(endpoint), unquote(api), tools)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let catalog = committed_catalog();
+        let mut expected: Vec<(String, String, String, usize)> = registry::ENDPOINTS
+            .iter()
+            .map(|e| {
+                (
+                    e.service_id.to_owned(),
+                    format!("{}{}", e.host, e.mcp_path),
+                    e.api_name.to_owned(),
+                    catalog.service(e.service_id).map_or(0, |s| s.tools.len()),
+                )
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "README lists {} endpoint rows, the registry has {}",
+            rows.len(),
+            expected.len()
+        );
+        for (row, want) in rows.iter().zip(&expected) {
+            assert_eq!(row, want, "README endpoint row diverges from the registry or snapshot");
         }
     }
 
@@ -2029,6 +2154,26 @@ mod tests {
                 ("geminicloudassist", "gemini cloud assist", SCORE_SERVICE, (0, 3)),
             ),
             (
+                "exact: hyphenated id spelled word by word",
+                ("vertex-generate", "vertex generate", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "exact: hyphenated id typed as one token",
+                ("vertex-generate", "vertex-generate", SCORE_SERVICE, (0, 1)),
+            ),
+            (
+                "exact: hyphenated id inside a longer query",
+                ("vtx-notebook", "list vtx notebook runtimes", SCORE_SERVICE, (1, 3)),
+            ),
+            (
+                "exact: underscore is a word boundary too",
+                ("foo_bar", "foo bar", SCORE_SERVICE, (0, 2)),
+            ),
+            (
+                "prefix: first word of a hyphenated id",
+                ("vertex-generate", "vertex", SCORE_SERVICE_PREFIX, (0, 1)),
+            ),
+            (
                 "prefix: product name shorter than the id",
                 ("sqladmin", "cloud sql", SCORE_SERVICE_PREFIX, (0, 2)),
             ),
@@ -2043,6 +2188,14 @@ mod tests {
             ("none: brand alone names nothing", ("cloudcli", "cloud", 0, (0, 0))),
             ("none: unrelated token", ("run", "bigquery", 0, (0, 0))),
             ("none: no run starts the id", ("bigquery", "data warehouse", 0, (0, 0))),
+            (
+                "none: the second word of a hyphenated id does not start it",
+                ("vertex-generate", "generate", 0, (0, 0)),
+            ),
+            (
+                "prefix: a separator token spells nothing, the word before it still does",
+                ("vertex-generate", "vertex - generate", SCORE_SERVICE_PREFIX, (0, 1)),
+            ),
         ];
         for (name, (service_id, query, score, (start, end))) in tests {
             let tokens: Vec<&str> = query.split_whitespace().collect();

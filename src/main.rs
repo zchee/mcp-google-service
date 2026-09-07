@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::debug!(
             service = endpoint.service_id,
             host = endpoint.host,
+            path = endpoint.mcp_path,
             api = endpoint.api_name,
             "registered endpoint"
         );
