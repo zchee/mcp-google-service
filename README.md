@@ -4,9 +4,11 @@ A single MCP server that aggregates Google Cloud's remote MCP endpoints behind
 one process, one authentication model, and one namespaced tool surface.
 
 Google publishes MCP endpoints per service at
-`https://{service}.googleapis.com/mcp`. Registering them individually in an MCP
-client runs into three problems, all measured against the live endpoints
-(2026-08-19, re-measured 2026-08-31 after the registry grew to 65):
+`https://{service}.googleapis.com/mcp` (with ten exceptions, listed under
+[The endpoint registry](#the-endpoint-registry)). Registering them
+individually in an MCP client runs into three problems, all measured against
+the live endpoints (2026-08-19, re-measured 2026-08-31 after the registry grew
+to 65):
 
 - **756 tools across 65 endpoints**, which is far more than a model can be
   offered at once.
@@ -309,6 +311,34 @@ startup; the rest are reported and survivable.
 | `Service Usage returned a pagination token it had already served` / `Service Usage listing did not terminate within 50 pages` | The enabled-API listing stopped making progress and was abandoned. Pruning degrades: the configured selection is exposed unpruned, with a `WARN`. | None required. If it persists, `--only` pins the services to expose without consulting Service Usage. |
 | `` `call` requires `arguments` to be a JSON object `` | `call` was given `arguments` as an array, string, number or boolean. | Read the schema with `describe_tools` and pass an object. Omitting `arguments` (or passing `null`) is valid for a tool that takes none. |
 
+## The endpoint registry
+
+`src/registry.rs` pins the 65 endpoints. Fifty-five follow one derived rule,
+host `{service}.googleapis.com`, path `/mcp`, Service Usage API name equal to
+the host, and are written as bare ids. Ten do not, and each exception records
+a fact about Google's layout rather than a choice made here:
+
+| Entry | Served from | Why it is manual |
+|---|---|---|
+| `vertex-endpoints`, `vertex-evaluation`, `vertex-generate`, `vertex-models`, `vertex-predict`, `vertex-prompts`, `vertex-retrieval`, `vertex-tuning` | `aiplatform.googleapis.com/mcp/{suite}` | Vertex AI publishes nine tool suites as paths on one shared host rather than one host per service, and Service Usage knows them all as `aiplatform.googleapis.com`. The registry pins the **global** host. The documentation also lists 46 regional hosts and 2 continental `rep` ones (`us`, `eu`); the global host answers discovery (probed 2026-08-31) and tool metadata does not vary by host, so the catalog needs no region. |
+| `vtx-notebook` | `aiplatform.googleapis.com/mcp/notebook` | The ninth Vertex suite. Its Colab Enterprise tool names run to 49 characters, and `vertex-notebook__` in front of one makes 66, over the 64-character limit MCP clients enforce on tool names; 13 id characters is the budget, so this one suite breaks the `vertex-` pattern. |
+| `ces` | `ces.us.rep.googleapis.com/mcp` | Customer Experience Agent Studio is served only from continental `rep` hosts; there is no `ces.googleapis.com/mcp`. The US host is pinned, as the documentation page shows. The EU variant, `ces.eu.rep.googleapis.com/mcp`, answers discovery too (probed 2026-09-01) and is deliberately not a second entry, for the reason below. |
+
+**Search spells an id word by word.** A `-` in a service id is a word
+boundary, so `vertex generate` names the `vertex-generate` suite the way
+`cloud asset` names `cloudasset`, and `vertex` alone reaches every `vertex-*`
+suite. The notebook suite's short id means `vertex notebook` does not name it:
+reach it with `notebook` or `colab`, each of which leads with the suite's own
+tools, or with `vtx notebook`.
+
+**Regional and EU routing is a follow-up, not a registry entry.** Discovery is
+host-invariant, but every `call` goes to the pinned host: Vertex calls go to
+the global endpoint and Agent Studio calls to the US one. A deployment that
+must keep its data in a region, or in the EU, has no way to say so yet. That
+is a serving-configuration concern (a per-service host override), tracked as
+the data-residency follow-up; adding EU or regional rows to the registry would
+only duplicate tool names without giving the operator the choice.
+
 ## The catalog snapshot
 
 `data/catalog-snapshot.json` is a committed, evidence-dated capture of all 65
@@ -458,14 +488,19 @@ from a real client. Run this once per release:
 ## Scope
 
 Supported: Cloud endpoints at `https://{service}.googleapis.com/mcp` over
-stdio, with ADC credentials.
+stdio, with ADC credentials, plus the manual entries in
+[The endpoint registry](#the-endpoint-registry): the nine Vertex AI suites at
+`aiplatform.googleapis.com/mcp/{suite}` on the global host, and Customer
+Experience Agent Studio at its US `rep` host.
 
 Not supported in v1, each for a specific reason:
 
 - Google Workspace `/mcp/v1` endpoints, which need consumer OAuth scopes that
   ADC is not known to satisfy.
-- Regional `.rep.googleapis.com` hosts, Vertex `/mcp/{toolset}` paths, and
-  `storage.googleapis.com/storage/mcp`, none of which were probed.
+- Choosing a regional Vertex host or the EU `rep` host for Agent Studio: the
+  data-residency follow-up described in the registry section. Both answer
+  discovery; neither is selectable for calls yet.
+- `storage.googleapis.com/storage/mcp`, which was not probed.
 - API-key authentication. Cloud endpoints reject it outright: "API keys are
   not supported by this API."
 - An HTTP-facing server mode. stdio covers Claude Code.

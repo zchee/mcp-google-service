@@ -128,7 +128,13 @@ pub static ENDPOINTS: &[Endpoint] = endpoints![
     ],
     manual: [
         // Customer Experience Agent Studio is served only from continental
-        // `rep` hosts; the US one is pinned, matching the docs page.
+        // `rep` hosts; there is no `ces.googleapis.com/mcp`. The US one is
+        // pinned, matching the docs page. The EU variant,
+        // `ces.eu.rep.googleapis.com/mcp`, answers discovery as well (probed
+        // 2026-09-01) and is deliberately not a second entry: tool metadata
+        // is host-invariant, but every call goes to the pinned host, so an
+        // EU data-residency deployment needs the regional/rep routing
+        // follow-up (a per-service host override), not a registry row.
         Endpoint {
             service_id: "ces",
             host: "ces.us.rep.googleapis.com",
