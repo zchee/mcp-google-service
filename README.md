@@ -634,9 +634,18 @@ Not supported in v1, each for a specific reason:
   for every operator is not a choice this registry should make.
 - MCP endpoints outside the Cloud plane, which answer discovery but were left
   out because they are not covered by the one-auth-shape evidence above:
-  Google Analytics Admin, Merchant, Places, Search Console and Travel Impact
-  Model all answered on 2026-09-07 and would each need their own OAuth scope
-  checked before a `call` could be claimed to work.
+  Google Analytics Admin, Merchant, Places, Search Console, Travel Impact
+  Model and Play Developer Reporting all answered on 2026-09-07 and would
+  each need their own OAuth scope checked before a `call` could be claimed to
+  work. Play Developer Reporting would also need a short id: two of its tool
+  names reach 71 characters once prefixed, and 15 id characters is the
+  budget, the same constraint that made `vtx-notebook`.
+- Hosts whose `/mcp` mount answers `initialize` and `ping` but has nothing to
+  list, found by the same sweep: `cloudcommerceprocurement`, `dataflow` and
+  `secretmanager` return 404 for `tools/list`, and `customsearch`,
+  `homegraph` and `orgpolicy` return an empty tool list (`homegraph` behind a
+  401 as well). None of them has a tool to expose, so none is an omission;
+  re-probe them when the registry is next swept.
 - API-key authentication. Cloud endpoints reject it outright: "API keys are
   not supported by this API."
 - An HTTP-facing server mode. stdio covers Claude Code.
