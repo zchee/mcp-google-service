@@ -10,6 +10,7 @@ pub mod archive;
 pub mod auth;
 pub mod catalog;
 pub mod config;
+pub mod discover_gate;
 pub mod error;
 pub mod proxy;
 pub mod prune;

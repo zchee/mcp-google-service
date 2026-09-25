@@ -5,11 +5,12 @@ use std::{io::Write, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use rmcp::{ServiceExt, transport::stdio};
+use rmcp::{ServerHandler, ServiceExt, transport::async_rw::AsyncRwTransport, transport::stdio};
 
 use mcp_google_service::{
     archive, auth, catalog,
     config::{Config, ExposeMode},
+    discover_gate::DiscoverGate,
     proxy, registry,
     server::{self, BackgroundStartup, CredentialState, Readiness},
 };
@@ -236,11 +237,22 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         Arc::new(proxy::Proxy::from_endpoints(auth, http.clone(), &exposed)),
         cfg.expose,
     );
-    let running = handler.serve(stdio()).await.context("starting the stdio MCP server")?;
+    // The gate answers a client's pre-`initialize` `server/discover` probe
+    // itself; rmcp 3.1.3 would otherwise commit the session to per-request
+    // `_meta` and refuse the legacy `tools/list` that follows the fallback.
+    // See `discover_gate` for the condition under which this goes back to
+    // `handler.serve(stdio())`.
+    let (stdin, stdout) = stdio();
+    let transport = DiscoverGate::new(
+        AsyncRwTransport::new_server(stdin, stdout),
+        &handler.supported_protocol_versions(),
+    );
+    let running = handler.serve(transport).await.context("starting the stdio MCP server")?;
 
-    // `serve` returns once the client's `initialize` has been answered. Only
-    // now does anything reach for the network, so neither credential
-    // discovery nor the refresh fan-out competes with the handshake.
+    // `serve` returns once the client's `initialize` has been answered (the
+    // gate keeps a refused probe from returning it earlier). Only now does
+    // anything reach for the network, so neither credential discovery nor the
+    // refresh fan-out competes with the handshake.
     match (background, cfg.expose) {
         (Some(background), _) => {
             tokio::spawn(background.run());
