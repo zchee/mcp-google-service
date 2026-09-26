@@ -50,18 +50,36 @@ jobs:
       - run: cargo nextest run --locked
       - run: cargo test --doc --locked
       - uses: EmbarkStudios/cargo-deny-action@v2
-      - name: Refuse a tag that does not match Cargo.toml
+      # A version already on crates.io is skipped rather than failed, so a
+      # re-run of the tag (or a tag pushed after a release was published by
+      # hand, as the first one was) stays green: the tests and cargo-deny
+      # above still ran, and there is nothing left to upload.
+      - name: Refuse a tag that does not match Cargo.toml; detect a published version
+        id: version
         run: |
+          crate="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].name')"
           version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
           if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
             exit 1
           fi
+          # crates.io answers 404 for a version it does not have, and refuses
+          # requests without a User-Agent.
+          if curl --fail --silent --show-error --output /dev/null \
+               --header "User-Agent: ${crate} publish workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})" \
+               "https://crates.io/api/v1/crates/${crate}/${version}"; then
+            echo "${crate} ${version} is already on crates.io; nothing to upload"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.version.outputs.published != 'true'
         id: auth
       # `publish` packages, builds the package from scratch and uploads it; a
       # package that does not build is rejected before anything is uploaded.
       # `--locked` publishes the graph the tests and cargo-deny just ran on.
       - run: cargo publish --locked
+        if: steps.version.outputs.published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

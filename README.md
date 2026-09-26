@@ -648,7 +648,9 @@ starts by refreshing it:
    workflow runs the test suite and `cargo deny` on the tagged commit,
    refuses a tag that does not match `Cargo.toml`, then publishes with
    `--locked` through crates.io Trusted Publishing, so no API token is stored
-   in the repository.
+   in the repository. A version that is already on crates.io is skipped, not
+   failed, so re-running a tag (or tagging a release that was published by
+   hand) stays green.
 
 Trusted Publishing can only be configured on a crate that already exists on
 crates.io, so the very first release is published by hand with
