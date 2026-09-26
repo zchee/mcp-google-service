@@ -1,4 +1,4 @@
-//! `Catalog` search over the committed 79-service / 985-tool snapshot.
+//! `Catalog` search over the committed 79-service / 1012-tool snapshot.
 //!
 //! Two temperatures per query:
 //!

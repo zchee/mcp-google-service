@@ -61,11 +61,16 @@ run__deploy_service_from_image
 run__get_service
 run__list_services
 
-# -- an exact service id beats services whose ids merely start with it
+# -- an exact service id beats services whose ids merely start with it.
+#    The 2026-09-26 snapshot added the three job tools; every `bigquery__`
+#    tool still precedes the first `bigquerydatatransfer__` one, in name order.
 query: bigquery
+bigquery__cancel_job
 bigquery__execute_sql
 bigquery__execute_sql_readonly
 bigquery__get_dataset_info
+bigquery__get_job
+bigquery__get_query_results
 bigquery__get_table_info
 bigquery__list_dataset_ids
 bigquery__list_table_ids

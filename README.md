@@ -10,7 +10,7 @@ individually in an MCP client runs into three problems, all measured against
 the live endpoints (2026-08-19, re-measured 2026-09-07 after the registry grew
 to 79):
 
-- **985 tools across 79 endpoints**, which is far more than a model can be
+- **1012 tools across 79 endpoints**, which is far more than a model can be
   offered at once.
 - **61 tool-name collisions** between services (several services publish a tool
   called `list_services`, for example).
@@ -135,7 +135,7 @@ All 79, in the order [`list_services`](#the-tool-surface) and
 [`print-catalog`](#command-line-interface) report them. The tool prefix is the
 service id (`{prefix}__{tool}`); the Service Usage name is
 what `gcloud services enable` takes and what pruning matches on; the tool
-counts are those of the snapshot pinned 2026-09-07. A test holds this table
+counts are those of the snapshot pinned 2026-09-26. A test holds this table
 to the registry and the embedded snapshot, so a registry change or a
 snapshot refresh that is not reflected here fails the build.
 
@@ -152,7 +152,7 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `apigee` | `apigee.googleapis.com/mcp` | `apigee.googleapis.com` | 39 |
 | `apihub` | `apihub.googleapis.com/mcp` | `apihub.googleapis.com` | 46 |
 | `backupdr` | `backupdr.googleapis.com/mcp` | `backupdr.googleapis.com` | 23 |
-| `bigquery` | `bigquery.googleapis.com/mcp` | `bigquery.googleapis.com` | 6 |
+| `bigquery` | `bigquery.googleapis.com/mcp` | `bigquery.googleapis.com` | 9 |
 | `bigquerydatatransfer` | `bigquerydatatransfer.googleapis.com/mcp` | `bigquerydatatransfer.googleapis.com` | 13 |
 | `bigquerymigration` | `bigquerymigration.googleapis.com/mcp` | `bigquerymigration.googleapis.com` | 10 |
 | `bigtableadmin` | `bigtableadmin.googleapis.com/mcp` | `bigtableadmin.googleapis.com` | 14 |
@@ -173,23 +173,23 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `container` | `container.googleapis.com/mcp` | `container.googleapis.com` | 23 |
 | `databasecenter` | `databasecenter.googleapis.com/mcp` | `databasecenter.googleapis.com` | 6 |
 | `databaseinsights` | `databaseinsights.googleapis.com/mcp` | `databaseinsights.googleapis.com` | 7 |
-| `dataform` | `dataform.googleapis.com/mcp` | `dataform.googleapis.com` | 21 |
+| `dataform` | `dataform.googleapis.com/mcp` | `dataform.googleapis.com` | 35 |
 | `datalineage` | `datalineage.googleapis.com/mcp` | `datalineage.googleapis.com` | 1 |
-| `datamigration` | `datamigration.googleapis.com/mcp` | `datamigration.googleapis.com` | 8 |
+| `datamigration` | `datamigration.googleapis.com/mcp` | `datamigration.googleapis.com` | 13 |
 | `dataplex` | `dataplex.googleapis.com/mcp` | `dataplex.googleapis.com` | 3 |
 | `dataproc` | `dataproc.googleapis.com/mcp` | `dataproc.googleapis.com` | 16 |
 | `datastream` | `datastream.googleapis.com/mcp` | `datastream.googleapis.com` | 10 |
 | `design` | `design.googleapis.com/mcp` | `design.googleapis.com` | 5 |
 | `designcenter` | `designcenter.googleapis.com/mcp` | `designcenter.googleapis.com` | 6 |
-| `developerconnect` | `developerconnect.googleapis.com/mcp` | `developerconnect.googleapis.com` | 2 |
+| `developerconnect` | `developerconnect.googleapis.com/mcp` | `developerconnect.googleapis.com` | 4 |
 | `developerknowledge` | `developerknowledge.googleapis.com/mcp` | `developerknowledge.googleapis.com` | 3 |
 | `dialogflow` | `dialogflow.googleapis.com/mcp` | `dialogflow.googleapis.com` | 1 |
 | `discoveryengine` | `discoveryengine.googleapis.com/mcp` | `discoveryengine.googleapis.com` | 3 |
 | `file` | `file.googleapis.com/mcp` | `file.googleapis.com` | 8 |
 | `firebasedataconnect` | `firebasedataconnect.googleapis.com/mcp` | `firebasedataconnect.googleapis.com` | 11 |
-| `firestore` | `firestore.googleapis.com/mcp` | `firestore.googleapis.com` | 25 |
+| `firestore` | `firestore.googleapis.com/mcp` | `firestore.googleapis.com` | 23 |
 | `geminicloudassist` | `geminicloudassist.googleapis.com/mcp` | `geminicloudassist.googleapis.com` | 5 |
-| `geminidataanalytics` | `geminidataanalytics.googleapis.com/mcp` | `geminidataanalytics.googleapis.com` | 15 |
+| `geminidataanalytics` | `geminidataanalytics.googleapis.com/mcp` | `geminidataanalytics.googleapis.com` | 12 |
 | `homedevelopers` | `homedevelopers.googleapis.com/mcp` | `homedevelopers.googleapis.com` | 1 |
 | `iam` | `iam.googleapis.com/mcp` | `iam.googleapis.com` | 12 |
 | `logging` | `logging.googleapis.com/mcp` | `logging.googleapis.com` | 6 |
@@ -202,15 +202,15 @@ below](#the-design-endpoint-and-enablement-pruning).
 | `netapp` | `netapp.googleapis.com/mcp` | `netapp.googleapis.com` | 14 |
 | `networkmanagement` | `networkmanagement.googleapis.com/mcp` | `networkmanagement.googleapis.com` | 4 |
 | `oracledatabase` | `oracledatabase.googleapis.com/mcp` | `oracledatabase.googleapis.com` | 39 |
-| `paydeveloper` | `paydeveloper.googleapis.com/mcp` | `paydeveloper.googleapis.com` | 13 |
+| `paydeveloper` | `paydeveloper.googleapis.com/mcp` | `paydeveloper.googleapis.com` | 15 |
 | `policytroubleshooter` | `policytroubleshooter.googleapis.com/mcp` | `policytroubleshooter.googleapis.com` | 2 |
 | `pubsub` | `pubsub.googleapis.com/mcp` | `pubsub.googleapis.com` | 15 |
-| `recommender` | `recommender.googleapis.com/mcp` | `recommender.googleapis.com` | 4 |
+| `recommender` | `recommender.googleapis.com/mcp` | `recommender.googleapis.com` | 9 |
 | `redis` | `redis.googleapis.com/mcp` | `redis.googleapis.com` | 25 |
 | `run` | `run.googleapis.com/mcp` | `run.googleapis.com` | 5 |
 | `saasservicemgmt` | `saasservicemgmt.googleapis.com/mcp` | `saasservicemgmt.googleapis.com` | 35 |
 | `servicehealth` | `servicehealth.googleapis.com/mcp` | `servicehealth.googleapis.com` | 2 |
-| `spanner` | `spanner.googleapis.com/mcp` | `spanner.googleapis.com` | 15 |
+| `spanner` | `spanner.googleapis.com/mcp` | `spanner.googleapis.com` | 16 |
 | `sqladmin` | `sqladmin.googleapis.com/mcp` | `sqladmin.googleapis.com` | 15 |
 | `stitch` | `stitch.googleapis.com/mcp` | `stitch.googleapis.com` | 15 |
 | `storage` | `storage.googleapis.com/storage/mcp` | `storage.googleapis.com` | 9 |
@@ -283,7 +283,7 @@ keeps its derived name rather than a guess.
 
 ## The tool surface
 
-By default the server exposes four meta-tools rather than 985 real ones.
+By default the server exposes four meta-tools rather than 1012 real ones.
 Schemas load on demand, so the model gets exact argument shapes without paying
 for them up front.
 
@@ -416,13 +416,13 @@ mcp-google-service print-catalog
 ```
 
 ```
-generated_at: 2026-09-07T18:42:33Z
+generated_at: 2026-09-26T04:24:00Z
 
 SERVICE               TOOLS  SOURCE
 agentregistry            20  live
 alloydb                  17  live
 ...
-79 services             985
+79 services            1012
 ```
 
 ### A note on `>` under zsh
@@ -484,7 +484,7 @@ startup; the rest are reported and survivable.
 ## The catalog snapshot
 
 `data/catalog-snapshot.json` is a committed, evidence-dated capture of all 79
-endpoints (985 tools, pinned 2026-09-07). It is embedded into the binary at
+endpoints (1012 tools, pinned 2026-09-26). It is embedded into the binary at
 compile time and serves three purposes: it makes startup fast, it lets a
 binary run without its repository, and it provides per-host fallback when a
 live fetch fails.

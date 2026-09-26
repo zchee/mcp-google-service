@@ -1,4 +1,4 @@
-//! Namespacing the 985 upstream tools and validating the catalog invariants.
+//! Namespacing the 1012 upstream tools and validating the catalog invariants.
 //!
 //! Two steps, measured separately because they run at different times:
 //!
