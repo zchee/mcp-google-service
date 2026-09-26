@@ -9,8 +9,8 @@
 //! on the same process when the probe is refused with anything other than a
 //! modern-lifecycle error. This server does not offer `2026-07-28` (see
 //! `GoogleMcpServer::supported_protocol_versions`), so the probe is refused,
-//! and rmcp 3.1.3 then mishandles the fallback: `serve_server_with_ct_inner`
-//! (`rmcp-3.1.3/src/service/server.rs:528-556`) marks the peer as requiring
+//! and rmcp 3.4.1 then mishandles the fallback: `serve_server_with_ct_inner`
+//! (`rmcp-3.4.1/src/service/server.rs:595-628`) marks the peer as requiring
 //! per-request `_meta` the moment the first request is not `initialize`, and
 //! never clears that mark. The `initialize` that follows is accepted, but the
 //! legacy `tools/list` after it is refused with `-32602 request _meta is

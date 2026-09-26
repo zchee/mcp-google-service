@@ -522,7 +522,7 @@ impl GoogleMcpServer {
 impl ServerHandler for GoogleMcpServer {
     /// Cap negotiation below `2026-07-28`.
     ///
-    /// rmcp 3.1.3 will agree to `2026-07-28` when a client offers it, even
+    /// rmcp 3.4.1 will agree to `2026-07-28` when a client offers it, even
     /// though that revision is newer than the SDK's own `LATEST`, and it then
     /// emits a bare `resultType: "complete"` where the revision expects a cache
     /// descriptor carrying `ttlMs` and `cacheScope`. Claude Code offers
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn protocol_negotiation_never_offers_the_revision_rmcp_serializes_wrongly() {
-        // Regression: rmcp 3.1.3 agrees to 2026-07-28 when a client offers it,
+        // Regression: rmcp 3.4.1 agrees to 2026-07-28 when a client offers it,
         // then emits `resultType: "complete"` where that revision expects a
         // cache descriptor with ttlMs and cacheScope. Claude Code offers
         // 2026-07-28 and rejects the resulting tools/list, leaving the server

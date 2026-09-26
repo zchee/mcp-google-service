@@ -22,7 +22,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # builder, so `data/catalog-snapshot.bin` is portable and a future default
 # change cannot silently re-shape it (the identity test would also refuse it).
 rkyv = { version = "0.8.18", features = ["little_endian", "pointer_width_32", "aligned"] }
-rmcp = { version = "3.1", features = ["server", "client", "transport-io", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.4", features = ["server", "client", "transport-io", "transport-streamable-http-client-reqwest", "reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -46,7 +46,7 @@ zeroize = "1"
 # ZSTDv01-v07 decoders in (~25 KB of `__text` the dispatcher pins and ld64
 # cannot strip); every frame this binary reads is one it wrote itself with
 # this same library, so there is nothing legacy to decode.
-zstd = { version = "0.13.3", default-features = false }
+zstd = { version = "0.14.0", default-features = false }
 
 # Test-only. The integration tier runs REAL in-process servers (a genuine rmcp
 # MCP server and a Service Usage REST stub) behind TLS, because both
@@ -73,7 +73,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 rcgen = "0.14"
 # The in-process upstream is a real MCP server speaking the real protocol
 # (plan section 4-P5), not a canned-response fake.
-rmcp = { version = "3.1", features = [
+rmcp = { version = "3.4", features = [
     "server",
     "transport-streamable-http-server",
     # The live tier drives the real compiled binary over its real stdio
