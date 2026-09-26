@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -13,7 +14,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       # rustup 1.28+ reads rust-toolchain.toml, so the pin and its
@@ -25,7 +26,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install pinned toolchain
@@ -42,7 +43,7 @@ jobs:
       - run: cargo test --doc
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       # Mint the GitHub OIDC token codecov-action exchanges for an upload
@@ -65,3 +66,12 @@ jobs:
           files: lcov.info
           fail_ci_if_error: true
           use_oidc: true
+
+  deny:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      # Licenses, advisories, bans and sources, per deny.toml. Runs against
+      # the committed Cargo.lock, so a `cargo update` that pulls in a new
+      # license or a yanked crate fails here rather than at publish time.
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -41,7 +41,7 @@ catalog underneath the server needs no `listChanged` notification.
 
 ## Requirements
 
-- Rust 1.97.1 (edition 2024, MSRV 1.88), pinned exactly by `rust-toolchain.toml`.
+- Rust 1.98.1 (edition 2024, MSRV 1.98), pinned exactly by `rust-toolchain.toml`.
 - The `gcloud` CLI, for creating credentials.
 - A Google Cloud project to use as the quota project.
 
@@ -53,6 +53,18 @@ cargo build --release
 
 The binary lands at `target/release/mcp-google-service`. It embeds a catalog
 snapshot at compile time, so it runs standalone without the repository.
+
+The crate is also on crates.io, so a checkout is optional:
+
+```sh
+cargo install --locked mcp-google-service
+```
+
+`--locked` installs the dependency versions the release was tested and
+license-checked with. The embedded catalog is the one the release was cut
+with; an installed binary can capture a newer one with the `snapshot`
+subcommand and serve it with `--snapshot` (see
+[The catalog snapshot](#the-catalog-snapshot)).
 
 ## Authentication setup
 
@@ -615,6 +627,37 @@ from a real client. Run this once per release:
 8. Call a tool belonging to a disabled API and confirm the error names the
    exact `gcloud services enable` command.
 9. Remove the test registration: `claude mcp remove gcp-test`.
+
+## Releasing
+
+The embedded catalog is frozen at the moment the package is cut, so a release
+starts by refreshing it:
+
+1. Regenerate and review the snapshot (see
+   [Regenerating and reviewing drift](#regenerating-and-reviewing-drift)),
+   and commit the JSON and the archive together.
+2. Bump `version` in `Cargo.toml`, run `cargo deny check`, and run the test
+   suite and the manual checklist above.
+3. `cargo publish --dry-run --locked`, which packages the crate and builds it
+   from the package. `data/catalog-snapshot.json` is deliberately excluded
+   (24 MB read only by the archive-identity tests and the snapshot-load
+   bench, which report themselves inert in an unpacked package); the package
+   must stay under crates.io's 10 MiB compressed limit, and the dry run
+   prints its size.
+4. Tag the commit with a signed `vX.Y.Z` tag and push it. The `Publish`
+   workflow runs the test suite and `cargo deny` on the tagged commit,
+   refuses a tag that does not match `Cargo.toml`, then publishes with
+   `--locked` through crates.io Trusted Publishing, so no API token is stored
+   in the repository.
+
+Trusted Publishing can only be configured on a crate that already exists on
+crates.io, so the very first release is published by hand with
+`cargo publish --locked` under an API token that has the `publish-new` scope.
+Then, in the crate's crates.io settings, register this repository, the
+`publish.yaml` workflow and the `crates-io` environment as its trusted
+publisher, and in the repository's GitHub settings give the `crates-io`
+environment a deployment rule that allows only `v*` tags: GitHub creates the
+environment unprotected the first time the workflow references it.
 
 ## Scope
 

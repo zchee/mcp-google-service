@@ -52,6 +52,31 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Repository-relative location of the committed snapshot.
 pub const SNAPSHOT_PATH: &str = "data/catalog-snapshot.json";
 
+/// The committed JSON snapshot, for tests that compare the embedded archive
+/// against its source.
+///
+/// `None` only inside an unpacked package: the JSON is excluded from the
+/// crate (`Cargo.toml` `exclude`), so there is nothing to compare against and
+/// nothing to review, and the identity such a test guards was checked in the
+/// repository before the package was cut. A package is recognised by the
+/// `Cargo.toml.orig` cargo writes beside every packaged manifest. Anywhere
+/// else, a missing JSON is the defect the calling test exists to catch.
+#[cfg(test)]
+pub(crate) fn committed_snapshot_json() -> Option<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    match std::fs::read_to_string(root.join(SNAPSHOT_PATH)) {
+        Ok(json) => Some(json),
+        Err(error) if root.join("Cargo.toml.orig").exists() => {
+            eprintln!(
+                "test inert: {error}; the JSON snapshot is not shipped in the package, and \
+                 this is an unpacked package, not a checkout"
+            );
+            None
+        }
+        Err(error) => panic!("committed JSON snapshot must exist in a checkout: {error}"),
+    }
+}
+
 /// Keeps the embedded archive's rkyv payload aligned: the bytes start with a
 /// 16-byte header, so a 16-aligned start leaves the payload 16-aligned too.
 #[repr(C, align(16))]
@@ -2354,14 +2379,11 @@ mod tests {
     /// skips match `rmcp`'s -- or this fails.
     #[test]
     fn archived_catalog_serializes_back_to_the_committed_json() {
+        let Some(committed) = committed_snapshot_json() else { return };
         let json = embedded_fallback_snapshot()
             .expect("the embedded archive materializes")
             .to_json()
             .expect("a materialized snapshot serializes");
-        let committed = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT_PATH),
-        )
-        .expect("the committed snapshot file reads");
         assert!(
             json == committed,
             "the archive-materialized catalog serializes differently from \
@@ -2377,14 +2399,10 @@ mod tests {
     /// them reports no drift.
     #[test]
     fn archived_and_parsed_catalogs_agree_tool_for_tool() {
+        let Some(committed) = committed_snapshot_json() else { return };
         let archived = committed_catalog();
-        let parsed: Snapshot = serde_json::from_str(
-            &std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT_PATH),
-            )
-            .expect("the committed snapshot file reads"),
-        )
-        .expect("the committed snapshot parses");
+        let parsed: Snapshot =
+            serde_json::from_str(&committed).expect("the committed snapshot parses");
         let parsed = parsed
             .into_catalog()
             .expect("the committed snapshot satisfies the namespacing invariants");
@@ -2418,14 +2436,10 @@ mod tests {
     /// the golden suite runs on the archive, this pins the equivalence.
     #[test]
     fn search_ranks_identically_over_archived_and_parsed_catalogs() {
+        let Some(committed) = committed_snapshot_json() else { return };
         let archived = committed_catalog();
-        let parsed: Snapshot = serde_json::from_str(
-            &std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT_PATH),
-            )
-            .expect("the committed snapshot file reads"),
-        )
-        .expect("the committed snapshot parses");
+        let parsed: Snapshot =
+            serde_json::from_str(&committed).expect("the committed snapshot parses");
         let parsed = parsed.into_catalog().expect("valid");
 
         for query in ["cloud run", "instances", "execute sql", ""] {

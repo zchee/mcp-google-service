@@ -2,10 +2,21 @@
 name = "mcp-google-service"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
-# Nothing here is meant for crates.io: the binary embeds an 11MB catalog
-# snapshot and targets one operator workflow.
-publish = false
+rust-version = "1.98"
+description = "One stdio MCP server fronting Google Cloud's per-service remote MCP endpoints: one auth model, one namespaced tool surface, enablement pruning"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/zchee/mcp-google-service"
+# crates.io allows five keywords of at most twenty characters each, and only
+# category slugs from its fixed list.
+keywords = ["mcp", "mcp-server", "google-cloud", "gcp", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# The binary embeds `data/catalog-snapshot.bin`; the 24 MB JSON it is derived
+# from is read only by the archive-identity tests, the snapshot-load bench and
+# `snapshot --from`, so it stays out of the package (those tests report
+# themselves inert in an unpacked package; see `catalog::committed_snapshot_json`).
+# crates.io caps a package at 10 MiB compressed and the JSON alone is 3.2 MiB.
+exclude = ["data/catalog-snapshot.json", ".github/"]
 
 [dependencies]
 anyhow = "1"
@@ -14,7 +25,7 @@ clap = { version = "4", features = ["derive", "env"] }
 gcp_auth = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "stream"] }
 # Zero-copy archived form of the committed catalog snapshot. The serve path
-# validates and reads the embedded archive in place instead of parsing 11.6 MB
+# validates and reads the embedded archive in place instead of parsing 24 MB
 # of JSON; `bytecheck` (a default feature) is what makes the checked `access`
 # the default path rather than an option. The three format-control features
 # are rkyv's defaults spelled out, as its docs ask binaries to do: the archive

@@ -573,9 +573,8 @@ mod tests {
     /// so it cannot land.
     #[test]
     fn committed_archive_matches_the_committed_json() {
+        let Some(json) = crate::catalog::committed_snapshot_json() else { return };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let json = std::fs::read_to_string(root.join("data/catalog-snapshot.json"))
-            .expect("committed JSON snapshot exists");
         let snapshot: Snapshot = serde_json::from_str(&json).expect("committed snapshot parses");
 
         let committed = std::fs::read(root.join("data/catalog-snapshot.bin")).expect(
