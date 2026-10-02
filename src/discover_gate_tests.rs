@@ -426,7 +426,7 @@ fn tool_names(reply: &Value) -> Option<Vec<&str>> {
 /// The defect this module exists for, pinned so that the module's removal
 /// condition is checked by the build rather than remembered.
 ///
-/// Without the gate, rmcp 3.4.1 refuses the probe with `-32022`, accepts the
+/// Without the gate, rmcp 3.5.0 refuses the probe with `-32022`, accepts the
 /// `initialize` that follows, and then refuses the legacy `tools/list` with
 /// `-32602`. When this test fails because that last reply succeeds, rmcp has
 /// picked up rust-sdk#1269 (or equivalent): delete this module and hand
@@ -440,7 +440,7 @@ async fn rmcp_still_mishandles_the_fallback_after_a_refused_probe() {
     assert_eq!(
         probe["error"]["code"],
         json!(-32022),
-        "bare rmcp 3.4.1 refuses the probe as an unsupported version. A `-32601` here \
+        "bare rmcp 3.5.0 refuses the probe as an unsupported version. A `-32601` here \
          means rmcp now refuses discovery itself (rust-sdk#1269), so the DiscoverGate \
          has served its purpose: delete `discover_gate.rs` and pass `stdio()` to \
          `serve` directly. Reply was: {probe}"

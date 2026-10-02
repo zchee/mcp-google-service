@@ -238,7 +238,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         cfg.expose,
     );
     // The gate answers a client's pre-`initialize` `server/discover` probe
-    // itself; rmcp 3.4.1 would otherwise commit the session to per-request
+    // itself; rmcp 3.5.0 would otherwise commit the session to per-request
     // `_meta` and refuse the legacy `tools/list` that follows the fallback.
     // See `discover_gate` for the condition under which this goes back to
     // `handler.serve(stdio())`.

@@ -14,7 +14,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::{
     RoleClient, ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, ContentBlock, JsonObject},
+    model::{CallToolRequestParams, CallToolResult, ClientConfig, ContentBlock, JsonObject},
     service::RunningService,
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -24,7 +24,7 @@ use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
     auth::{AuthContext, TokenGeneration},
-    catalog::split_namespaced,
+    catalog::{split_namespaced, upstream_client},
     error::{classify_upstream, sanitize_body},
     registry::Endpoint,
 };
@@ -81,7 +81,7 @@ struct CachedSession {
     generation: TokenGeneration,
     /// The session. Shared so a dispatch in flight keeps it alive after the
     /// cache has let go of it; the last holder's drop closes it.
-    service: Arc<RunningService<RoleClient, ()>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     /// When a dispatch last used it, for idle eviction and LRU ordering.
     last_used: Instant,
 }
@@ -249,7 +249,7 @@ impl Proxy {
         &self,
         route: &Route,
         tool_name: &str,
-    ) -> Result<Arc<RunningService<RoleClient, ()>>, String> {
+    ) -> Result<Arc<RunningService<RoleClient, ClientConfig>>, String> {
         let mut retried = false;
         loop {
             let (headers, generation) = match self.call_headers().await {
@@ -294,8 +294,10 @@ impl Proxy {
         generation: TokenGeneration,
         headers: HashMap<HeaderName, HeaderValue>,
         tool_name: &str,
-    ) -> Result<Arc<RunningService<RoleClient, ()>>, Box<rmcp::service::ClientInitializeError>>
-    {
+    ) -> Result<
+        Arc<RunningService<RoleClient, ClientConfig>>,
+        Box<rmcp::service::ClientInitializeError>,
+    > {
         {
             let mut sessions = self.sessions.lock().await;
             self.evict_idle(&mut sessions);
@@ -313,7 +315,7 @@ impl Proxy {
             StreamableHttpClientTransportConfig::with_uri(route.mcp_url.clone())
                 .custom_headers(headers),
         );
-        let service = Arc::new(().serve(transport).await?);
+        let service = Arc::new(upstream_client().serve(transport).await?);
         tracing::debug!(
             service = route.service_id,
             host = route.host,
@@ -332,7 +334,11 @@ impl Proxy {
 
     /// Drop `session` from the cache if it is still the one cached for
     /// `service_id`; a newer replacement is left alone.
-    async fn evict(&self, service_id: &str, session: &Arc<RunningService<RoleClient, ()>>) {
+    async fn evict(
+        &self,
+        service_id: &str,
+        session: &Arc<RunningService<RoleClient, ClientConfig>>,
+    ) {
         let mut sessions = self.sessions.lock().await;
         if sessions.get(service_id).is_some_and(|cached| Arc::ptr_eq(&cached.service, session)) {
             sessions.remove(service_id);

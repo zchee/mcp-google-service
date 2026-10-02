@@ -30,6 +30,7 @@
 //! | P3 token rotation | `a_rotated_token_forces_a_fresh_session` |
 //! | P3 401 retry | `an_unauthorized_handshake_is_retried_once_against_a_fresh_token` |
 //! | P3 stale-session safety | `a_credential_failure_drops_every_cached_session` |
+//! | upstream protocol pin | `a_dispatch_session_offers_the_pinned_upstream_protocol_version`, `discovery_offers_the_pinned_upstream_protocol_version` |
 
 mod common;
 
@@ -43,7 +44,7 @@ use std::{
 use hyper::StatusCode;
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, JsonObject},
+    model::{CallToolRequestParams, CallToolResult, ClientConfig, JsonObject, ProtocolVersion},
 };
 use serde_json::{Value, json};
 
@@ -104,7 +105,7 @@ fn result_text(result: &CallToolResult) -> String {
 /// `ServerHandler` methods directly means the assertions cover the actual
 /// protocol path: initialize, tool listing, and `tools/call` framing.
 struct Session {
-    client: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    client: rmcp::service::RunningService<rmcp::service::RoleClient, ClientConfig>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -119,10 +120,25 @@ impl Session {
                 Err(error) => panic!("the in-memory MCP server failed to start: {error}"),
             }
         });
-        let client =
-            ().serve(client_io)
-                .await
-                .expect("the in-memory MCP client completes the initialize handshake");
+        // Offer what Claude Code offers, stated here rather than taken from
+        // the SDK's default so a release that moves the default cannot change
+        // what these sessions exercise. The server caps negotiation below
+        // 2026-07-28, so every session also checks that cap on the wire.
+        let client = ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .serve(client_io)
+            .await
+            .expect("the in-memory MCP client completes the initialize handshake");
+        let negotiated = client
+            .peer_info()
+            .expect("a completed handshake records the server's answer")
+            .protocol_version
+            .clone();
+        assert_eq!(
+            negotiated,
+            ProtocolVersion::V_2025_11_25,
+            "a client offering 2026-07-28 must be answered with 2025-11-25"
+        );
         Self { client, server }
     }
 
@@ -1468,6 +1484,58 @@ async fn a_second_dispatch_reuses_the_session_and_does_not_reinitialize() {
         upstream.all_requests()
     );
     assert_eq!(proxy.cached_sessions().await, 1);
+
+    upstream.server.shutdown().await;
+}
+
+/// The revision offered to an upstream is this crate's decision, not the
+/// SDK's default.
+///
+/// Regression: rmcp 3.5.0 moved `ProtocolVersion::LATEST`, and with it the
+/// `initialize` a default client sends, to `2026-07-28`. Measured 2026-10-03
+/// against the live endpoints, that default made `paydeveloper` refuse
+/// `initialize` with `-32601 Method not supported` and moved 77 other
+/// endpoints onto a revision nothing here had been verified against. A
+/// dependency bump must not be able to do that again.
+///
+/// The offer is read where the upstream receives it. The session's
+/// `MCP-Protocol-Version` header would not show it: a stock rmcp server
+/// answers either offer with `2025-11-25`.
+#[tokio::test]
+async fn a_dispatch_session_offers_the_pinned_upstream_protocol_version() {
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-run").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+    let proxy =
+        Proxy::new(fake_auth("token-pin", TEST_PROJECT), http, vec![Route::from_endpoint(run)]);
+
+    echo_ok(&proxy, "pinned").await;
+
+    assert_eq!(
+        upstream.offered_protocol_versions(),
+        ["2025-11-25"],
+        "a dispatch session must open with exactly one `initialize`, offering 2025-11-25"
+    );
+
+    upstream.server.shutdown().await;
+}
+
+/// The discovery path opens its own sessions, so it is pinned separately.
+#[tokio::test]
+async fn discovery_offers_the_pinned_upstream_protocol_version() {
+    let upstream = spawn_mcp_upstream(&["run.googleapis.com"], "synthetic-discovery").await;
+    let http = client_resolving(&[("run.googleapis.com", upstream.server.addr())]);
+    let run = registry::find("run").expect("`run` is a registered endpoint");
+
+    Catalog::build_live(vec![run], &http, None)
+        .await
+        .expect("discovery against the in-process upstream yields a valid catalog");
+
+    assert_eq!(
+        upstream.offered_protocol_versions(),
+        ["2025-11-25"],
+        "catalog discovery must open with exactly one `initialize`, offering 2025-11-25"
+    );
 
     upstream.server.shutdown().await;
 }

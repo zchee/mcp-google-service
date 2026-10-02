@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, CallToolResult},
+    model::{CallToolRequestParams, CallToolResult, ClientConfig, ProtocolVersion},
     transport::child_process::TokioChildProcess,
 };
 use serde_json::{Value, json};
@@ -63,7 +63,7 @@ fn live_project() -> Option<String> {
 /// A live MCP session against the compiled binary, plus how long it took to
 /// become ready.
 struct LiveSession {
-    client: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    client: rmcp::service::RunningService<rmcp::service::RoleClient, ClientConfig>,
     /// Process spawn through completed `initialize`.
     ready_after: Duration,
 }
@@ -79,11 +79,24 @@ impl LiveSession {
         let started = Instant::now();
         let transport = TokioChildProcess::new(command)
             .expect("the built binary must be spawnable for the live tier");
-        let client =
-            ().serve(transport)
-                .await
-                .expect("the binary must complete the MCP initialize handshake");
+        // Offer what Claude Code offers, stated here rather than taken from
+        // the SDK's default; the binary must answer with 2025-11-25.
+        let client = ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .serve(transport)
+            .await
+            .expect("the binary must complete the MCP initialize handshake");
         let ready_after = started.elapsed();
+        let negotiated = client
+            .peer_info()
+            .expect("a completed handshake records the server's answer")
+            .protocol_version
+            .clone();
+        assert_eq!(
+            negotiated,
+            ProtocolVersion::V_2025_11_25,
+            "a client offering 2026-07-28 must be answered with 2025-11-25"
+        );
 
         Self { client, ready_after }
     }

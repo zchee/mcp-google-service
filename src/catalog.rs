@@ -18,7 +18,7 @@ use std::{
 
 use rmcp::{
     ServiceExt,
-    model::{JsonObject, Tool},
+    model::{ClientConfig, JsonObject, ProtocolVersion, Tool},
     service::{ClientInitializeError, ServiceError},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -48,6 +48,31 @@ pub const FETCH_CONCURRENCY: usize = 16;
 
 /// Per-host budget covering `initialize` plus every `tools/list` page.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Protocol revision offered to every upstream in `initialize`.
+///
+/// Stated here rather than left to the SDK, whose default client offers
+/// `ProtocolVersion::LATEST` and so changes what goes on the wire whenever a
+/// release moves that constant. rmcp 3.5.0 moved it to `2026-07-28`; measured
+/// against the live endpoints on 2026-10-03, `paydeveloper` then refused
+/// `initialize` with `-32601 Method not supported`, and 77 of the other 78
+/// settled on `2026-07-28`, a revision none of this crate's dispatch,
+/// pagination or error-classification behaviour has been verified against.
+/// `2025-11-25` is what every endpoint was probed and pinned with. It is
+/// spelled as a literal revision on purpose: `LATEST_WITH_INITIALIZE` equals
+/// it today and moves with the SDK just as `LATEST` did. Raising it is a
+/// decision to take with a fan-out in hand, not a side effect of
+/// `cargo update`.
+pub const UPSTREAM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+/// The client every upstream session is opened with: rmcp's default client,
+/// except that it offers [`UPSTREAM_PROTOCOL_VERSION`].
+///
+/// Discovery and dispatch both go through this, so the two paths cannot
+/// drift onto different revisions.
+pub fn upstream_client() -> ClientConfig {
+    ClientConfig::default().with_protocol_version(UPSTREAM_PROTOCOL_VERSION)
+}
 
 /// Repository-relative location of the committed snapshot.
 pub const SNAPSHOT_PATH: &str = "data/catalog-snapshot.json";
@@ -1511,7 +1536,10 @@ async fn fetch_tools(
         http.clone(),
         StreamableHttpClientTransportConfig::with_uri(endpoint.mcp_url()),
     );
-    let client = ().serve(transport).await.map_err(|e| FetchError::Initialize(Box::new(e)))?;
+    let client = upstream_client()
+        .serve(transport)
+        .await
+        .map_err(|e| FetchError::Initialize(Box::new(e)))?;
 
     let listed = client.list_all_tools().await;
     // Tear the session down regardless of the listing outcome; a failed

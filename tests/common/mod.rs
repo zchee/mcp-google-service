@@ -48,8 +48,8 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        Tool,
+        InitializeRequestParams, InitializeResult, JsonObject, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -240,6 +240,10 @@ where
 /// HTTP headers the upstream observed, in arrival order.
 pub type ObservedHeaders = Arc<Mutex<Vec<HashMap<String, String>>>>;
 
+/// The `protocolVersion` of every `initialize` an upstream received, in
+/// arrival order.
+pub type OfferedVersions = Arc<Mutex<Vec<String>>>;
+
 /// Wraps a service, recording each request's headers before delegating.
 ///
 /// Recording server-side is what makes the section 5.5 assertion meaningful:
@@ -344,6 +348,8 @@ where
 pub struct SyntheticUpstream {
     /// Headers observed by the transport, shared with the recording wrapper.
     observed: ObservedHeaders,
+    /// Protocol revisions clients offered in `initialize`.
+    offered: OfferedVersions,
     /// Service name reported in `initialize`, to tell upstreams apart.
     label: String,
 }
@@ -399,6 +405,23 @@ impl ServerHandler for SyntheticUpstream {
         info
     }
 
+    /// The default handshake, plus a record of the revision the client
+    /// offered. The reply cannot stand in for it: a stock rmcp server answers
+    /// an offer of `2026-07-28` with `2025-11-25`, the newest revision that
+    /// still has an `initialize`, so what was offered is visible only here.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        self.offered
+            .lock()
+            .expect("offered-version mutex is never held across a panic")
+            .push(request.protocol_version.to_string());
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -449,6 +472,8 @@ pub struct McpUpstream {
     pub server: TestServer,
     /// Headers seen per request, in arrival order.
     pub observed: ObservedHeaders,
+    /// Protocol revisions offered per `initialize`, in arrival order.
+    pub offered: OfferedVersions,
 }
 
 impl McpUpstream {
@@ -465,6 +490,11 @@ impl McpUpstream {
             .last()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The `protocolVersion` each `initialize` offered, in arrival order.
+    pub fn offered_protocol_versions(&self) -> Vec<String> {
+        self.offered.lock().expect("offered-version mutex is never held across a panic").clone()
     }
 
     /// Every request's headers, in arrival order.
@@ -507,8 +537,10 @@ pub async fn spawn_mcp_upstream_rejecting(
     reject: usize,
 ) -> McpUpstream {
     let observed: ObservedHeaders = Arc::new(Mutex::new(Vec::new()));
+    let offered: OfferedVersions = Arc::new(Mutex::new(Vec::new()));
 
     let handler_observed = Arc::clone(&observed);
+    let handler_offered = Arc::clone(&offered);
     let label = label.to_owned();
 
     // `StreamableHttpServerConfig` is #[non_exhaustive], so it is built by
@@ -524,7 +556,11 @@ pub async fn spawn_mcp_upstream_rejecting(
 
     let service = StreamableHttpService::new(
         move || {
-            Ok(SyntheticUpstream { observed: Arc::clone(&handler_observed), label: label.clone() })
+            Ok(SyntheticUpstream {
+                observed: Arc::clone(&handler_observed),
+                offered: Arc::clone(&handler_offered),
+                label: label.clone(),
+            })
         },
         Arc::new(LocalSessionManager::default()),
         config,
@@ -539,7 +575,7 @@ pub async fn spawn_mcp_upstream_rejecting(
     };
     let server = spawn_tls(hostnames.iter().map(|h| (*h).to_owned()).collect(), recording).await;
 
-    McpUpstream { server, observed }
+    McpUpstream { server, observed, offered }
 }
 
 /// One page of a Service Usage `services.list` response.
